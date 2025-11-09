@@ -1,42 +1,53 @@
-#include <iostream>
-#include <string>
+#include "lexer.h"
 #include <cctype>
+#include <iostream>
 
-using namespace std;
-
-enum Token {
-    tok_eof = -1,
-    tok_identifier = -2,
-    tok_number = -3,
-    tok_if = -4,
-    tok_else = -5,
-};
-
-string IdentifierStr;
+std::string IdentifierStr;
 double NumVal;
 
 int gettok() {
     static int LastChar = ' ';
-    
+
     while (isspace(LastChar))
         LastChar = getchar();
 
-    if (isalpha(LastChar)) {
+    if (isalpha(LastChar) || LastChar == '_') {
         IdentifierStr = LastChar;
-        while (isalnum(LastChar = getchar()))
+        while (isalnum(LastChar = getchar()) || LastChar == '_')
             IdentifierStr += LastChar;
 
         if (IdentifierStr == "if") return tok_if;
         if (IdentifierStr == "else") return tok_else;
+        if (IdentifierStr == "vec2") return tok_vec2;
+        if (IdentifierStr == "vec3") return tok_vec3;
+        if (IdentifierStr == "vec4") return tok_vec4;
+        if (IdentifierStr == "double") return tok_double;
+        if (IdentifierStr == "float") return tok_float;
+        if (IdentifierStr == "int") return tok_int;
+        if (IdentifierStr == "uint") return tok_uint;
+        if (IdentifierStr == "bool") return tok_bool;
         return tok_identifier;
     }
 
     if (isdigit(LastChar) || LastChar == '.') {
-        string NumStr;
+        std::string NumStr;
+        int dotCount = 0;
+        bool invalid = false;
+
         do {
+            if (LastChar == '.') {
+                dotCount++;
+                if (dotCount > 1)
+                    invalid = true;
+            }
             NumStr += LastChar;
             LastChar = getchar();
         } while (isdigit(LastChar) || LastChar == '.');
+
+        if (invalid) {
+            std::cerr << "Warning: invalid number literal: " << NumStr << std::endl;
+            return tok_invalid_number;
+        }
 
         NumVal = strtod(NumStr.c_str(), nullptr);
         return tok_number;
@@ -46,6 +57,56 @@ int gettok() {
         do LastChar = getchar();
         while (LastChar != EOF && LastChar != '\n' && LastChar != '\r');
         return gettok();
+    }
+
+    if (LastChar == '+') {
+        LastChar = getchar();
+        return tok_plus;
+    }
+
+    if (LastChar == '=') {
+        LastChar = getchar();
+        return tok_assign;
+    }
+
+    if (LastChar == '(') {
+        LastChar = getchar();
+        return tok_lparen;
+    }
+
+    if (LastChar == ')') {
+        LastChar = getchar();
+        return tok_rparen;
+    }
+
+    if (LastChar == ',') {
+        LastChar = getchar();
+        return tok_comma;
+    }
+
+    if (LastChar == '>') {
+        LastChar = getchar();
+        return tok_greater;
+    }
+
+    if (LastChar == ';') {
+        LastChar = getchar();
+        return tok_semicolon;
+    }
+
+    if (LastChar == '{') {
+        LastChar = getchar();
+        return tok_lbrace;
+    }
+
+    if (LastChar == '}') {
+        LastChar = getchar();
+        return tok_rbrace;
+    }
+
+    if (LastChar == '.') {
+        LastChar = getchar();
+        return tok_dot;
     }
 
     if (LastChar == EOF) return tok_eof;
