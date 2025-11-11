@@ -21,37 +21,70 @@ int gettok() {
         if (IdentifierStr == "vec2") return tok_vec2;
         if (IdentifierStr == "vec3") return tok_vec3;
         if (IdentifierStr == "vec4") return tok_vec4;
+        if (IdentifierStr == "mat2") return tok_mat2;
+        if (IdentifierStr == "mat3") return tok_mat3;
+        if (IdentifierStr == "mat4") return tok_mat4;
+        if (IdentifierStr == "mat2x3") return tok_mat2x3;
+        if (IdentifierStr == "mat2x4") return tok_mat2x4;
+        if (IdentifierStr == "mat3x2") return tok_mat3x2;
+        if (IdentifierStr == "mat3x4") return tok_mat3x4;
+        if (IdentifierStr == "mat4x2") return tok_mat4x2;
+        if (IdentifierStr == "mat4x3") return tok_mat4x3;
         if (IdentifierStr == "double") return tok_double;
         if (IdentifierStr == "float") return tok_float;
         if (IdentifierStr == "int") return tok_int;
         if (IdentifierStr == "uint") return tok_uint;
         if (IdentifierStr == "bool") return tok_bool;
+        if (IdentifierStr == "true") return tok_true;
+        if (IdentifierStr == "false") return tok_false;
         return tok_identifier;
     }
 
     if (isdigit(LastChar) || LastChar == '.') {
         std::string NumStr;
         int dotCount = 0;
-        bool invalid = false;
 
-        do {
-            if (LastChar == '.') {
-                dotCount++;
-                if (dotCount > 1)
-                    invalid = true;
+        if (LastChar == '.') {
+            // lookahead: da li je posle '.' cifra?
+            int C = getchar();
+            if (!isdigit(C)) {
+                // Nije decimalna tačka, već operator '.' (npr. a.x)
+                int ThisChar = '.';
+                LastChar = C;           // ne gubimo sledeći znak
+                return tok_dot;
             }
+            // Jeste decimalan broj, počinje sa ".<digit>"
+            NumStr += '.';
+            NumStr += static_cast<char>(C);
+            dotCount = 1;
+            LastChar = getchar();
+        } else {
+            // broj počinje cifrom
+            do {
+                NumStr += LastChar;
+                LastChar = getchar();
+            } while (isdigit(LastChar));
+            if (LastChar == '.') {
+                dotCount = 1;
+                NumStr += LastChar;
+                LastChar = getchar();
+            }
+        }
+
+        // Nastavak: skupljaj ostatak decimalnog dela (samo još cifre / jedna tačka nije dozvoljena)
+        while (isdigit(LastChar)) {
             NumStr += LastChar;
             LastChar = getchar();
-        } while (isdigit(LastChar) || LastChar == '.');
-
-        if (invalid) {
-            std::cerr << "Warning: invalid number literal: " << NumStr << std::endl;
-            return tok_invalid_number;
+        }
+        if (LastChar == '.') {
+            // druga tačka -> nevažan slučaj; vrati prvu kao broj, pusti parser da prijavi grešku kasnije
+            // ili možeš ovde ispisati warning i tretirati '.' kao sledeći token
         }
 
         NumVal = strtod(NumStr.c_str(), nullptr);
         return tok_number;
     }
+
 
     if (LastChar == '#') {
         do LastChar = getchar();
@@ -64,9 +97,35 @@ int gettok() {
         return tok_plus;
     }
 
-    if (LastChar == '=') {
+    if (LastChar == '*') {
         LastChar = getchar();
+        return tok_multiply;
+    }
+
+    if (LastChar == '/') {
+        LastChar = getchar();
+        return tok_divide;
+    }
+
+    if (LastChar == '-') {
+        LastChar = getchar();
+        return tok_minus;
+    }
+
+    if (LastChar == '=') {
+        if ((LastChar = getchar()) == '=') {
+            LastChar = getchar();
+            return tok_equal;
+        }
         return tok_assign;
+    }
+
+    if (LastChar == '!') {
+        if ((LastChar = getchar()) == '=') {
+            LastChar = getchar();
+            return tok_not_equal;
+        }
+        return '!';
     }
 
     if (LastChar == '(') {
@@ -79,13 +138,34 @@ int gettok() {
         return tok_rparen;
     }
 
+    if (LastChar == '[') {
+        LastChar = getchar();
+        return tok_lbracket;
+    }
+
+    if (LastChar == ']') {
+        LastChar = getchar();
+        return tok_rbracket;
+    }
+
     if (LastChar == ',') {
         LastChar = getchar();
         return tok_comma;
     }
 
+    if (LastChar == '<') {
+        if ((LastChar = getchar()) == '=') {
+            LastChar = getchar();
+            return tok_less_equal;
+        }
+        return tok_less;
+    }
+
     if (LastChar == '>') {
-        LastChar = getchar();
+        if ((LastChar = getchar()) == '=') {
+            LastChar = getchar();
+            return tok_greater_equal;
+        }
         return tok_greater;
     }
 

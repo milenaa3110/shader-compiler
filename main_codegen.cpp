@@ -40,7 +40,7 @@ int main() {
 
     // čitaj i generiši kod za niz dodela: vec3 a = 1 + 2; itd.
     while (CurTok != tok_eof) {
-        if (auto stmt = ParseAssignment()) {
+        if (auto stmt = ParseStatement()) {
             if (!stmt->codegen()) {
                 std::cerr << "Codegen failed for statement.\n";
                 return 1;

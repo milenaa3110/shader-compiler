@@ -35,3 +35,16 @@ llvm::Value* AssignmentExprAST::codegen() {
     Init->codegen();
     return nullptr;
 }
+
+llvm::Value* UnaryExprAST::codegen() {
+    std::cout << "UnaryExpr: " << (char)Op << " ";
+    Operand->codegen();
+    return nullptr;
+}
+
+llvm::Value* MemberAccessExprAST::codegen() {
+    std::cout << "MemberAccess: ";
+    Object->codegen();
+    std::cout << "." << Member << std::endl;
+    return nullptr;
+}
