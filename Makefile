@@ -1,110 +1,139 @@
-# ================== Toolchain (host) ==================
-CXX       := g++
-CXXSTD    := -std=c++17
-CXXWARN   := -Wall -Wextra
+# Toolchain (host)
+CXX    := g++
+CXXSTD := -std=c++20
+CXXWARN:= -Wall -Wextra
 
-# ================== LLVM flags ==================
+# LLVM
 LLVM_CXXFLAGS := $(shell llvm-config --cxxflags 2>/dev/null)
 LLVM_LDFLAGS  := $(shell llvm-config --ldflags --system-libs --libs core support 2>/dev/null)
+LLVM_OPT      ?= opt
+LLC           ?= llc
 
-# ================== RISC-V toolchain ==================
-CLANG        ?= clang
-CLANGXX      ?= clang++
-LLC          ?= llc
-QEMU_SYS     ?= qemu-system-riscv64
-QEMU_USER    ?= gen5
-RISCV_TRIPLE ?= riscv64-unknown-linux-gnu
-RISCV_SYSROOT?= /usr/riscv64-linux-gnu
+# RISC-V toolchain
+QEMU_USER     ?= qemu-riscv64
+RISCV_TRIPLE  ?= riscv64-unknown-linux-gnu
+RISCV_SYSROOT ?= /usr/riscv64-linux-gnu
+CROSS_CXX     ?= riscv64-linux-gnu-g++
 
-# Optional: use LLD for linking RISC-V binaries
-USE_LLD ?= 1
-CROSS_CXX ?= riscv64-linux-gnu-g++
+# Dirs
+LEXER_DIR      := lexer
+PARSER_DIR     := parser
+AST_DIR        := ast
+CODEGEN_DIR    := codegen_state
+HELPERS_DIR    := helpers
+MAIN_DIR       := main
+MAINCODEGEN_DIR:= main_codegen
+INPUT_DIR      := input
+TEST_DIR_RISCV := test/riscv
 
-# ================== Build directories ==================
-OBJDIR_PARSER := build/parser
-OBJDIR_LLVM   := build/llvm
+BUILD_DIR      := build
+OBJDIR_LLVM    := $(BUILD_DIR)/llvm
 
-$(shell mkdir -p $(OBJDIR_PARSER) $(OBJDIR_LLVM) >/dev/null)
-
-# ================== Parser-only target (bez LLVM) ==================
-TARGET_PARSER := parser_test
-PARSER_SRCS   := main.cpp lexer.cpp parser.cpp ast_dummy.cpp
-PARSER_OBJS   := $(addprefix $(OBJDIR_PARSER)/,$(PARSER_SRCS:.cpp=.o))
-PARSER_DEPS   := lexer.h parser.h ast.h
-
-# ================== Codegen (LLVM) ==================
+# Binaries
 TARGET_CODEGEN := shader_codegen
-CODEGEN_SRCS   := lexer.cpp parser.cpp codegen_state.cpp ast.cpp main_codegen.cpp
-CODEGEN_OBJS   := $(addprefix $(OBJDIR_LLVM)/,$(CODEGEN_SRCS:.cpp=.o))
+TARGET_IRGEN   := irgen
 
-# ================== IR generator ==================
-TARGET_IRGEN := irgen
-IRGEN_SRCS   := lexer.cpp parser.cpp codegen_state.cpp ast.cpp main_lib.cpp
-IRGEN_OBJS   := $(addprefix $(OBJDIR_LLVM)/,$(IRGEN_SRCS:.cpp=.o))
+# Sources (shared)
+COMMON_SRCS := \
+  $(LEXER_DIR)/lexer.cpp \
+  $(PARSER_DIR)/parser.cpp \
+  $(CODEGEN_DIR)/codegen_state.cpp \
+  $(AST_DIR)/ast.cpp \
+  $(HELPERS_DIR)/call_helpers.cpp \
+  $(HELPERS_DIR)/assignment_helpers.cpp
 
-# ================== Default target ==================
+CODEGEN_SRCS := $(COMMON_SRCS) $(MAINCODEGEN_DIR)/main_codegen.cpp
+IRGEN_SRCS   := $(COMMON_SRCS) $(MAIN_DIR)/main_lib.cpp
+
+CODEGEN_OBJS := $(patsubst %.cpp,$(OBJDIR_LLVM)/%.o,$(notdir $(CODEGEN_SRCS)))
+IRGEN_OBJS   := $(patsubst %.cpp,$(OBJDIR_LLVM)/irgen_%.o,$(notdir $(IRGEN_SRCS)))
+
+# ---- default ----
 .PHONY: all
-ifeq ($(strip $(LLVM_CXXFLAGS)),)
-  $(info llvm-config not found; building only parser_test)
-  all: $(TARGET_PARSER)
-else
-  all: $(TARGET_CODEGEN)
-endif
+all: $(TARGET_CODEGEN) $(TARGET_IRGEN)
 
-# ================== Parser-only build ==================
-$(TARGET_PARSER): $(PARSER_OBJS)
-	$(CXX) $(CXXSTD) $(CXXWARN) $^ -o $@
+# ---- build dir ----
+$(OBJDIR_LLVM):
+	@mkdir -p $(OBJDIR_LLVM)
 
-$(OBJDIR_PARSER)/%.o: %.cpp $(PARSER_DEPS)
-	$(CXX) $(CXXSTD) $(CXXWARN) -c $< -o $@
+# ---- compile rules ----
+# CODEGEN objects
+$(OBJDIR_LLVM)/%.o: $(LEXER_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/%.o: $(PARSER_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/%.o: $(CODEGEN_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(CODEGEN_DIR) -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/%.o: $(AST_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/%.o: $(HELPERS_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/%.o: $(MAINCODEGEN_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -fPIC -c $< -o $@
 
-# ================== LLVM builds ==================
-$(OBJDIR_LLVM)/%.o: %.cpp
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -fPIC -c $< -o $@
+# IRGEN objects (prefix irgen_)
+$(OBJDIR_LLVM)/irgen_%.o: $(MAIN_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/irgen_%.o: $(LEXER_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/irgen_%.o: $(PARSER_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/irgen_%.o: $(CODEGEN_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(CODEGEN_DIR) -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/irgen_%.o: $(AST_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/irgen_%.o: $(HELPERS_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -fPIC -c $< -o $@
 
-$(TARGET_CODEGEN): $(CODEGEN_OBJS)
-	$(CXX) $^ -o $@ $(LLVM_LDFLAGS)
+# ---- link ----
+$(TARGET_CODEGEN): $(OBJDIR_LLVM) $(CODEGEN_OBJS)
+	$(CXX) $(CODEGEN_OBJS) -o $@ $(LLVM_LDFLAGS) -lfmt
 
-$(TARGET_IRGEN): $(IRGEN_OBJS)
-	$(CXX) $^ -o $@ $(LLVM_LDFLAGS)
+$(TARGET_IRGEN): $(OBJDIR_LLVM) $(IRGEN_OBJS)
+	$(CXX) $(IRGEN_OBJS) -o $@ $(LLVM_LDFLAGS) -lfmt
 
-# ================== Od .src do .ll ==================
-module.ll: shader.src $(TARGET_IRGEN)
-	./$(TARGET_IRGEN) < shader.src
-	@echo "Wrote module.ll"
+# ---- IR pipeline ----
+module.ll: $(INPUT_DIR)/shader.src $(TARGET_IRGEN)
+	./$(TARGET_IRGEN) < $<
 
-# ================== RISC-V: .ll -> .o (PIC) -> .so ==================
-shader.o: module.ll
-	$(LLC) -filetype=obj -relocation-model=pic -mtriple=riscv64-unknown-linux-gnu \
+module.opt.ll: module.ll
+	$(LLVM_OPT) -O3 -S module.ll -o module.opt.ll
+
+# ---- RISC-V build from OPTIMIZED IR ----
+shader.o: module.opt.ll
+	$(LLC) -O3 -filetype=obj -relocation-model=pic -mtriple=$(RISCV_TRIPLE) \
 		-mattr=+d,+f -float-abi=hard -o $@ $<
 
-# ================== RISC-V: .o -> .so ==================
 librvshade.so: shader.o
 	$(CROSS_CXX) -shared -fPIC shader.o -o $@
 
-test_host.rv: test_host.cpp librvshade.so
-	$(CROSS_CXX) -O2 test_host.cpp -L. -lrvshade -Wl,-rpath,'$$ORIGIN' -o $@
+test_host.rv: $(TEST_DIR_RISCV)/test_host.cpp librvshade.so
+	$(CROSS_CXX) -O3 -flto $< -L. -lrvshade -Wl,-rpath,'$$ORIGIN' -o $@
 
 .PHONY: run-riscv
 run-riscv: test_host.rv
-	@echo "Running RISC-V user-mode..."
 	$(QEMU_USER) -L $(RISCV_SYSROOT) ./test_host.rv
 
-.PHONY: riscv-test
-riscv-test: module.ll shader.o librvshade.so test_host.rv
-	@echo "Running RISC-V shader test (user-mode)..."
-	$(QEMU_USER) -L $(RISCV_SYSROOT) ./test_host.rv
-# ================== Helpers ==================
-.PHONY: clean run run-codegen ir
-clean:
-	rm -f $(TARGET_PARSER) $(TARGET_CODEGEN) $(TARGET_IRGEN) \
-	      $(OBJDIR_PARSER)/*.o $(OBJDIR_LLVM)/*.o \
-	      module.ll shader.o librvshade.so test_host.rv out.ppm
-
-run: $(TARGET_PARSER)
-	./$(TARGET_PARSER)
-
+# interactive codegen run
+.PHONY: run-codegen
 run-codegen: $(TARGET_CODEGEN)
 	./$(TARGET_CODEGEN)
 
-ir-riscv: riscv-test
+# NOTE: radi samo ako shader_codegen ispisuje cist IR na stdout
+.PHONY: run-codegen-opt
+run-codegen-opt: $(TARGET_CODEGEN)
+	./$(TARGET_CODEGEN) | $(LLVM_OPT) -O3 -S
+	
+# ---- convenience ----
+.PHONY: ir opt so test
+ir: module.ll
+opt: module.opt.ll
+so: librvshade.so
+test: run-riscv
+
+# ---- clean ----
+.PHONY: clean
+clean:
+	rm -rf $(BUILD_DIR)
+	rm -f $(TARGET_CODEGEN) $(TARGET_IRGEN) \
+	      module.ll module.opt.ll shader.o librvshade.so test_host.rv
