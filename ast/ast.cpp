@@ -845,8 +845,14 @@ llvm::Value* FunctionAST::codegen() {
         }
 
         // ── Create function ───────────────────────────────────────────
+        // Use stable stage-based names so VS+FS modules can be linked without conflicts
+        std::string stageFuncName;
+        if      (stage == ShaderStage::Vertex)   stageFuncName = "vs_main";
+        else if (stage == ShaderStage::Fragment)  stageFuncName = "fs_main";
+        else                                      stageFuncName = "cs_main";
+
         FunctionType* FT = FunctionType::get(Type::getVoidTy(*Context), paramTys, false);
-        Function* F = Function::Create(FT, Function::ExternalLinkage, Proto->Name, TheModule.get());
+        Function* F = Function::Create(FT, Function::ExternalLinkage, stageFuncName, TheModule.get());
         { unsigned idx = 0; for (auto& a : F->args()) a.setName(paramNames[idx++]); }
 
         BasicBlock* BB = BasicBlock::Create(*Context, "entry", F);

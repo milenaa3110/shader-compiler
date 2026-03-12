@@ -1,0 +1,32 @@
+# scene_fs.src - fragment shader: procedural grid + smooth color gradient
+in vec2 vUV;
+in vec4 vWorldPos;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float u = vUV.x;
+    float v = vUV.y;
+
+    # UV-based gradient (background)
+    float r = u;
+    float g = v;
+    float b = 0.5 + 0.5 * sin(u * 6.2832 + v * 4.0);
+
+    # Grid overlay
+    float gx = fract(u * 10.0);
+    float gy = fract(v * 10.0);
+    float line = step(0.95, gx) + step(0.95, gy);
+    line = clamp(line, 0.0, 1.0);
+
+    r = mix(r, 1.0, line * 0.4);
+    g = mix(g, 1.0, line * 0.4);
+    b = mix(b, 1.0, line * 0.4);
+
+    # Vignette
+    float cx = u - 0.5;
+    float cy = v - 0.5;
+    float vign = 1.0 - smoothstep(0.3, 0.7, sqrt(cx*cx + cy*cy));
+
+    FragColor = vec4(r * vign, g * vign, b * vign, 1.0);
+}

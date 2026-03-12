@@ -1,0 +1,24 @@
+# scene_vs.src - vertex shader for a two-triangle quad (full-screen UV plane)
+# Sends world-space position and UV to the fragment shader
+out vec2 vUV;
+out vec4 vWorldPos;
+
+@entry @stage(vertex)
+fn void main() {
+    float vid = float(gl_VertexID);
+
+    # Two CCW triangles covering NDC [-1,1]^2
+    # Quad verts:  0=BL, 1=BR, 2=TR, 3=BL, 4=TR, 5=TL
+    float px = 0.0;
+    float py = 0.0;
+    if (vid == 0.0) { px = -1.0; py = -1.0; }
+    if (vid == 1.0) { px =  1.0; py = -1.0; }
+    if (vid == 2.0) { px =  1.0; py =  1.0; }
+    if (vid == 3.0) { px = -1.0; py = -1.0; }
+    if (vid == 4.0) { px =  1.0; py =  1.0; }
+    if (vid == 5.0) { px = -1.0; py =  1.0; }
+
+    gl_Position = vec4(px, py, 0.0, 1.0);
+    vUV = vec2((px + 1.0) * 0.5, (py + 1.0) * 0.5);
+    vWorldPos = vec4(px, py, 0.0, 1.0);
+}

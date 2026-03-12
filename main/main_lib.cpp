@@ -71,6 +71,8 @@ static bool addShadeWrapper() {
     return true;
 }
 
+#include "emit_trampolines.h"
+
 
 int main() {
     InitializeModule();
@@ -97,6 +99,11 @@ int main() {
         if (!addShadeWrapper()) return 1;
     } else if (!hasStageEntry) {
         std::cerr << "shade() not found\n"; return 1;
+    }
+
+    // Emit pipeline trampolines (vs_invoke / fs_invoke) for stage-entry shaders
+    if (hasStageEntry) {
+        emitPipelineTrampolines();
     }
 
     if (llvm::verifyModule(*TheModule, &llvm::errs())) {

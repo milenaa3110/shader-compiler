@@ -1,0 +1,9 @@
+# triangle_fs.src - fragment shader: interpolated colour from vertex
+in vec4 vColor;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    FragColor = vColor;
+}

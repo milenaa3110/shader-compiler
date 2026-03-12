@@ -1,0 +1,21 @@
+# triangle_vs.src - vertex shader: RGB triangle baked into gl_VertexID
+out vec4 vColor;
+out vec2 vUV;
+
+@entry @stage(vertex)
+fn void main() {
+    float vid = float(gl_VertexID);
+
+    # Hard-coded CCW triangle: bottom-left(red), bottom-right(green), top-center(blue)
+    float px = (vid == 0.0) ? -0.7 : ((vid == 1.0) ?  0.7 : 0.0);
+    float py = (vid == 0.0) ? -0.6 : ((vid == 1.0) ? -0.6 : 0.8);
+
+    gl_Position = vec4(px, py, 0.0, 1.0);
+
+    float r = (vid == 0.0) ? 1.0 : 0.0;
+    float g = (vid == 1.0) ? 1.0 : 0.0;
+    float b = (vid == 2.0) ? 1.0 : 0.0;
+    vColor = vec4(r, g, b, 1.0);
+
+    vUV = vec2((px + 1.0) * 0.5, (py + 1.0) * 0.5);
+}

@@ -1,0 +1,29 @@
+# anim_vs.src - animated vertex shader for RISC-V + SPIR-V animation tests
+# uTime drives rotation/expansion of a 6-vertex quad (2 triangles)
+uniform float uTime;
+out vec2 vUV;
+out vec4 vColor;
+
+@entry @stage(vertex)
+fn void main() {
+    float vid = float(gl_VertexID);
+
+    # Full-screen quad (2 triangles, 6 verts)
+    float px = 0.0;
+    float py = 0.0;
+    if (vid == 0.0) { px = -1.0; py = -1.0; }
+    if (vid == 1.0) { px =  1.0; py = -1.0; }
+    if (vid == 2.0) { px =  1.0; py =  1.0; }
+    if (vid == 3.0) { px = -1.0; py = -1.0; }
+    if (vid == 4.0) { px =  1.0; py =  1.0; }
+    if (vid == 5.0) { px = -1.0; py =  1.0; }
+
+    # Animate UV offset with time
+    float uo = uTime * 0.2;
+    float uu = (px + 1.0) * 0.5 + uo;
+    float uv = (py + 1.0) * 0.5 + uTime * 0.15;
+
+    gl_Position = vec4(px, py, 0.0, 1.0);
+    vUV    = vec2(uu, uv);
+    vColor = vec4(0.5 + 0.5 * sin(uTime + vid), 0.5 + 0.5 * cos(uTime), 0.5, 1.0);
+}
