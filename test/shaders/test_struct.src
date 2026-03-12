@@ -1,0 +1,25 @@
+# test_struct.src - struct declaration, construction, field access and assignment
+
+struct Color {
+    float r;
+    float g;
+    float b;
+};
+
+fn Color makeColor(float t) {
+    Color c = Color(t, 1.0 - t, 0.5);
+    return c;
+}
+
+fn vec4 shade(vec2 uv) {
+    Color col = makeColor(uv.x);
+
+    # field assignment
+    col.b = uv.y;
+
+    float r = col.r;
+    float g = col.g;
+    float b = col.b;
+
+    return vec4(r, g, b, 1.0);
+}

@@ -52,12 +52,18 @@ int main() {
         }
     }
 
-    std::ofstream f("result/riscv_out.ppm", std::ios::binary);
-    f << "P6\n" << W << " " << H << "\n255\n";
-    f.write(reinterpret_cast<char*>(img.data()), img.size());
-
     auto end = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(end - start).count();
     std::cout << "Render time: " << ms << " ms\n";
-    std::cout << "Test completed!\n";
+
+    const char* outpath = "result/shader_out.ppm";
+    std::ofstream f(outpath, std::ios::binary);
+    if (!f) {
+        std::cerr << "Cannot open " << outpath << " for writing\n";
+        return 1;
+    }
+    f << "P6\n" << W << " " << H << "\n255\n";
+    f.write(reinterpret_cast<char*>(img.data()), img.size());
+    std::cout << "Image written to " << outpath << "\n";
+    return 0;
 }

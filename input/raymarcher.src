@@ -1,0 +1,111 @@
+# raymarcher.src - sphere-trace a scene with a sphere and a ground plane
+# Exercises: vec3 ops, length, normalize, dot, max, mix, for, break, +=
+
+fn vec4 shade(vec2 uv) {
+    # Camera
+    float px = (uv.x - 0.5) * 2.0;
+    float py = (uv.y - 0.5) * 2.0;
+
+    # Ray origin and direction
+    float rox = 0.0;
+    float roy = 0.5;
+    float roz = -3.0;
+
+    float rdx = px;
+    float rdy = py;
+    float rdz = 1.8;
+
+    # Normalise direction
+    float rlen = sqrt(rdx*rdx + rdy*rdy + rdz*rdz);
+    rdx = rdx / rlen;
+    rdy = rdy / rlen;
+    rdz = rdz / rlen;
+
+    # Sphere at origin, radius 1
+    float t = 0.0;
+    float hit = 0.0;
+
+    for (float i = 0.0; i < 96.0; i = i + 1.0) {
+        float px2 = rox + rdx * t;
+        float py2 = roy + rdy * t;
+        float pz2 = roz + rdz * t;
+
+        # Sphere SDF
+        float sx = px2 - 0.0;
+        float sy = py2 - 0.0;
+        float sz = pz2 - 0.0;
+        float sphere_dist = sqrt(sx*sx + sy*sy + sz*sz) - 1.0;
+
+        # Floor SDF (y = -1)
+        float floor_dist = py2 + 1.0;
+
+        float d = min(sphere_dist, floor_dist);
+        if (d < 0.001) {
+            hit = (sphere_dist < floor_dist) ? 1.0 : 2.0;
+            break;
+        }
+        if (t > 12.0) break;
+        t += d;
+    }
+
+    # Background gradient
+    float bgr = 0.4 + rdy * 0.3;
+    float bgg = 0.6 + rdy * 0.2;
+    float bgb = 0.9;
+
+    if (hit < 0.5) {
+        return vec4(bgr, bgg, bgb, 1.0);
+    }
+
+    # Hit point and normal
+    float hx = rox + rdx * t;
+    float hy = roy + rdy * t;
+    float hz = roz + rdz * t;
+
+    float nx = 0.0;
+    float ny = 0.0;
+    float nz = 0.0;
+
+    if (hit > 1.5) {
+        # Floor normal: straight up
+        nx = 0.0;
+        ny = 1.0;
+        nz = 0.0;
+    } else {
+        # Sphere normal
+        float nlen2 = sqrt(hx*hx + hy*hy + hz*hz);
+        nx = hx / nlen2;
+        ny = hy / nlen2;
+        nz = hz / nlen2;
+    }
+
+    # Light direction (normalised)
+    float lx = 0.577;
+    float ly = 0.577;
+    float lz = -0.577;
+
+    float diff = max(nx*lx + ny*ly + nz*lz, 0.0);
+    float ambient = 0.15;
+
+    # Fresnel-ish rim term
+    float vdotn = -(rdx*nx + rdy*ny + rdz*nz);
+    float rim = pow(1.0 - max(vdotn, 0.0), 3.0);
+
+    if (hit > 1.5) {
+        # Checker floor
+        float fx = hx * 2.0;
+        float fz = hz * 2.0;
+        float cx2 = fx - floor(fx) - 0.5;
+        float cz2 = fz - floor(fz) - 0.5;
+        float checker = (cx2 * cz2 > 0.0) ? 0.8 : 0.3;
+        float lit = ambient + diff * checker;
+        return vec4(lit, lit, lit * 1.1, 1.0);
+    }
+
+    # Sphere: warm-orange surface + blue rim light
+    float sr = (0.9 * diff + ambient) + rim * 0.3;
+    float sg = (0.4 * diff + ambient) + rim * 0.3;
+    float sb = (0.1 * diff + ambient) + rim * 0.7;
+
+    return vec4(sr, sg, sb, 1.0);
+}

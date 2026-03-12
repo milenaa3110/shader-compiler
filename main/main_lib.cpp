@@ -86,7 +86,18 @@ int main() {
         if (n && !n->codegen()) { std::cerr << "Codegen failed.\n"; return 1; }
     }
 
-    if (!addShadeWrapper()) return 1;
+    // Only add the shade_wrapper shim when a legacy shade(vec2)->vec4 function exists.
+    // Stage-entry shaders (@entry @stage(...)) don't have this function and don't need it.
+    bool hasShade = TheModule->getFunction("shade") != nullptr;
+    bool hasStageEntry = false;
+    for (auto& F : *TheModule) {
+        if (F.hasMetadata("shader.stage")) { hasStageEntry = true; break; }
+    }
+    if (hasShade) {
+        if (!addShadeWrapper()) return 1;
+    } else if (!hasStageEntry) {
+        std::cerr << "shade() not found\n"; return 1;
+    }
 
     if (llvm::verifyModule(*TheModule, &llvm::errs())) {
         std::cerr << "Invalid LLVM module.\n"; return 1;

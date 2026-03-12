@@ -1,0 +1,14 @@
+# test_uniforms.src - uniform scalars and uniform arrays
+
+uniform float uTime;
+uniform vec3  uColor;
+
+fn vec4 shade(vec2 uv) {
+    float t = uTime;
+    float wave = sin(uv.x * 6.28 + t);
+
+    vec3 base = uColor;
+    base.x = base.x * (wave * 0.5 + 0.5);
+
+    return vec4(base.x, base.y, base.z, 1.0);
+}

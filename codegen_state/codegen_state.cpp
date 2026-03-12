@@ -20,7 +20,11 @@ std::unordered_map<std::string, StructInfo> NamedStructTypes;
 std::unordered_set<std::string> StructTypes;
 std::unordered_map<std::string, std::vector<std::string>> StructDependencies;
 std::vector<llvm::BasicBlock*> BreakStack;
+std::vector<llvm::BasicBlock*> ContinueStack;
 std::map<std::string, llvm::GlobalVariable*> UniformArrays;
+std::vector<StageVar> StageInputVars;
+std::vector<StageVar> StageOutputVars;
+std::vector<ResourceBinding> ResourceBindings;
 
 using namespace llvm;
 
@@ -55,7 +59,11 @@ Type* getFloatElemOrType(Type* T) {
 }
 
 Value* dotFloatVector(IRBuilder<>& B, Value* a, Value* b) {
-    auto* VT = cast<FixedVectorType>(a->getType());
+    auto* VT = dyn_cast<FixedVectorType>(a->getType());
+    if (!VT) {
+        logError("dotFloatVector: argument is not a vector type");
+        return nullptr;
+    }
     unsigned N = VT->getNumElements();
     Value* mul = B.CreateFMul(a, b);
     Value* acc = B.CreateExtractElement(mul, (uint64_t)0);
@@ -362,6 +370,148 @@ Value* codegenBuiltin(IRBuilder<>& B,
         // clamp(x, minVal, maxVal) = max(minVal, min(x, maxVal))
         Value* minXMax = B.CreateBinaryIntrinsic(Intrinsic::minnum, x, maxVal);
         return B.CreateBinaryIntrinsic(Intrinsic::maxnum, minVal, minXMax);
+    }
+    // === cross(a, b) ===
+    if (name == "cross") {
+        if (args.size() != 2) { logError("cross expects 2 args"); return nullptr; }
+        Value* a = args[0]; Value* b = args[1];
+        auto* ax = B.CreateExtractElement(a,(uint64_t)0); auto* ay = B.CreateExtractElement(a,(uint64_t)1); auto* az = B.CreateExtractElement(a,(uint64_t)2);
+        auto* bx = B.CreateExtractElement(b,(uint64_t)0); auto* by = B.CreateExtractElement(b,(uint64_t)1); auto* bz = B.CreateExtractElement(b,(uint64_t)2);
+        auto* cx = B.CreateFSub(B.CreateFMul(ay,bz),B.CreateFMul(az,by),"cx");
+        auto* cy = B.CreateFSub(B.CreateFMul(az,bx),B.CreateFMul(ax,bz),"cy");
+        auto* cz = B.CreateFSub(B.CreateFMul(ax,by),B.CreateFMul(ay,bx),"cz");
+        auto* vt = FixedVectorType::get(Type::getFloatTy(B.getContext()),3);
+        Value* res = UndefValue::get(vt);
+        res = B.CreateInsertElement(res,cx,(uint64_t)0);
+        res = B.CreateInsertElement(res,cy,(uint64_t)1);
+        return B.CreateInsertElement(res,cz,(uint64_t)2,"cross");
+    }
+    // === abs(x) ===
+    if (name == "abs") {
+        if (args.size()!=1) { logError("abs expects 1 arg"); return nullptr; }
+        Value* x = args[0];
+        if (x->getType()->isFPOrFPVectorTy()) return createUnaryIntrinsic(B,Intrinsic::fabs,x);
+        Value* neg=B.CreateNeg(x,"neg"); Value* zero=Constant::getNullValue(x->getType());
+        return B.CreateSelect(B.CreateICmpSLT(x,zero),neg,x,"abs");
+    }
+    // === sign(x) ===
+    if (name == "sign") {
+        if (args.size()!=1) { logError("sign expects 1 arg"); return nullptr; }
+        Value* x=args[0]; Type* ty=x->getType();
+        if (ty->isFPOrFPVectorTy()) {
+            Type* sty=ty->getScalarType();
+            Value* pos=ConstantFP::get(sty,1.0),*neg=ConstantFP::get(sty,-1.0),*zer=ConstantFP::get(sty,0.0);
+            if (ty->isVectorTy()) { unsigned n=cast<FixedVectorType>(ty)->getNumElements(); pos=B.CreateVectorSplat(n,pos); neg=B.CreateVectorSplat(n,neg); zer=B.CreateVectorSplat(n,zer); }
+            Value* r=B.CreateSelect(B.CreateFCmpOGT(x,zer),pos,zer);
+            return B.CreateSelect(B.CreateFCmpOLT(x,zer),neg,r,"sign");
+        }
+        Value* zero=Constant::getNullValue(ty),*one=ConstantInt::get(ty,1),*neg=ConstantInt::get(ty,-1);
+        Value* r=B.CreateSelect(B.CreateICmpSGT(x,zero),one,zero);
+        return B.CreateSelect(B.CreateICmpSLT(x,zero),neg,r,"sign");
+    }
+    if (name=="ceil")  { if(args.size()!=1)return nullptr; return createUnaryIntrinsic(B,Intrinsic::ceil,args[0]); }
+    if (name=="round") { if(args.size()!=1)return nullptr; return createUnaryIntrinsic(B,Intrinsic::round,args[0]); }
+    if (name=="trunc") { if(args.size()!=1)return nullptr; return createUnaryIntrinsic(B,Intrinsic::trunc,args[0]); }
+    if (name=="pow")   { if(args.size()!=2)return nullptr; return createBinaryIntrinsic(B,Intrinsic::pow,args[0],args[1]); }
+    if (name=="exp")   { if(args.size()!=1)return nullptr; return createUnaryIntrinsic(B,Intrinsic::exp,args[0]); }
+    if (name=="log")   { if(args.size()!=1)return nullptr; return createUnaryIntrinsic(B,Intrinsic::log,args[0]); }
+    if (name=="exp2")  { if(args.size()!=1)return nullptr; return createUnaryIntrinsic(B,Intrinsic::exp2,args[0]); }
+    if (name=="log2")  { if(args.size()!=1)return nullptr; return createUnaryIntrinsic(B,Intrinsic::log2,args[0]); }
+    if (name=="tan")   { if(args.size()!=1)return nullptr; return B.CreateFDiv(createUnaryIntrinsic(B,Intrinsic::sin,args[0]),createUnaryIntrinsic(B,Intrinsic::cos,args[0]),"tan"); }
+    // === step(edge, x) ===
+    if (name=="step") {
+        if(args.size()!=2){logError("step expects 2 args");return nullptr;}
+        Value* edge=splatIfScalarTo(B,args[0],args[1]->getType()); Value* x=args[1]; Type* ty=x->getType();
+        Value* zero=ty->isVectorTy()?(Value*)B.CreateVectorSplat(cast<FixedVectorType>(ty)->getNumElements(),ConstantFP::get(ty->getScalarType(),0.0f)):ConstantFP::get(ty,0.0f);
+        Value* one =ty->isVectorTy()?(Value*)B.CreateVectorSplat(cast<FixedVectorType>(ty)->getNumElements(),ConstantFP::get(ty->getScalarType(),1.0f)):ConstantFP::get(ty,1.0f);
+        return B.CreateSelect(B.CreateFCmpOLT(x,edge),zero,one,"step");
+    }
+    // === smoothstep(e0, e1, x) ===
+    if (name=="smoothstep") {
+        if(args.size()!=3){logError("smoothstep expects 3 args");return nullptr;}
+        Value* e0=args[0],*e1=args[1],*x=args[2]; Type* ty=x->getType();
+        e0=splatIfScalarTo(B,e0,ty); e1=splatIfScalarTo(B,e1,ty);
+        Value* t=B.CreateFDiv(B.CreateFSub(x,e0),B.CreateFSub(e1,e0),"ss_t");
+        Type* ety=getFloatElemOrType(ty);
+        Value* zv=splatIfScalarTo(B,ConstantFP::get(ety,0.0f),ty);
+        Value* ov=splatIfScalarTo(B,ConstantFP::get(ety,1.0f),ty);
+        Value* tv=splatIfScalarTo(B,ConstantFP::get(ety,2.0f),ty);
+        Value* thv=splatIfScalarTo(B,ConstantFP::get(ety,3.0f),ty);
+        t=createBinaryIntrinsic(B,Intrinsic::minnum,createBinaryIntrinsic(B,Intrinsic::maxnum,t,zv),ov);
+        return B.CreateFMul(B.CreateFMul(t,t,"tt"),B.CreateFSub(thv,B.CreateFMul(tv,t)),"smoothstep");
+    }
+    // === reflect(I, N) ===
+    if (name=="reflect") {
+        if(args.size()!=2){logError("reflect expects 2 args");return nullptr;}
+        Value* I=args[0],*N=args[1];
+        Value* scale=B.CreateFMul(ConstantFP::get(dotFloatVector(B,N,I)->getType(),2.0f),dotFloatVector(B,N,I),"rs");
+        return B.CreateFSub(I,B.CreateFMul(splatIfScalarTo(B,scale,I->getType()),N),"reflect");
+    }
+    // === distance(a, b) ===
+    if (name=="distance") {
+        if(args.size()!=2){logError("distance expects 2 args");return nullptr;}
+        Value* d=B.CreateFSub(args[0],args[1],"dd");
+        return createUnaryIntrinsic(B,Intrinsic::sqrt,dotFloatVector(B,d,d));
+    }
+    // === fma(a, b, c) ===
+    if (name=="fma") {
+        if(args.size()!=3)return nullptr;
+        return B.CreateIntrinsic(Intrinsic::fma,{args[0]->getType()},{args[0],args[1],args[2]});
+    }
+    // === derivative stubs ===
+    if (name=="dFdx"||name=="dFdy"||name=="fwidth") { if(args.size()!=1)return nullptr; return Constant::getNullValue(args[0]->getType()); }
+    // === barrier stubs ===
+    if (name=="barrier"||name=="memoryBarrier"||name=="groupMemoryBarrier") {
+        std::string fn_name="__"+name;
+        Function* fn=M->getFunction(fn_name);
+        if(!fn){auto* FT=FunctionType::get(Type::getVoidTy(B.getContext()),{},false);fn=Function::Create(FT,Function::ExternalLinkage,fn_name,M);}
+        B.CreateCall(fn,{});
+        return Constant::getNullValue(Type::getInt32Ty(B.getContext()));
+    }
+    // === texture(sampler, uv) ===
+    if (name=="texture") {
+        if(args.size()<2){logError("texture expects at least 2 args");return nullptr;}
+        auto* vec4Ty=FixedVectorType::get(Type::getFloatTy(B.getContext()),4);
+        auto* ptrTy=PointerType::getUnqual(B.getContext()); auto* f32Ty=Type::getFloatTy(B.getContext());
+        Value* uv=args[1];
+        if(uv->getType()->isVectorTy()&&cast<FixedVectorType>(uv->getType())->getNumElements()==3){
+            Function* fn=M->getFunction("__texcube_sample");
+            if(!fn){auto* FT=FunctionType::get(vec4Ty,{ptrTy,f32Ty,f32Ty,f32Ty},false);fn=Function::Create(FT,Function::ExternalLinkage,"__texcube_sample",M);}
+            return B.CreateCall(fn,{args[0],B.CreateExtractElement(uv,(uint64_t)0),B.CreateExtractElement(uv,(uint64_t)1),B.CreateExtractElement(uv,(uint64_t)2)},"tex");
+        }
+        Function* fn=M->getFunction("__tex2d_sample");
+        if(!fn){auto* FT=FunctionType::get(vec4Ty,{ptrTy,f32Ty,f32Ty},false);fn=Function::Create(FT,Function::ExternalLinkage,"__tex2d_sample",M);}
+        return B.CreateCall(fn,{args[0],B.CreateExtractElement(uv,(uint64_t)0),B.CreateExtractElement(uv,(uint64_t)1)},"tex");
+    }
+    // === textureLod(sampler, uv, lod) ===
+    if (name=="textureLod") {
+        if(args.size()!=3){logError("textureLod expects 3 args");return nullptr;}
+        auto* vec4Ty=FixedVectorType::get(Type::getFloatTy(B.getContext()),4);
+        auto* ptrTy=PointerType::getUnqual(B.getContext()); auto* f32Ty=Type::getFloatTy(B.getContext());
+        Function* fn=M->getFunction("__tex2d_sample_lod");
+        if(!fn){auto* FT=FunctionType::get(vec4Ty,{ptrTy,f32Ty,f32Ty,f32Ty},false);fn=Function::Create(FT,Function::ExternalLinkage,"__tex2d_sample_lod",M);}
+        Value* uv=args[1];
+        return B.CreateCall(fn,{args[0],B.CreateExtractElement(uv,(uint64_t)0),B.CreateExtractElement(uv,(uint64_t)1),args[2]},"texlod");
+    }
+    // === imageLoad / imageStore ===
+    if (name=="imageLoad") {
+        if(args.size()!=2){logError("imageLoad expects 2 args");return nullptr;}
+        auto* vec4Ty=FixedVectorType::get(Type::getFloatTy(B.getContext()),4);
+        auto* ptrTy=PointerType::getUnqual(B.getContext()); auto* i32Ty=Type::getInt32Ty(B.getContext());
+        Function* fn=M->getFunction("__image2d_load");
+        if(!fn){auto* FT=FunctionType::get(vec4Ty,{ptrTy,i32Ty,i32Ty},false);fn=Function::Create(FT,Function::ExternalLinkage,"__image2d_load",M);}
+        Value* coord=args[1];
+        return B.CreateCall(fn,{args[0],B.CreateExtractElement(coord,(uint64_t)0),B.CreateExtractElement(coord,(uint64_t)1)},"imgld");
+    }
+    if (name=="imageStore") {
+        if(args.size()!=3){logError("imageStore expects 3 args");return nullptr;}
+        auto* ptrTy=PointerType::getUnqual(B.getContext()); auto* i32Ty=Type::getInt32Ty(B.getContext());
+        auto* vec4Ty=FixedVectorType::get(Type::getFloatTy(B.getContext()),4);
+        Function* fn=M->getFunction("__image2d_store");
+        if(!fn){auto* FT=FunctionType::get(Type::getVoidTy(B.getContext()),{ptrTy,i32Ty,i32Ty,vec4Ty},false);fn=Function::Create(FT,Function::ExternalLinkage,"__image2d_store",M);}
+        Value* coord=args[1];
+        B.CreateCall(fn,{args[0],B.CreateExtractElement(coord,(uint64_t)0),B.CreateExtractElement(coord,(uint64_t)1),args[2]});
+        return Constant::getNullValue(Type::getInt32Ty(B.getContext()));
     }
     return nullptr;
 }

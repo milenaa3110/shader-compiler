@@ -2,6 +2,7 @@
 #include <fmt/core.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/IR/Verifier.h>
 #include "../codegen_state/codegen_state.h"
 #include "../error_utils.h"
@@ -245,6 +246,47 @@ Value* BinaryExprAST::codegen() {
 // Boolean literal ast
 Value* BooleanExprAST::codegen() {
     return ConstantInt::get(Type::getInt1Ty(*Context), Val ? 1 : 0);
+}
+
+// Ternary expression: cond ? thenExpr : elseExpr
+Value* TernaryExprAST::codegen() {
+    Value* condVal = Cond->codegen();
+    if (!condVal) return nullptr;
+
+    if (!condVal->getType()->isIntegerTy(1)) {
+        if (condVal->getType()->isIntegerTy())
+            condVal = Builder->CreateICmpNE(condVal, ConstantInt::get(condVal->getType(), 0), "ternary.cond");
+        else if (condVal->getType()->isFPOrFPVectorTy())
+            condVal = Builder->CreateFCmpONE(condVal, ConstantFP::get(condVal->getType(), 0.0), "ternary.cond");
+    }
+
+    Function* F = Builder->GetInsertBlock()->getParent();
+    BasicBlock* ThenBB  = BasicBlock::Create(*Context, "ternary.then", F);
+    BasicBlock* ElseBB  = BasicBlock::Create(*Context, "ternary.else", F);
+    BasicBlock* MergeBB = BasicBlock::Create(*Context, "ternary.merge", F);
+
+    Builder->CreateCondBr(condVal, ThenBB, ElseBB);
+
+    Builder->SetInsertPoint(ThenBB);
+    Value* thenVal = ThenExpr->codegen();
+    if (!thenVal) return nullptr;
+    Builder->CreateBr(MergeBB);
+    ThenBB = Builder->GetInsertBlock();
+
+    Builder->SetInsertPoint(ElseBB);
+    Value* elseVal = ElseExpr->codegen();
+    if (!elseVal) return nullptr;
+    Builder->CreateBr(MergeBB);
+    ElseBB = Builder->GetInsertBlock();
+
+    Builder->SetInsertPoint(MergeBB);
+    if (thenVal->getType() != elseVal->getType())
+        makeTypesMatch(thenVal, elseVal);
+
+    PHINode* PN = Builder->CreatePHI(thenVal->getType(), 2, "ternary.result");
+    PN->addIncoming(thenVal, ThenBB);
+    PN->addIncoming(elseVal, ElseBB);
+    return PN;
 }
 
 // Member access - struct field or vector swizzle
@@ -740,10 +782,158 @@ llvm::Value* PrototypeAST::codegen() {
 }
 
 llvm::Value* FunctionAST::codegen() {
-    using namespace llvm;
-
     auto savedIP = Builder->saveIP();
 
+    // ── Entry-point (stage-aware) codegen ─────────────────────────────
+    if (Attrs.isEntry) {
+        ShaderStage stage = *Attrs.stage;
+
+        auto* i32Ty   = Type::getInt32Ty(*Context);
+        auto* f32Ty   = Type::getFloatTy(*Context);
+        auto* vec4Ty  = FixedVectorType::get(f32Ty, 4);
+        auto* uvec3Ty = FixedVectorType::get(i32Ty, 3);
+        auto* ptrTy   = PointerType::getUnqual(*Context);
+
+        // ── Build output struct type ──────────────────────────────────
+        StructType* outStructTy = nullptr;
+        std::vector<std::string> outVarNames;
+        std::vector<Type*>       outVarTypes;
+
+        if (stage == ShaderStage::Vertex) {
+            outVarNames.push_back("gl_Position");
+            outVarTypes.push_back(vec4Ty);
+            for (auto& sv : StageOutputVars) {
+                Type* t = resolveTypeByName(sv.typeName);
+                if (!t) { logError(fmt::format("Unknown out-var type: {}", sv.typeName)); return nullptr; }
+                outVarNames.push_back(sv.name);
+                outVarTypes.push_back(t);
+            }
+            outStructTy = StructType::create(*Context, outVarTypes, "VS_Output");
+        } else if (stage == ShaderStage::Fragment) {
+            for (auto& sv : StageOutputVars) {
+                Type* t = resolveTypeByName(sv.typeName);
+                if (!t) { logError(fmt::format("Unknown out-var type: {}", sv.typeName)); return nullptr; }
+                outVarNames.push_back(sv.name);
+                outVarTypes.push_back(t);
+            }
+            if (!outVarTypes.empty())
+                outStructTy = StructType::create(*Context, outVarTypes, "FS_Output");
+        }
+
+        // ── Build parameter list ──────────────────────────────────────
+        std::vector<Type*>       paramTys;
+        std::vector<std::string> paramNames;
+
+        if (stage == ShaderStage::Vertex) {
+            paramTys.push_back(i32Ty);  paramNames.push_back("gl_VertexID");
+            paramTys.push_back(i32Ty);  paramNames.push_back("gl_InstanceID");
+            paramTys.push_back(ptrTy);  paramNames.push_back("_out");
+        } else if (stage == ShaderStage::Fragment) {
+            paramTys.push_back(vec4Ty); paramNames.push_back("gl_FragCoord");
+            for (auto& sv : StageInputVars) {
+                Type* t = resolveTypeByName(sv.typeName);
+                if (!t) { logError(fmt::format("Unknown in-var type: {}", sv.typeName)); return nullptr; }
+                paramTys.push_back(t);
+                paramNames.push_back(sv.name);
+            }
+            if (outStructTy) { paramTys.push_back(ptrTy); paramNames.push_back("_out"); }
+        } else { // Compute
+            paramTys.push_back(uvec3Ty); paramNames.push_back("gl_GlobalInvocationID");
+            paramTys.push_back(uvec3Ty); paramNames.push_back("gl_LocalInvocationID");
+            paramTys.push_back(uvec3Ty); paramNames.push_back("gl_WorkGroupID");
+            paramTys.push_back(uvec3Ty); paramNames.push_back("gl_NumWorkgroups");
+        }
+
+        // ── Create function ───────────────────────────────────────────
+        FunctionType* FT = FunctionType::get(Type::getVoidTy(*Context), paramTys, false);
+        Function* F = Function::Create(FT, Function::ExternalLinkage, Proto->Name, TheModule.get());
+        { unsigned idx = 0; for (auto& a : F->args()) a.setName(paramNames[idx++]); }
+
+        BasicBlock* BB = BasicBlock::Create(*Context, "entry", F);
+        Builder->SetInsertPoint(BB);
+        NamedValues.clear();
+
+        // Store params as allocas
+        for (auto& arg : F->args()) {
+            std::string an = std::string(arg.getName());
+            AllocaInst* A = CreateEntryBlockAlloca(F, an, arg.getType());
+            Builder->CreateStore(&arg, A);
+            NamedValues[an] = A;
+        }
+
+        // Create output-variable allocas (so body can assign to them)
+        if (stage == ShaderStage::Vertex) {
+            AllocaInst* A = CreateEntryBlockAlloca(F, "gl_Position", vec4Ty);
+            Builder->CreateStore(Constant::getNullValue(vec4Ty), A);
+            NamedValues["gl_Position"] = A;
+            for (size_t i = 1; i < outVarNames.size(); ++i) {
+                AllocaInst* B2 = CreateEntryBlockAlloca(F, outVarNames[i], outVarTypes[i]);
+                Builder->CreateStore(Constant::getNullValue(outVarTypes[i]), B2);
+                NamedValues[outVarNames[i]] = B2;
+            }
+        } else if (stage == ShaderStage::Fragment) {
+            for (size_t i = 0; i < outVarNames.size(); ++i) {
+                AllocaInst* A = CreateEntryBlockAlloca(F, outVarNames[i], outVarTypes[i]);
+                Builder->CreateStore(Constant::getNullValue(outVarTypes[i]), A);
+                NamedValues[outVarNames[i]] = A;
+            }
+        }
+
+        // ── Codegen body ──────────────────────────────────────────────
+        if (!Body->codegen()) {
+            F->eraseFromParent();
+            Builder->restoreIP(savedIP);
+            return nullptr;
+        }
+
+        // ── Epilogue: store outputs into _out struct ──────────────────
+        BasicBlock* cur = Builder->GetInsertBlock();
+        if (!cur->getTerminator() && outStructTy) {
+            auto outIt = NamedValues.find("_out");
+            if (outIt != NamedValues.end()) {
+                Value* outPtr = Builder->CreateLoad(ptrTy, outIt->second, "out.ptr");
+                for (size_t i = 0; i < outVarNames.size(); ++i) {
+                    auto varIt = NamedValues.find(outVarNames[i]);
+                    if (varIt == NamedValues.end()) continue;
+                    Value* loaded = Builder->CreateLoad(outVarTypes[i], varIt->second, outVarNames[i] + ".ld");
+                    Value* gep = Builder->CreateStructGEP(outStructTy, outPtr, (unsigned)i);
+                    Builder->CreateStore(loaded, gep);
+                }
+            }
+        }
+
+        cur = Builder->GetInsertBlock();
+        if (!cur->getTerminator())
+            Builder->CreateRetVoid();
+
+        // ── Shader metadata ───────────────────────────────────────────
+        const char* stageStr = stage == ShaderStage::Vertex   ? "vertex"
+                             : stage == ShaderStage::Fragment  ? "fragment"
+                                                               : "compute";
+        F->setMetadata("shader.stage",
+            MDNode::get(*Context, MDString::get(*Context, stageStr)));
+
+        if (Attrs.workgroupSize.has_value()) {
+            auto& ws = *Attrs.workgroupSize;
+            Metadata* wsMDs[] = {
+                ConstantAsMetadata::get(ConstantInt::get(i32Ty, ws[0])),
+                ConstantAsMetadata::get(ConstantInt::get(i32Ty, ws[1])),
+                ConstantAsMetadata::get(ConstantInt::get(i32Ty, ws[2]))
+            };
+            F->setMetadata("shader.workgroup_size", MDNode::get(*Context, wsMDs));
+        }
+
+        if (verifyFunction(*F, &errs())) {
+            logError(fmt::format("Entry function verification failed for '{}'", Proto->Name));
+            F->eraseFromParent();
+            Builder->restoreIP(savedIP);
+            return nullptr;
+        }
+        Builder->restoreIP(savedIP);
+        return F;
+    }
+
+    // ── Regular (non-entry) function ──────────────────────────────────
     Function* F = nullptr;
     if (auto* V = Proto->codegen()) F = cast<Function>(V);
     else return nullptr;
@@ -770,7 +960,6 @@ llvm::Value* FunctionAST::codegen() {
         if (F->getReturnType()->isVoidTy()) {
             Builder->CreateRetVoid();
         } else {
-            // If semantic check says all paths return, this block must be unreachable.
             if (allPathsReturn(Body.get())) {
                 Builder->CreateUnreachable();
             } else {
@@ -841,6 +1030,28 @@ Value* BreakStmtAST::codegen() {
     return ConstantFP::get(Type::getFloatTy(*Context), 0.0f);
 }
 
+// Continue statement
+Value* ContinueStmtAST::codegen() {
+    if (ContinueStack.empty()) {
+        logError("Continue statement outside of loop");
+        return nullptr;
+    }
+    Builder->CreateBr(ContinueStack.back());
+    return ConstantFP::get(Type::getFloatTy(*Context), 0.0f);
+}
+
+// Discard statement
+Value* DiscardStmtAST::codegen() {
+    Function* discardFn = TheModule->getFunction("__frag_discard");
+    if (!discardFn) {
+        FunctionType* FT = FunctionType::get(Type::getVoidTy(*Context), {}, false);
+        discardFn = Function::Create(FT, Function::ExternalLinkage, "__frag_discard", TheModule.get());
+    }
+    Builder->CreateCall(discardFn, {});
+    Builder->CreateUnreachable();
+    return ConstantFP::get(Type::getFloatTy(*Context), 0.0f);
+}
+
 // While statement
 Value* WhileExprAST::codegen() {
     Function* F = Builder->GetInsertBlock()->getParent();
@@ -861,9 +1072,11 @@ Value* WhileExprAST::codegen() {
     // body
     Builder->SetInsertPoint(BodyBB);
     BreakStack.push_back(AfterBB);
+    ContinueStack.push_back(CondBB);
 
     if (!Body->codegen()) {
         BreakStack.pop_back();
+        ContinueStack.pop_back();
         return nullptr;
     }
 
@@ -873,6 +1086,7 @@ Value* WhileExprAST::codegen() {
     }
 
     BreakStack.pop_back();
+    ContinueStack.pop_back();
 
     // continue after loop
     Builder->SetInsertPoint(AfterBB);
@@ -903,9 +1117,11 @@ Value* ForExprAST::codegen() {
     // body
     Builder->SetInsertPoint(BodyBB);
     BreakStack.push_back(AfterBB);
+    ContinueStack.push_back(IncBB);
 
     if (!Body->codegen()) {
         BreakStack.pop_back();
+        ContinueStack.pop_back();
         return nullptr;
     }
 
@@ -915,6 +1131,7 @@ Value* ForExprAST::codegen() {
     }
 
     BreakStack.pop_back();
+    ContinueStack.pop_back();
 
     // increment
     Builder->SetInsertPoint(IncBB);
@@ -961,6 +1178,20 @@ llvm::Value* StructDeclExprAST::codegen() {
     info.FieldNames = std::move(fieldNames);
     NamedStructTypes[Name] = std::move(info);
 
+    return Constant::getNullValue(Type::getInt32Ty(*Context));
+}
+
+// Stage variable declaration codegen
+Value* StageVarDeclAST::codegen() {
+    StageVar sv;
+    sv.name = Name;
+    sv.typeName = TypeName;
+    sv.isInput = isInput;
+    sv.binding = binding;
+    if (isInput)
+        StageInputVars.push_back(sv);
+    else
+        StageOutputVars.push_back(sv);
     return Constant::getNullValue(Type::getInt32Ty(*Context));
 }
 
@@ -1019,12 +1250,93 @@ Value* ArrayInitExprAST::codegen() {
         values.push_back(v);
     }
 
-    // Create array type
+    // Create array type and a temporary alloca to hold the initialized data
     ArrayType* arrTy = ArrayType::get(elemType, values.size());
+    Function* F = Builder->GetInsertBlock()->getParent();
+    AllocaInst* tmpAlloca = CreateEntryBlockAlloca(F, "arr.init.tmp", arrTy);
 
-    // Create constant array or alloca depending on context
-    // For now, return a dummy value (this would typically be used in assignment context)
-    return Constant::getNullValue(arrTy);
+    for (size_t i = 0; i < values.size(); ++i) {
+        Value* indices[] = { Builder->getInt32(0), Builder->getInt32((uint32_t)i) };
+        Value* elemPtr = Builder->CreateInBoundsGEP(arrTy, tmpAlloca, indices, "init.elem.ptr");
+        Builder->CreateStore(values[i], elemPtr);
+    }
+
+    return tmpAlloca;
+}
+
+// Matrix element assignment: mat[i] = col  or  mat[i][j] = scalar
+Value* MatrixAssignmentExprAST::codegen() {
+    auto* lhsVar = dynamic_cast<VariableExprAST*>(Object.get());
+    if (!lhsVar) {
+        logError("Matrix assignment LHS must be a named variable");
+        return nullptr;
+    }
+
+    auto it = NamedValues.find(lhsVar->Name);
+    if (it == NamedValues.end()) {
+        logError(fmt::format("Unknown variable '{}' in matrix assignment", lhsVar->Name));
+        return nullptr;
+    }
+
+    AllocaInst* alloca = it->second;
+    Type* matTy = alloca->getAllocatedType();
+    if (!matTy->isArrayTy()) {
+        logError(fmt::format("'{}' is not a matrix/array type", lhsVar->Name));
+        return nullptr;
+    }
+
+    auto* arrTy = cast<ArrayType>(matTy);
+    Type* colTy  = arrTy->getElementType();
+
+    Value* iVal = Index->codegen();
+    if (!iVal) return nullptr;
+    iVal = toI32(iVal);
+    if (!iVal) return nullptr;
+
+    Value* zero   = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+    Value* colPtr = Builder->CreateInBoundsGEP(matTy, alloca, {zero, iVal},
+                                               lhsVar->Name + ".col.ptr");
+
+    if (!Index2) {
+        // mat[i] = col_vec — assign entire column
+        Value* rhs = RHS->codegen();
+        if (!rhs) return nullptr;
+        if (rhs->getType() != colTy) {
+            logError("Type mismatch in matrix column assignment");
+            return nullptr;
+        }
+        Builder->CreateStore(rhs, colPtr);
+        return rhs;
+    }
+
+    // mat[i][j] = scalar — update one element
+    if (!colTy->isVectorTy()) {
+        logError("Second index is only valid for matrix (array-of-vector) types");
+        return nullptr;
+    }
+
+    auto* vecColTy  = cast<FixedVectorType>(colTy);
+    Type* scalarTy = vecColTy->getElementType();
+
+    Value* rhs = RHS->codegen();
+    if (!rhs) return nullptr;
+    if (rhs->getType() != scalarTy) {
+        rhs = castScalarTo(rhs, scalarTy);
+        if (!rhs) {
+            logError("Cannot cast RHS to matrix element scalar type");
+            return nullptr;
+        }
+    }
+
+    Value* jVal = Index2->codegen();
+    if (!jVal) return nullptr;
+    jVal = toI32(jVal);
+    if (!jVal) return nullptr;
+
+    Value* col    = Builder->CreateLoad(vecColTy, colPtr, lhsVar->Name + ".col");
+    Value* newCol = Builder->CreateInsertElement(col, rhs, jVal, "mat.elem.ins");
+    Builder->CreateStore(newCol, colPtr);
+    return rhs;
 }
 
 // ArrayDeclExprAST codegen

@@ -4,6 +4,7 @@
     #include <iostream>
     #include <fstream>
     #include <algorithm>
+    #include <sys/stat.h>
 
     extern "C" void shade_wrapper(float u, float v, float *out);
 
@@ -57,10 +58,13 @@
         // Single frame render
         render_frame(W, H, img, 0.0f);
 
-        std::ofstream f("result/advanced_out.ppm", std::ios::binary);
+        mkdir("result", 0755);
+        const char* outpath = "result/advanced_out.ppm";
+        std::ofstream f(outpath, std::ios::binary);
+        if (!f) { std::cerr << "Cannot open " << outpath << "\n"; return 1; }
         f << "P6\n" << W << " " << H << "\n255\n";
         f.write(reinterpret_cast<char*>(img.data()), img.size());
-        std::cout << "Saved result/advanced_out.ppm\n";
+        std::cout << "Saved " << outpath << "\n";
 
         // Benchmark
         benchmark(512, 512, 100);

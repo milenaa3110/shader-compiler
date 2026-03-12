@@ -1,0 +1,10 @@
+in vec4 vColor;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    vec4 coord = gl_FragCoord;
+    float alpha = coord.w;
+    FragColor = vec4(vColor.r, vColor.g, vColor.b, alpha);
+}

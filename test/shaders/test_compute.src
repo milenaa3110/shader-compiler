@@ -1,0 +1,9 @@
+uniform float uBrightness;
+
+@entry @stage(compute) @workgroup_size(8, 8, 1)
+fn void main() {
+    float gx = float(gl_GlobalInvocationID.x);
+    float gy = float(gl_GlobalInvocationID.y);
+    float val = (gx + gy) * uBrightness;
+    float result = clamp(val, 0.0, 1.0);
+}

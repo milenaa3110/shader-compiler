@@ -1,0 +1,38 @@
+# test_builtins2.src - new built-in functions added in Phase II
+
+fn vec4 shade(vec2 uv) {
+    float x = uv.x;
+    float y = uv.y;
+
+    # math
+    float p  = pow(x + 0.01, 2.2);
+    float e  = exp(x);
+    float l  = log(x + 0.01);
+    float e2 = exp2(x);
+    float l2 = log2(x + 0.01);
+    float ab = abs(x - 0.5);
+    float sg = sign(y - 0.5);
+    float cl = ceil(x * 3.0);
+    float rn = round(x * 5.0);
+    float tr = trunc(x * 7.0);
+
+    # interpolation
+    float st = step(0.5, x);
+    float ss = smoothstep(0.3, 0.7, x);
+
+    # geometry
+    vec2 a = vec2(x, y);
+    vec2 b = vec2(1.0 - x, 1.0 - y);
+    float dist = distance(a, b);
+
+    # cross product (vec3)
+    vec3 u3 = vec3(x, y, 0.5);
+    vec3 v3 = vec3(0.5, x, y);
+    vec3 cr = cross(u3, v3);
+
+    float r = smoothstep(0.0, 1.0, p + ab);
+    float g = smoothstep(0.0, 1.0, ss + st * 0.5);
+    float bv = smoothstep(0.0, 1.0, dist);
+
+    return vec4(r, g, bv, 1.0);
+}

@@ -122,6 +122,17 @@ inline Value* toI32(Value *v) {
         if (name == "int")    return Type::getInt32Ty(*Context);
         if (name == "uint")   return Type::getInt32Ty(*Context);
         if (name == "bool")   return Type::getInt1Ty(*Context);
+        // integer vector types
+        if (name == "uvec2") return FixedVectorType::get(Type::getInt32Ty(*Context), 2);
+        if (name == "uvec3") return FixedVectorType::get(Type::getInt32Ty(*Context), 3);
+        if (name == "uvec4") return FixedVectorType::get(Type::getInt32Ty(*Context), 4);
+        if (name == "ivec2") return FixedVectorType::get(Type::getInt32Ty(*Context), 2);
+        if (name == "ivec3") return FixedVectorType::get(Type::getInt32Ty(*Context), 3);
+        if (name == "ivec4") return FixedVectorType::get(Type::getInt32Ty(*Context), 4);
+        // opaque sampler/image types → opaque pointer
+        if (name == "sampler2D"    || name == "sampler3D"   || name == "samplerCube" ||
+            name == "sampler2DArray" || name == "image2D"   || name == "imageBuffer")
+            return PointerType::getUnqual(*Context);
         // for vector types
         if (name.consume_front("vec")) {
             if (unsigned n; !name.getAsInteger(10, n) && (n >= 2 && n <= 4))

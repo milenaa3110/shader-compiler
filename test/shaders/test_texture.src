@@ -1,0 +1,9 @@
+layout(binding=0) uniform sampler2D uTex;
+uniform vec2 uResolution;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    vec2 uv = gl_FragCoord.xy / uResolution;
+    FragColor = texture(uTex, uv);
+}

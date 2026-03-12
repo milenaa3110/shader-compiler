@@ -1,0 +1,22 @@
+# test_matrix_assign.src - matrix element and column assignment (new feature)
+
+fn vec4 shade(vec2 uv) {
+    # declare a mat2 (2 columns of vec2)
+    mat2 m = mat2(1.0);
+
+    # column assignment: mat[i] = vec2(...)
+    m[0] = vec2(uv.x, 0.0);
+    m[1] = vec2(0.0, uv.y);
+
+    # element assignment: mat[col][row] = scalar
+    m[0][1] = 0.5;
+    m[1][0] = 0.5;
+
+    # read back elements
+    float a = m[0][0];
+    float b = m[0][1];
+    float c = m[1][0];
+    float d = m[1][1];
+
+    return vec4(a, b, c, d);
+}

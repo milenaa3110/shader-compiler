@@ -59,7 +59,54 @@ enum Token {
 	tok_uniform = -75,
 	tok_void = -76,
 	tok_not = -77,
-    tok_invalid_number = -100,
+    tok_at = -78,
+    tok_entry = -79,
+    tok_stage = -80,
+    tok_vertex = -81,
+    tok_fragment = -82,
+    tok_compute = -83,
+    tok_bitwise_and = -84,   // bare '&' — bitwise AND not supported; triggers parse error
+    tok_bitwise_or  = -85,   // bare '|' — bitwise OR  not supported; triggers parse error
+
+    // Stage interface qualifiers
+    tok_in    = -86,
+    tok_out   = -87,
+    tok_inout = -88,
+
+    // Unsigned/signed int vector types
+    tok_uvec2 = -89,
+    tok_uvec3 = -90,
+    tok_uvec4 = -91,
+    tok_ivec2 = -92,
+    tok_ivec3 = -93,
+    tok_ivec4 = -94,
+
+    // Sampler / image opaque types
+    tok_sampler2D   = -95,
+    tok_sampler3D   = -96,
+    tok_samplerCube = -97,
+    tok_image2D     = -98,
+
+    // Additional statement keywords
+    tok_continue = -99,
+    tok_discard  = -110,
+    tok_const    = -111,
+
+    // Compound assignment operators
+    tok_plus_assign  = -112,  // +=
+    tok_minus_assign = -113,  // -=
+    tok_mul_assign   = -114,  // *=
+    tok_div_assign   = -115,  // /=
+
+    // Increment / decrement
+    tok_increment = -116,  // ++
+    tok_decrement = -117,  // --
+
+    // Ternary operator
+    tok_question = -118,  // ?
+    tok_colon    = -119,  // :
+
+    tok_invalid_number = -120,
 };
 
 extern std::string IdentifierStr;

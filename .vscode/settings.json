@@ -1,0 +1,25 @@
+{
+    // 1. Isključi Microsoft IntelliSense da bi clangd mogao da radi
+    "C_Cpp.intelliSenseEngine": "disabled",
+
+    // 2. Podesi putanju do clangd-a koji smo instalirali
+    "clangd.path": "/usr/bin/clangd-18",
+
+    // 3. Ovo je ključno: prebacuje tvoje putanje iz onog JSON-a u clangd
+    "clangd.arguments": [
+        "--query-driver=/usr/bin/clang++,/usr/bin/g++",
+        "--background-index",
+        "--clang-tidy",
+        "--header-insertion=never",
+        "--log=verbose",
+        "--pretty",
+        "--all-scopes-completion",
+        "--completion-style=detailed",
+        "--header-insertion=never",
+        "--background-index",
+        "--clang-tidy",
+        "--compile-commands-dir=${workspaceFolder}",
+        "-query-driver=/usr/bin/clang++",
+        "--fallback-style=Google"
+    ]
+}

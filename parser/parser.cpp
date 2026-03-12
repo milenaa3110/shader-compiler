@@ -1,10 +1,10 @@
-#include "../parser/parser.h"
+#include "parser.h"
 #include "../error_utils.h"
-#include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <fmt/core.h>
@@ -21,16 +21,18 @@ public:
         return peek();
     }
 
-    // peek at Parser::peek()rent token
+    // peek at Parser::peek() current token
     int peek() const { return Cur; }
 
     std::vector<std::unique_ptr<ExprAST> > ParseProgram();
 
     std::unique_ptr<ExprAST> parseStruct();
 
-    std::unique_ptr<ExprAST> parseUniform();
-
     std::unique_ptr<ExprAST> parseFunction();
+
+    std::optional<FunctionAttrs> parseFunctionAttrs();
+    
+    static std::optional<ShaderStage> stageFromTok(int tok);
 
     std::unique_ptr<ExprAST> parseStatement();
 
@@ -45,6 +47,10 @@ public:
     std::unique_ptr<ExprAST> parseReturn();
 
     std::unique_ptr<ExprAST> parseBreak();
+    std::unique_ptr<ExprAST> parseStageVarDecl(bool isInput, int binding = -1);
+    std::unique_ptr<ExprAST> parseContinue();
+    std::unique_ptr<ExprAST> parseDiscard();
+    std::unique_ptr<ExprAST> parseUniform(int binding = -1);
 
     std::unique_ptr<ExprAST> parseVarDecl();
 
@@ -71,23 +77,15 @@ private:
     // check if token is a type token (e.g., int, float, vec3, etc.)
     static bool isTypeTok(const int tok) {
         switch (tok) {
-            case tok_vec2:
-            case tok_vec3:
-            case tok_vec4:
-            case tok_double:
-            case tok_float:
-            case tok_int:
-            case tok_uint:
-            case tok_bool:
-            case tok_mat2:
-            case tok_mat3:
-            case tok_mat4:
-            case tok_mat2x3:
-            case tok_mat2x4:
-            case tok_mat3x2:
-            case tok_mat3x4:
-            case tok_mat4x2:
-            case tok_mat4x3:
+            case tok_vec2: case tok_vec3: case tok_vec4:
+            case tok_double: case tok_float: case tok_int: case tok_uint: case tok_bool:
+            case tok_mat2: case tok_mat3: case tok_mat4:
+            case tok_mat2x3: case tok_mat2x4: case tok_mat3x2:
+            case tok_mat3x4: case tok_mat4x2: case tok_mat4x3:
+            case tok_uvec2: case tok_uvec3: case tok_uvec4:
+            case tok_ivec2: case tok_ivec3: case tok_ivec4:
+            case tok_sampler2D: case tok_sampler3D: case tok_samplerCube:
+            case tok_image2D:
                 return true;
             default: return false;
         }
@@ -142,6 +140,16 @@ private:
             case tok_mat3x4: return "mat3x4";
             case tok_mat4x2: return "mat4x2";
             case tok_mat4x3: return "mat4x3";
+            case tok_uvec2: return "uvec2";
+            case tok_uvec3: return "uvec3";
+            case tok_uvec4: return "uvec4";
+            case tok_ivec2: return "ivec2";
+            case tok_ivec3: return "ivec3";
+            case tok_ivec4: return "ivec4";
+            case tok_sampler2D:   return "sampler2D";
+            case tok_sampler3D:   return "sampler3D";
+            case tok_samplerCube: return "samplerCube";
+            case tok_image2D:     return "image2D";
             case tok_void: return "void";
             default: return "";
         }
@@ -298,10 +306,74 @@ private:
 // Parse program
 std::vector<std::unique_ptr<ExprAST> > Parser::ParseProgram() {
     std::vector<std::unique_ptr<ExprAST> > program;
+    std::unordered_map<ShaderStage, std::string> entryByStage;
     while (peek() != tok_eof) {
         std::unique_ptr<ExprAST> stmt = nullptr;
-        if (peek() == tok_fn) {
-            stmt = parseFunction();
+    if (peek() == tok_at) {
+        auto attrsOpt = parseFunctionAttrs();
+        if (!attrsOpt) {
+            next(); // skip invalid attributes
+            continue;
+        }
+
+        if (peek() != tok_fn) {
+            logError("Attributes are only allowed before a function ('fn')");
+            while (peek() != tok_fn && peek() != tok_eof) next();
+            continue;
+        }
+
+        auto fn = parseFunction();
+        if (auto *F = dynamic_cast<FunctionAST*>(fn.get())) {
+            F->Attrs = *attrsOpt;
+        } else {
+            logError("Internal error: expected FunctionAST after parsing function");
+        }
+
+        stmt = std::move(fn);
+        if (auto *F = dynamic_cast<FunctionAST*>(stmt.get())) {
+            if (F->Attrs.isEntry) {
+            ShaderStage st = *F->Attrs.stage;
+            if (entryByStage.count(st)) {
+                logError(fmt::format("Multiple entry points for stage. Already: {}, new: {}",
+                                    entryByStage[st], F->Proto->Name));
+                } else {
+                    entryByStage[st] = F->Proto->Name;
+                }
+            }
+        }
+    }
+    else if (peek() == tok_fn) {
+        stmt = parseFunction();
+    } else if (peek() == tok_in) {
+            stmt = parseStageVarDecl(true);
+        } else if (peek() == tok_out) {
+            stmt = parseStageVarDecl(false);
+        } else if (peek() == tok_identifier && IdentifierStr == "layout") {
+            // layout(binding=N, ...) uniform/in/out ...
+            int binding = -1;
+            next(); // 'layout'
+            if (peek() == tok_lparen) {
+                next(); // '('
+                while (peek() != tok_rparen && peek() != tok_eof) {
+                    if (peek() == tok_identifier && IdentifierStr == "binding") {
+                        next();
+                        if (peek() == tok_assign) { next(); if (peek() == tok_number) { binding = (int)NumVal; next(); } }
+                    } else if (peek() == tok_identifier) {
+                        next(); // skip unknown key
+                        if (peek() == tok_assign) { next(); if (peek() == tok_number) next(); }
+                    } else if (peek() == tok_comma) { next(); }
+                    else { next(); }
+                }
+                if (peek() == tok_rparen) next();
+            }
+            if (peek() == tok_uniform)      stmt = parseUniform(binding);
+            else if (peek() == tok_in)      stmt = parseStageVarDecl(true, binding);
+            else if (peek() == tok_out)     stmt = parseStageVarDecl(false, binding);
+            else {
+                logError("Expected 'uniform', 'in', or 'out' after layout(...)");
+                while (peek() != tok_semicolon && peek() != tok_eof) next();
+                if (peek() == tok_semicolon) next();
+            }
         } else if (peek() == tok_uniform) {
             stmt = parseUniform();
         } else if (peek() == tok_struct) {
@@ -323,21 +395,22 @@ std::vector<std::unique_ptr<ExprAST> > Parser::ParseProgram() {
 std::unique_ptr<ExprAST> Parser::parseStruct() {
     next(); // 'struct'
     if (peek() != tok_identifier) {
-        std::cerr << "Expected struct name after 'struct'\n";
+        logError("Expected struct name after 'struct'");
         return nullptr;
     }
     std::string structName = IdentifierStr;
     next(); // struct name
-    
+
     if (peek() != tok_lbrace) {
-        std::cerr << "Expected '{' after struct name\n";
+        logError("Expected '{' after struct name");
         return nullptr;
     }
     next(); // '{'
     std::vector<std::pair<std::string, std::string> > fields;
+    std::unordered_set<std::string> seenFieldNames;
     while (peek() != tok_rbrace) {
         if (peek() != tok_identifier && !isTypeTok(peek())) {
-            std::cerr << "Expected field type in struct\n";
+            logError("Expected field type in struct");
             return nullptr;
         }
         std::string fieldType;
@@ -346,42 +419,46 @@ std::unique_ptr<ExprAST> Parser::parseStruct() {
         } else {
             // check if it's a user-defined struct type
             if (!isUserTypeName(IdentifierStr)) {
-                std::cerr << "Unknown type '" << IdentifierStr << "' in struct field\n";
+                logError(fmt::format("Unknown type '{}' in struct field", IdentifierStr));
                 return nullptr;
             }
             fieldType = IdentifierStr;
         }
         next(); // type
         if (peek() != tok_identifier) {
-            std::cerr << "Expected field name in struct\n";
+            logError("Expected field name in struct");
             return nullptr;
         }
         std::string fieldName = IdentifierStr;
+        if (!seenFieldNames.insert(fieldName).second) {
+            logError(fmt::format("Duplicate field name '{}' in struct", fieldName));
+            return nullptr;
+        }
         next(); // field name
         if (peek() != tok_semicolon) {
-            std::cerr << "Expected ';' after struct field\n";
+            logError("Expected ';' after struct field");
             return nullptr;
         }
         next(); // ';'
         fields.emplace_back(fieldType, fieldName);
     }
     if (peek() != tok_rbrace) {
-        std::cerr << "Expected '}' after struct body\n";
+        logError("Expected '}' after struct body");
         return nullptr;
     }
     next(); // '}'
     if (peek() != tok_semicolon) {
-        std::cerr << "Expected ';' after struct declaration\n";
+        logError("Expected ';' after struct declaration");
         return nullptr;
     }
     next(); // ';'
-    
+
     // add to struct types before cycle check (needed for dependency lookup)
     StructTypes.insert(structName);
-    
+
     // check for recursive struct definitions (both direct and indirect)
     if (hasRecursiveStructs(structName, fields)) {
-        std::cerr << "Error: Struct '" << structName << "' contains recursive definition\n";
+        logError(fmt::format("Struct '{}' contains recursive definition", structName));
         StructTypes.erase(structName);
         StructDependencies.erase(structName);
         return nullptr;
@@ -391,7 +468,7 @@ std::unique_ptr<ExprAST> Parser::parseStruct() {
 }
 
 // Uniform declaration
-std::unique_ptr<ExprAST> Parser::parseUniform() {
+std::unique_ptr<ExprAST> Parser::parseUniform(int /*binding*/) {
     next(); // 'uniform'
     std::string type;
 
@@ -428,11 +505,11 @@ std::unique_ptr<ExprAST> Parser::parseUniform() {
             logError("Expected array size");
             return nullptr;
         }
-        arraySize = static_cast<int>(NumVal);
-        if (arraySize <= 0) {
-            logError("Array size must be positive");
+        if (NumVal < 1.0 || NumVal > 65536.0) {
+            logError(fmt::format("Array size must be between 1 and 65536, got {}", (int)NumVal));
             return nullptr;
         }
+        arraySize = static_cast<int>(NumVal);
         next(); // number
 
         if (peek() != tok_rbracket) {
@@ -490,6 +567,10 @@ std::unique_ptr<ExprAST> Parser::parseFunction() {
         while (true) {
             std::string pty;
 
+            // === Optional qualifier: in, out, inout ===
+            if (peek() == tok_in || peek() == tok_out || peek() == tok_inout)
+                next(); // consume (semantics reserved for future inout pointer passing)
+
             // === PARAM TYPE: built-in or user-defined struct ===
             if (isTypeTok(peek())) {
                 pty = std::string(tokToTypeName(peek()));
@@ -531,6 +612,86 @@ std::unique_ptr<ExprAST> Parser::parseFunction() {
     return std::make_unique<FunctionAST>(std::move(proto), std::move(body));
 }
 
+std::optional<ShaderStage> Parser::stageFromTok(int tok) {
+    switch (tok) {
+        case tok_vertex:   return ShaderStage::Vertex;
+        case tok_fragment: return ShaderStage::Fragment;
+        case tok_compute:  return ShaderStage::Compute;
+        default: return std::nullopt;
+    }
+}
+
+std::optional<FunctionAttrs> Parser::parseFunctionAttrs() {
+    FunctionAttrs attrs;
+
+    while (peek() == tok_at) {
+        next(); // '@'
+
+        if (peek() == tok_entry) {
+            next(); // 'entry'
+            if (attrs.isEntry) {
+                logError("Duplicate @entry");
+                return std::nullopt;
+            }
+            attrs.isEntry = true;
+            continue;
+        }
+
+        if (peek() == tok_stage) {
+            next(); // 'stage'
+
+            if (peek() != tok_lparen) {
+                logError("Expected '(' after @stage");
+                return std::nullopt;
+            }
+            next(); // '('
+
+            auto st = stageFromTok(peek());
+            if (!st.has_value()) {
+                logError("Expected stage name: vertex|fragment|compute");
+                return std::nullopt;
+            }
+            if (attrs.stage.has_value()) {
+                logError("Duplicate @stage");
+                return std::nullopt;
+            }
+            attrs.stage = *st;
+            next(); // consume vertex/fragment/compute
+
+            if (peek() != tok_rparen) {
+                logError("Expected ')' after @stage(...)");
+                return std::nullopt;
+            }
+            next(); // ')'
+            continue;
+        }
+
+        if (peek() == tok_identifier && IdentifierStr == "workgroup_size") {
+            next(); // 'workgroup_size'
+            if (peek() != tok_lparen) { logError("Expected '(' after @workgroup_size"); return std::nullopt; }
+            next(); // '('
+            uint32_t x = 1, y = 1, z = 1;
+            if (peek() == tok_number) { x = (uint32_t)NumVal; next(); }
+            if (peek() == tok_comma)  { next(); if (peek() == tok_number) { y = (uint32_t)NumVal; next(); } }
+            if (peek() == tok_comma)  { next(); if (peek() == tok_number) { z = (uint32_t)NumVal; next(); } }
+            if (peek() != tok_rparen) { logError("Expected ')' after @workgroup_size(...)"); return std::nullopt; }
+            next(); // ')'
+            attrs.workgroupSize = std::array<uint32_t,3>{x, y, z};
+            continue;
+        }
+
+        logError(fmt::format("Unknown attribute after '@': {}", getTokName(peek())));
+        return std::nullopt;
+    }
+
+    if (attrs.isEntry && !attrs.stage.has_value()) {
+        logError("@entry requires @stage(...)");
+        return std::nullopt;
+    }
+
+    return attrs;
+}
+
 // Parse statement
 std::unique_ptr<ExprAST> Parser::parseStatement() {
     switch (peek()) {
@@ -546,10 +707,25 @@ std::unique_ptr<ExprAST> Parser::parseStatement() {
             return parseFor();
         case tok_break:
             return parseBreak();
+        case tok_continue:
+            return parseContinue();
+        case tok_discard:
+            return parseDiscard();
+        case tok_const:
+            next(); // consume 'const'
+            return parseVarDecl();
         case tok_if:
             return parseIfExpr();
         case tok_lbrace:
             return parseBlockExpr();
+        case tok_increment:
+        case tok_decrement: {
+            // prefix ++/-- as a standalone statement (e.g. "++x;")
+            auto expr = parseExpression();
+            if (!expr) return nullptr;
+            if (peek() == tok_semicolon) next();
+            return expr;
+        }
         case tok_identifier:
             // could be var decl for user-defined type
             if (isUserTypeName(IdentifierStr)) {
@@ -576,7 +752,7 @@ std::unique_ptr<ExprAST> Parser::parseBlockExpr() {
         statements.push_back(std::move(stmt));
     }
     if (peek() != tok_rbrace) {
-        std::cerr << "Expected '}' at end of block\n";
+        logError("Expected '}' at end of block");
         return nullptr;
     }
     next(); // '}'
@@ -595,7 +771,7 @@ std::unique_ptr<ExprAST> Parser::parseIfExpr() {
     auto cond = parseExpression();
     if (!cond) return nullptr;
     if (Parser::peek() != tok_rparen) {
-        std::cerr << "Expected ')' in if condition\n";
+        logError("Expected ')' in if condition");
         return nullptr;
     }
     next(); // ')'
@@ -728,6 +904,44 @@ std::unique_ptr<ExprAST> Parser::parseReturn() {
 }
 
 // Break statement
+// Stage variable declaration: in/out type name;
+std::unique_ptr<ExprAST> Parser::parseStageVarDecl(bool isInput, int binding) {
+    next(); // consume 'in' or 'out'
+    std::string type;
+    if (isTypeTok(peek())) {
+        type = std::string(tokToTypeName(peek()));
+        next();
+    } else if (peek() == tok_identifier && isUserTypeName(IdentifierStr)) {
+        type = IdentifierStr;
+        next();
+    } else {
+        logError("Expected type in in/out declaration");
+        return nullptr;
+    }
+    if (peek() != tok_identifier) { logError("Expected name in in/out declaration"); return nullptr; }
+    std::string name = IdentifierStr;
+    next();
+    if (peek() != tok_semicolon) { logError("Expected ';' after in/out declaration"); return nullptr; }
+    next();
+    return std::make_unique<StageVarDeclAST>(isInput, type, name, binding);
+}
+
+// Continue statement
+std::unique_ptr<ExprAST> Parser::parseContinue() {
+    next(); // 'continue'
+    if (peek() != tok_semicolon) { logError("Expected ';' after continue"); return nullptr; }
+    next();
+    return std::make_unique<ContinueStmtAST>();
+}
+
+// Discard statement
+std::unique_ptr<ExprAST> Parser::parseDiscard() {
+    next(); // 'discard'
+    if (peek() != tok_semicolon) { logError("Expected ';' after discard"); return nullptr; }
+    next();
+    return std::make_unique<DiscardStmtAST>();
+}
+
 std::unique_ptr<ExprAST> Parser::parseBreak() {
     if (peek() != tok_break) {
         logError("Expected 'break' keyword");
@@ -776,11 +990,11 @@ std::unique_ptr<ExprAST> Parser::parseVarDecl() {
             logError("Expected array size inside []");
             return nullptr;
         }
-        arraySize = static_cast<int>(NumVal);
-        if (arraySize <= 0) {
-            logError("Array size must be positive");
+        if (NumVal < 1.0 || NumVal > 65536.0) {
+            logError(fmt::format("Array size must be between 1 and 65536, got {}", (int)NumVal));
             return nullptr;
         }
+        arraySize = static_cast<int>(NumVal);
         next(); // number
 
         if (peek() != tok_rbracket) {
@@ -908,6 +1122,31 @@ std::unique_ptr<ExprAST> Parser::parseAssignmentOrExprStatement() {
     // parse left-hand side using primary expression
     auto lhs = parsePrimary();
     if (!lhs) return nullptr;
+    // Compound assignment: a += rhs, a -= rhs, a *= rhs, a /= rhs
+    if (peek() == tok_plus_assign || peek() == tok_minus_assign ||
+        peek() == tok_mul_assign  || peek() == tok_div_assign) {
+        int op = peek();
+        next();
+        auto rhs = parseExpression();
+        if (!rhs) return nullptr;
+        if (peek() != tok_semicolon) { logError("Expected ';' after compound assignment"); return nullptr; }
+        next();
+        int binOp;
+        switch (op) {
+            case tok_plus_assign:  binOp = tok_plus;     break;
+            case tok_minus_assign: binOp = tok_minus;    break;
+            case tok_mul_assign:   binOp = tok_multiply; break;
+            default:               binOp = tok_divide;   break;
+        }
+        if (auto* var = dynamic_cast<VariableExprAST*>(lhs.get())) {
+            auto lhsCopy = std::make_unique<VariableExprAST>(var->Name);
+            auto binExpr = std::make_unique<BinaryExprAST>(binOp, std::move(lhsCopy), std::move(rhs));
+            return std::make_unique<AssignmentExprAST>("", var->Name, std::move(binExpr));
+        }
+        logError("Compound assignment only supported for simple variables");
+        return nullptr;
+    }
+
     // assignment statement - example : a = 5;
     // ReSharper disable once CppDFAConstantConditions
     if (peek() == tok_assign) {
@@ -921,12 +1160,15 @@ std::unique_ptr<ExprAST> Parser::parseAssignmentOrExprStatement() {
         }
         next(); // ';'
 
-        // matrix assignment: a[i] = ... or a[i][j] = ...
+        // matrix assignment: a[i] = col_vec  or  a[i][j] = scalar
         if (auto *maccRaw = dynamic_cast<MatrixAccessExprAST*>(lhs.get())) {
-            // For matrix element assignment, we need special handling
-            // This will be handled in MatrixAccessExprAST or a dedicated assignment class
-            logError("Direct matrix element assignment not yet fully supported");
-            return nullptr;
+            std::unique_ptr<MatrixAccessExprAST> macc(maccRaw);
+            lhs.release();
+            return std::make_unique<MatrixAssignmentExprAST>(
+                std::move(macc->Object),
+                std::move(macc->Index),
+                std::move(macc->Index2),
+                std::move(rhs));
         }
 
         // member assignment: v.xyz = ..., obj.field = ...
@@ -958,29 +1200,56 @@ std::unique_ptr<ExprAST> Parser::parseAssignmentOrExprStatement() {
     return expr;
 }
 
-// parse binary operator right-hand side
-// example : lhs op rhs
+// parse expression, including optional ternary
 std::unique_ptr<ExprAST> Parser::parseExpression() {
-    // parse left-hand side (first operand)
     auto lhs = parseUnary();
     if (!lhs) return nullptr;
-    return parseBinOpRHS(0, std::move(lhs));
+    auto expr = parseBinOpRHS(0, std::move(lhs));
+    if (!expr) return nullptr;
+
+    // Ternary: expr ? thenExpr : elseExpr
+    if (peek() == tok_question) {
+        next(); // '?'
+        auto thenExpr = parseExpression();
+        if (!thenExpr) return nullptr;
+        if (peek() != tok_colon) { logError("Expected ':' in ternary operator"); return nullptr; }
+        next(); // ':'
+        auto elseExpr = parseExpression();
+        if (!elseExpr) return nullptr;
+        return std::make_unique<TernaryExprAST>(std::move(expr), std::move(thenExpr), std::move(elseExpr));
+    }
+    return expr;
 }
 
 // for unary operators
-// example : -x
+// example : -x, ++x, --x
 std::unique_ptr<ExprAST> Parser::parseUnary() {
-    if (peek() == tok_minus || peek() == '-' || 
-        peek() == tok_plus || peek() == '+' || 
-        peek() == tok_not || peek() == '!') {
+    // prefix ++ / --
+    if (peek() == tok_increment || peek() == tok_decrement) {
+        bool isInc = (peek() == tok_increment);
+        next();
+        auto operand = parseUnary();
+        if (!operand) return nullptr;
+        if (auto* var = dynamic_cast<VariableExprAST*>(operand.get())) {
+            auto one     = std::make_unique<NumberExprAST>(1.0);
+            auto varCopy = std::make_unique<VariableExprAST>(var->Name);
+            int binOp    = isInc ? tok_plus : tok_minus;
+            auto binExpr = std::make_unique<BinaryExprAST>(binOp, std::move(varCopy), std::move(one));
+            return std::make_unique<AssignmentExprAST>("", var->Name, std::move(binExpr));
+        }
+        logError("Prefix ++/-- only supported on simple variables");
+        return nullptr;
+    }
+
+    if (peek() == tok_minus || peek() == '-' ||
+        peek() == tok_plus  || peek() == '+' ||
+        peek() == tok_not   || peek() == '!') {
         int Op = peek();
-        next(); // unary operator
-        // for --x or ++x, it is handled here
+        next();
         auto operand = parseUnary();
         if (!operand) return nullptr;
         return std::make_unique<UnaryExprAST>(Op, std::move(operand));
     }
-    // if the current token is not unary operator, it must be a primary expr
     return parsePrimary();
 }
 
@@ -1007,6 +1276,10 @@ std::unique_ptr<ExprAST> Parser::parsePrimary() {
         case tok_mat3x4:
         case tok_mat4x2:
         case tok_mat4x3:
+        case tok_uvec2: case tok_uvec3: case tok_uvec4:
+        case tok_ivec2: case tok_ivec3: case tok_ivec4:
+        case tok_sampler2D: case tok_sampler3D: case tok_samplerCube:
+        case tok_image2D:
             expr = parseIdentifierOrCtorExpr();
             break;
         case tok_number:
@@ -1128,6 +1401,19 @@ std::unique_ptr<ExprAST> Parser::parsePostfixAfterIdent(std::unique_ptr<ExprAST>
                     std::move(base),
                     std::move(idx1)
                 );
+            }
+            continue;
+        }
+        // postfix ++ / --
+        if (peek() == tok_increment || peek() == tok_decrement) {
+            bool isInc = (peek() == tok_increment);
+            next();
+            if (auto* var = dynamic_cast<VariableExprAST*>(base.get())) {
+                auto one     = std::make_unique<NumberExprAST>(1.0);
+                auto varCopy = std::make_unique<VariableExprAST>(var->Name);
+                int binOp    = isInc ? tok_plus : tok_minus;
+                auto binExpr = std::make_unique<BinaryExprAST>(binOp, std::move(varCopy), std::move(one));
+                base = std::make_unique<AssignmentExprAST>("", var->Name, std::move(binExpr));
             }
             continue;
         }

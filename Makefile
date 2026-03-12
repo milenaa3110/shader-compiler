@@ -4,10 +4,17 @@ CXXSTD := -std=c++20
 CXXWARN:= -Wall -Wextra
 
 # LLVM
-LLVM_CXXFLAGS := $(shell llvm-config --cxxflags 2>/dev/null)
-LLVM_LDFLAGS  := $(shell llvm-config --ldflags --system-libs --libs core support 2>/dev/null)
-LLVM_OPT      ?= opt
-LLC           ?= llc
+# LLVM_CXXFLAGS := $(shell llvm-config --cxxflags 2>/dev/null)
+# LLVM_LDFLAGS  := $(shell llvm-config --ldflags --system-libs --libs core support 2>/dev/null)
+# LLVM_OPT      ?= opt
+# LLC           ?= llc
+# LLVM
+LLVM_CONFIG   := llvm-config-18
+LLVM_CXXFLAGS := $(shell $(LLVM_CONFIG) --cxxflags)
+LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags --system-libs --libs core support)
+LLVM_OPT      := opt-18
+LLC           := llc-18
+
 
 # RISC-V toolchain
 QEMU_USER     ?= qemu-riscv64
@@ -59,31 +66,34 @@ $(OBJDIR_LLVM):
 # ---- compile rules ----
 # CODEGEN objects
 $(OBJDIR_LLVM)/%.o: $(LEXER_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -MMD -MP -fPIC -c $< -o $@
 $(OBJDIR_LLVM)/%.o: $(PARSER_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
 $(OBJDIR_LLVM)/%.o: $(CODEGEN_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(CODEGEN_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
 $(OBJDIR_LLVM)/%.o: $(AST_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
 $(OBJDIR_LLVM)/%.o: $(HELPERS_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -MMD -MP -fPIC -c $< -o $@
 $(OBJDIR_LLVM)/%.o: $(MAINCODEGEN_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -MMD -MP -fPIC -c $< -o $@
 
 # IRGEN objects (prefix irgen_)
 $(OBJDIR_LLVM)/irgen_%.o: $(MAIN_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -MMD -MP -fPIC -c $< -o $@
 $(OBJDIR_LLVM)/irgen_%.o: $(LEXER_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -MMD -MP -fPIC -c $< -o $@
 $(OBJDIR_LLVM)/irgen_%.o: $(PARSER_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
 $(OBJDIR_LLVM)/irgen_%.o: $(CODEGEN_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(CODEGEN_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
 $(OBJDIR_LLVM)/irgen_%.o: $(AST_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
 $(OBJDIR_LLVM)/irgen_%.o: $(HELPERS_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -fPIC -c $< -o $@
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -MMD -MP -fPIC -c $< -o $@
+
+# Auto-generated header dependencies
+-include $(wildcard $(OBJDIR_LLVM)/*.d)
 
 # ---- link ----
 $(TARGET_CODEGEN): $(OBJDIR_LLVM) $(CODEGEN_OBJS)
@@ -110,8 +120,26 @@ librvshade.so: shader.o
 test_host.rv: $(TEST_DIR_RISCV)/test_host.cpp librvshade.so
 	$(CROSS_CXX) -O3 -flto $< -L. -lrvshade -Wl,-rpath,'$$ORIGIN' -o $@
 
+RESULT_DIR     := result
+TEST_HOST_SRC  := $(TEST_DIR_RISCV)/test_host.cpp
+
+# ---- native render (no QEMU, host architecture) ----
+shader_native.o: module.opt.ll
+	llc-18 -O3 -filetype=obj -o $@ $<
+
+render_host: $(TEST_HOST_SRC) shader_native.o
+	$(CXX) $(CXXSTD) -O3 $(TEST_HOST_SRC) shader_native.o -o $@
+
+.PHONY: render
+render: module.opt.ll render_host
+	@mkdir -p $(RESULT_DIR)
+	./render_host
+	@echo "Image: $(RESULT_DIR)/shader_out.ppm"
+
+# ---- RISC-V render (requires QEMU) ----
 .PHONY: run-riscv
 run-riscv: test_host.rv
+	@mkdir -p $(RESULT_DIR)
 	$(QEMU_USER) -L $(RISCV_SYSROOT) ./test_host.rv
 
 # interactive codegen run
@@ -131,9 +159,21 @@ opt: module.opt.ll
 so: librvshade.so
 test: run-riscv
 
+# ---- unit tests ----
+TEST_SCRIPT := test/run_tests.sh
+
+.PHONY: check check-verbose
+check: all
+	@bash $(TEST_SCRIPT) --no-build
+
+check-verbose: all
+	@bash $(TEST_SCRIPT) --no-build --verbose
+
 # ---- clean ----
 .PHONY: clean
 clean:
 	rm -rf $(BUILD_DIR)
 	rm -f $(TARGET_CODEGEN) $(TARGET_IRGEN) \
-	      module.ll module.opt.ll shader.o librvshade.so test_host.rv
+	      module.ll module.opt.ll shader.o shader_native.o \
+	      librvshade.so test_host.rv render_host
+	rm -rf $(RESULT_DIR)

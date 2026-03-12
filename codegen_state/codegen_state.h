@@ -18,13 +18,35 @@ struct StructInfo {
     std::vector<std::string> FieldNames;
 };
 
+// Stage variable descriptor (in/out declarations at file scope)
+struct StageVar {
+    std::string name;
+    std::string typeName;
+    bool isInput; // true = "in", false = "out"
+    int  binding; // -1 if no layout(binding=N)
+};
+
+// Resource binding descriptor (sampler/image uniforms)
+struct ResourceBinding {
+    std::string typeName; // "sampler2D", "samplerCube", "image2D", ...
+    std::string name;
+    int         binding;
+};
+
 extern std::unique_ptr<llvm::LLVMContext> Context;
 extern std::unique_ptr<llvm::Module> TheModule;
 extern std::unique_ptr<llvm::IRBuilder<>> Builder;
 extern std::map<std::string, llvm::AllocaInst*> NamedValues;
 extern std::unordered_map<std::string, StructInfo> NamedStructTypes;
 extern std::vector<llvm::BasicBlock*> BreakStack;
+extern std::vector<llvm::BasicBlock*> ContinueStack;  // for 'continue' statement
 extern std::map<std::string, llvm::GlobalVariable*> UniformArrays;
+
+// Stage variable registries — populated by StageVarDeclAST::codegen()
+extern std::vector<StageVar> StageInputVars;
+extern std::vector<StageVar> StageOutputVars;
+// Resource bindings for samplers/images
+extern std::vector<ResourceBinding> ResourceBindings;
 
 inline llvm::AllocaInst* CreateEntryBlockAlloca(llvm::Function* F,
                                                 const std::string& name,

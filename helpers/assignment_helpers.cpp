@@ -112,14 +112,10 @@ Value* MatrixColumnAssigner::codegen() {
             comps.push_back(s);
     }
 
-    Value* curMat = Builder->CreateLoad(matTy, alloca);
-    AllocaInst* tmpA = CreateEntryBlockAlloca(
-        Builder->GetInsertBlock()->getParent(), "tmp.mat", matTy);
-    Builder->CreateStore(curMat, tmpA);
-
-    Value* zero = ConstantInt::get(Type::getInt32Ty(*Context), 0);
-    Value* colPtr = Builder->CreateGEP(matTy, tmpA, {zero, colIdx}, "col.ptr");
-    Value* colVal = Builder->CreateLoad(colTy, colPtr);
+    // GEP directly to the target column inside alloca — no full-matrix copy needed
+    Value* zero   = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+    Value* colPtr = Builder->CreateInBoundsGEP(matTy, alloca, {zero, colIdx}, "col.ptr");
+    Value* colVal = Builder->CreateLoad(colTy, colPtr, "col.old");
 
     Value* newCol = colVal;
     for (unsigned i = 0; i < K; ++i) {
@@ -128,9 +124,7 @@ Value* MatrixColumnAssigner::codegen() {
     }
 
     Builder->CreateStore(newCol, colPtr);
-    Value* newMat = Builder->CreateLoad(matTy, tmpA);
-    Builder->CreateStore(newMat, alloca);
-    return newMat;
+    return newCol;
 }
 
 StructFieldAssigner::StructFieldAssigner(ExprAST* obj, const std::string& field, ExprAST* rhs)
@@ -186,7 +180,10 @@ Value* StructFieldAssigner::codegen() {
     }
 
     Type* objTy = alloca->getAllocatedType();
-    if (!objTy->isStructTy()) return nullptr;
+    if (!objTy->isStructTy()) {
+        logError("Struct field assignment: LHS is not a struct type");
+        return nullptr;
+    }
 
     auto* st = cast<StructType>(objTy);
     unsigned idx = findFieldIndex(st);
@@ -202,6 +199,7 @@ Value* StructFieldAssigner::codegen() {
         Builder->CreateStore(updated, alloca);
         return updated;
     }
+    logError("Struct field assignment: LHS must be a simple variable expression");
     return nullptr;
 }
 VectorSwizzleAssigner::VectorSwizzleAssigner(ExprAST* vecVar, const std::string& swizzle, ExprAST* rhs)

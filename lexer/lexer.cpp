@@ -34,7 +34,32 @@ static std::unordered_map<std::string, int> keywords = {
     {"break", tok_break},
     {"struct", tok_struct},
     {"uniform", tok_uniform},
-    {"void", tok_void}
+    {"void", tok_void},
+    {"stage", tok_stage},
+    {"entry", tok_entry},
+    {"vertex", tok_vertex},
+    {"fragment", tok_fragment},
+    {"compute", tok_compute},
+    // Stage interface qualifiers
+    {"in",    tok_in},
+    {"out",   tok_out},
+    {"inout", tok_inout},
+    // Integer vector types
+    {"uvec2", tok_uvec2},
+    {"uvec3", tok_uvec3},
+    {"uvec4", tok_uvec4},
+    {"ivec2", tok_ivec2},
+    {"ivec3", tok_ivec3},
+    {"ivec4", tok_ivec4},
+    // Sampler / image types
+    {"sampler2D",   tok_sampler2D},
+    {"sampler3D",   tok_sampler3D},
+    {"samplerCube", tok_samplerCube},
+    {"image2D",     tok_image2D},
+    // Additional keywords
+    {"continue", tok_continue},
+    {"discard",  tok_discard},
+    {"const",    tok_const},
 };
 
 int gettok() {
@@ -79,6 +104,19 @@ int gettok() {
             NumStr += LastChar;
             LastChar = getchar();
         }
+        // Scientific notation: e.g. 1.5e3 or 2E-4
+        if (LastChar == 'e' || LastChar == 'E') {
+            NumStr += LastChar;
+            LastChar = getchar();
+            if (LastChar == '+' || LastChar == '-') {
+                NumStr += LastChar;
+                LastChar = getchar();
+            }
+            while (isdigit(LastChar)) {
+                NumStr += LastChar;
+                LastChar = getchar();
+            }
+        }
         NumVal = strtod(NumStr.c_str(), nullptr);
         return tok_number;
     }
@@ -91,10 +129,26 @@ int gettok() {
     }
 
     switch (LastChar) {
-        case '+': LastChar = getchar(); return tok_plus;
-        case '*': LastChar = getchar(); return tok_multiply;
-        case '/': LastChar = getchar(); return tok_divide;
-        case '-': LastChar = getchar(); return tok_minus;
+        case '+':
+            LastChar = getchar();
+            if (LastChar == '+') { LastChar = getchar(); return tok_increment; }
+            if (LastChar == '=') { LastChar = getchar(); return tok_plus_assign; }
+            return tok_plus;
+        case '-':
+            LastChar = getchar();
+            if (LastChar == '-') { LastChar = getchar(); return tok_decrement; }
+            if (LastChar == '=') { LastChar = getchar(); return tok_minus_assign; }
+            return tok_minus;
+        case '*':
+            LastChar = getchar();
+            if (LastChar == '=') { LastChar = getchar(); return tok_mul_assign; }
+            return tok_multiply;
+        case '/':
+            LastChar = getchar();
+            if (LastChar == '=') { LastChar = getchar(); return tok_div_assign; }
+            return tok_divide;
+        case '?': LastChar = getchar(); return tok_question;
+        case ':': LastChar = getchar(); return tok_colon;
         case '(': LastChar = getchar(); return tok_lparen;
         case ')': LastChar = getchar(); return tok_rparen;
         case '[': LastChar = getchar(); return tok_lbracket;
@@ -103,6 +157,7 @@ int gettok() {
         case ';': LastChar = getchar(); return tok_semicolon;
         case '{': LastChar = getchar(); return tok_lbrace;
         case '}': LastChar = getchar(); return tok_rbrace;
+        case '@': LastChar = getchar(); return tok_at;
 
         case '=':
             if ((LastChar = getchar()) == '=') {
@@ -137,14 +192,14 @@ int gettok() {
                 LastChar = getchar();
                 return tok_and;
             }
-            return '&';
+            return tok_bitwise_and;  // bare '&' — not a supported operator
 
         case '|':
             if ((LastChar = getchar()) == '|') {
                 LastChar = getchar();
                 return tok_or;
             }
-            return '|';
+            return tok_bitwise_or;   // bare '|' — not a supported operator
 
         case '.':
             LastChar = getchar();

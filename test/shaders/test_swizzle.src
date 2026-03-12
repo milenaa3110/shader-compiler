@@ -1,0 +1,26 @@
+# test_swizzle.src - vector swizzle read and write
+
+fn vec4 shade(vec2 uv) {
+    vec4 col = vec4(uv.x, uv.y, 0.5, 1.0);
+
+    # swizzle read - single component
+    float r = col.x;
+    float g = col.y;
+
+    # swizzle read - multi component
+    vec2 rg = col.xy;
+    vec3 rgb = col.xyz;
+
+    # swizzle write
+    vec3 v = vec3(0.0, 0.0, 0.0);
+    v.x = uv.x;
+    v.yz = uv;
+
+    # rgb alias
+    vec3 alt = vec3(0.0, 0.0, 0.0);
+    alt.r = col.r;
+    alt.g = col.g;
+    alt.b = rgb.z;
+
+    return vec4(v.x, v.y, v.z, 1.0);
+}

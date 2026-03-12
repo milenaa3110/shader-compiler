@@ -1,0 +1,33 @@
+# test_operators.src - compound assignment, increment/decrement, ternary
+
+fn vec4 shade(vec2 uv) {
+    float x = uv.x;
+    float y = uv.y;
+
+    # compound assignment
+    float a = 0.5;
+    a += x;
+    a -= 0.1;
+    a *= 2.0;
+    a /= 1.5;
+
+    # prefix ++/--
+    float b = 0.0;
+    b += 1.0;
+    ++b;
+    --b;
+
+    # postfix ++/--
+    float c = 1.0;
+    c++;
+    c--;
+
+    # ternary ? :
+    float big  = (x > y) ? x : y;
+    float small = (x < y) ? x : y;
+
+    # nested ternary
+    float clamped = (a < 0.0) ? 0.0 : ((a > 1.0) ? 1.0 : a);
+
+    return vec4(big, small, clamped, 1.0);
+}

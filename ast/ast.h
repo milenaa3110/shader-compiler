@@ -6,10 +6,36 @@
 #include <memory>
 #include <iostream>
 #include "../lexer/lexer.h"
-#include <unordered_map>
+#include <array>
+#include <optional>
 
 // Forward declaration of LLVM classes
 namespace llvm { class Value; }
+
+enum class ShaderStage {
+    Vertex,
+    Fragment,
+    Compute
+};
+
+enum class Builtin {
+    Position,
+    FragCoord,
+    FragDepth,
+    VertexId,
+    InstanceId,
+    GlobalInvocationId,
+    LocalInvocationId,
+    WorkgroupId,
+    NumWorkgroups,
+    LocalInvocationIndex
+};
+
+struct FunctionAttrs {
+    bool isEntry = false;
+    std::optional<ShaderStage> stage;
+    std::optional<std::array<uint32_t,3>> workgroupSize;
+};
 
 // Helper function to print indentation
 inline void printIndent(int indent) {
@@ -94,6 +120,26 @@ public:
     }
 };
 
+// Ternary operator: cond ? then : else
+class TernaryExprAST : public ExprAST {
+public:
+    std::unique_ptr<ExprAST> Cond, ThenExpr, ElseExpr;
+
+    TernaryExprAST(std::unique_ptr<ExprAST> cond,
+                   std::unique_ptr<ExprAST> then_,
+                   std::unique_ptr<ExprAST> else_)
+        : Cond(std::move(cond)), ThenExpr(std::move(then_)), ElseExpr(std::move(else_)) {}
+
+    llvm::Value* codegen() override;
+    void print(int indent = 0) const override {
+        printIndent(indent);
+        std::cout << "Ternary\n";
+        Cond->print(indent + 1);
+        ThenExpr->print(indent + 1);
+        ElseExpr->print(indent + 1);
+    }
+};
+
 // Boolean literal
 class BooleanExprAST : public ExprAST {
 public:
@@ -165,6 +211,31 @@ public:
         Object->print(indent + 1);
         Index->print(indent + 1);
         if (Index2) Index2->print(indent + 1);
+    }
+};
+
+// Matrix element assignment: mat[i] = col_vec  or  mat[i][j] = scalar
+class MatrixAssignmentExprAST : public ExprAST {
+public:
+    std::unique_ptr<ExprAST> Object;  // the matrix variable
+    std::unique_ptr<ExprAST> Index;   // column index
+    std::unique_ptr<ExprAST> Index2;  // row index (nullptr => whole-column assignment)
+    std::unique_ptr<ExprAST> RHS;
+
+    MatrixAssignmentExprAST(std::unique_ptr<ExprAST> obj,
+                            std::unique_ptr<ExprAST> idx,
+                            std::unique_ptr<ExprAST> idx2,
+                            std::unique_ptr<ExprAST> rhs)
+        : Object(std::move(obj)), Index(std::move(idx)),
+          Index2(std::move(idx2)), RHS(std::move(rhs)) {}
+
+    llvm::Value* codegen() override;
+
+    void print(int indent = 0) const override {
+        printIndent(indent);
+        std::cout << "MatrixAssignment: [" << (Index2 ? "][" : "") << "] = ...\n";
+        Object->print(indent + 1);
+        RHS->print(indent + 1);
     }
 };
 
@@ -285,17 +356,34 @@ class FunctionAST : public ExprAST {
 public:
     std::unique_ptr<PrototypeAST> Proto;
     std::unique_ptr<ExprAST> Body;
+    FunctionAttrs Attrs;
 
     FunctionAST(std::unique_ptr<PrototypeAST> proto,
-                std::unique_ptr<ExprAST> body)
-      : Proto(std::move(proto)), Body(std::move(body)) {}
+                std::unique_ptr<ExprAST> body,
+                FunctionAttrs attrs = {})
+      : Proto(std::move(proto)), Body(std::move(body)), Attrs(std::move(attrs)) {}
 
     llvm::Value* codegen() override;
     void print(int indent=0) const override {
-        printIndent(indent); std::cout << "Function: " << Proto->Name << "\n";
+        printIndent(indent);
+        std::cout << "Function: " << Proto->Name;
+
+        if (Attrs.stage.has_value()) {
+            std::cout << " [stage=";
+            switch (*Attrs.stage) {
+                case ShaderStage::Vertex:   std::cout << "vertex"; break;
+                case ShaderStage::Fragment: std::cout << "fragment"; break;
+                case ShaderStage::Compute:  std::cout << "compute"; break;
+            }
+            std::cout << "]";
+        }
+        if (Attrs.isEntry) std::cout << " [entry]";
+        std::cout << "\n";
+
         Body->print(indent+1);
     }
 };
+
 
 // Return statement
 class ReturnStmtAST : public ExprAST {
@@ -393,6 +481,28 @@ public:
     }
 };
 
+// Continue statement
+class ContinueStmtAST : public ExprAST {
+public:
+    ContinueStmtAST() = default;
+    llvm::Value* codegen() override;
+    void print(int indent = 0) const override {
+        printIndent(indent);
+        std::cout << "Continue\n";
+    }
+};
+
+// Discard statement (fragment stage only)
+class DiscardStmtAST : public ExprAST {
+public:
+    DiscardStmtAST() = default;
+    llvm::Value* codegen() override;
+    void print(int indent = 0) const override {
+        printIndent(indent);
+        std::cout << "Discard\n";
+    }
+};
+
 // STRUCT DECLARATION
 
 class StructDeclExprAST : public ExprAST {
@@ -411,6 +521,24 @@ public:
             printIndent(indent + 4);
             std::cout << "Field: " << field.first << " " << field.second << "\n";
         }
+    }
+};
+
+// Stage variable declaration: in/out type name;
+class StageVarDeclAST : public ExprAST {
+public:
+    bool isInput;   // true = "in", false = "out"
+    std::string TypeName;
+    std::string Name;
+    int binding;    // -1 if no layout(binding=N)
+
+    StageVarDeclAST(bool isInput_, std::string typeName, std::string name, int binding_ = -1)
+        : isInput(isInput_), TypeName(std::move(typeName)), Name(std::move(name)), binding(binding_) {}
+
+    llvm::Value* codegen() override;
+    void print(int indent = 0) const override {
+        printIndent(indent + 2);
+        std::cout << (isInput ? "StageIn: " : "StageOut: ") << TypeName << " " << Name << "\n";
     }
 };
 
