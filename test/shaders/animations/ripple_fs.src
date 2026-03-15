@@ -1,0 +1,41 @@
+# ripple_fs.src — Water ripples: interference of 5 expanding wave sources
+# Tests: sqrt per-source, additive wave interference on RVV
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float u = vUV.x;
+    float v = vUV.y;
+    float wave = 0.0;
+
+    # Source 1: center
+    float d1 = sqrt((u - 0.5) * (u - 0.5) + (v - 0.5) * (v - 0.5));
+    wave = wave + sin(d1 * 32.0 - uTime * 5.0) / (d1 * 12.0 + 0.8);
+
+    # Source 2: top-left
+    float d2 = sqrt((u - 0.2) * (u - 0.2) + (v - 0.25) * (v - 0.25));
+    wave = wave + sin(d2 * 28.0 - uTime * 4.5 + 1.0) / (d2 * 10.0 + 0.8);
+
+    # Source 3: bottom-right
+    float d3 = sqrt((u - 0.78) * (u - 0.78) + (v - 0.75) * (v - 0.75));
+    wave = wave + sin(d3 * 36.0 - uTime * 5.5 + 2.1) / (d3 * 14.0 + 0.8);
+
+    # Source 4: top-right (slow)
+    float d4 = sqrt((u - 0.75) * (u - 0.75) + (v - 0.22) * (v - 0.22));
+    wave = wave + sin(d4 * 20.0 - uTime * 3.0 + 3.7) / (d4 * 8.0 + 1.0);
+
+    # Source 5: bottom-left
+    float d5 = sqrt((u - 0.22) * (u - 0.22) + (v - 0.78) * (v - 0.78));
+    wave = wave + sin(d5 * 24.0 - uTime * 4.0 + 5.5) / (d5 * 9.0 + 1.0);
+
+    wave = clamp(wave * 0.3 + 0.5, 0.0, 1.0);
+
+    float r = mix(0.0,  0.6, wave) + mix(0.4, 0.9, wave * wave);
+    float g = mix(0.15, 0.7, wave);
+    float b = mix(0.5,  1.0, wave);
+
+    FragColor = vec4(r, g, b, 1.0);
+}

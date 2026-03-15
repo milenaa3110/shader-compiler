@@ -1,0 +1,10 @@
+# terrain_fs.src — Fragment shader for animated terrain
+# Just passes through the interpolated per-vertex color.
+
+in vec4 vColor;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    FragColor = vColor;
+}

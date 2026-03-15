@@ -1,0 +1,42 @@
+# galaxy_fs.src — Spiral galaxy: logarithmic spiral arms + star glow field
+# Tests: log, exp, continuous polar-coordinate math on RVV
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float dx = vUV.x - 0.5;
+    float dy = vUV.y - 0.5;
+    float r  = sqrt(dx * dx + dy * dy) + 0.0001;
+
+    # Angle: use atan2 via normalized coords
+    float nx = dx / r;
+    float ny = dy / r;
+    float angle = (nx + 1.0) * 0.5 + step(0.0, -ny) * 0.5;   # 0..1
+
+    # Log-spiral arm density: 4 arms
+    float spiral = fract(angle * 4.0 - log(r * 6.0 + 1.0) * 1.2 - uTime * 0.15);
+    float armWidth = smoothstep(0.0, 0.2, spiral) * smoothstep(1.0, 0.8, spiral);
+
+    # Radial brightness fall-off
+    float glow   = exp(-r * 5.0);
+    float bright = armWidth * exp(-r * 3.5) + glow * 0.3;
+
+    # Core: bright white center
+    float core = exp(-r * 20.0) * 2.0;
+
+    # Star field (pseudo-random from position)
+    float starSeed = sin(dx * 127.3 + dy * 311.7) * 43758.5;
+    float star     = step(0.998, fract(starSeed)) * 0.7;
+
+    # Color: spiral = blue-white, outer = reddish
+    float hue = r * 0.8 + uTime * 0.05;
+    float rc  = 0.6 + 0.4 * sin(hue * 3.14);
+    float gc  = 0.5 + 0.5 * sin(hue * 3.14 + 1.5);
+    float bc  = 0.8 + 0.2 * sin(hue * 3.14 + 3.0);
+
+    float total = clamp(bright + core + star, 0.0, 1.0);
+    FragColor = vec4(total * rc, total * gc, total * bc, 1.0);
+}

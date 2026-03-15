@@ -1,0 +1,35 @@
+# julia_fs.src — Julia set with animated c parameter tracing a cardioid
+# c = 0.7885 * (cos(t), sin(t)) sweeps through beautiful Julia sets
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float cr = 0.7885 * cos(uTime * 0.4);
+    float ci = 0.7885 * sin(uTime * 0.4);
+
+    float zx = (vUV.x - 0.5) * 3.2;
+    float zy = (vUV.y - 0.5) * 3.2;
+    float iter = 0.0;
+
+    for (float i = 0.0; i < 64.0; i = i + 1.0) {
+        if (zx * zx + zy * zy < 4.0) {
+            float nx = zx * zx - zy * zy + cr;
+            float ny = 2.0 * zx * zy + ci;
+            zx = nx;
+            zy = ny;
+            iter = i + 1.0;
+        }
+    }
+
+    float escaped = step(3.99, zx * zx + zy * zy);
+    float t = iter / 64.0;
+
+    float r = 0.5 + 0.5 * sin(t * 9.42 + uTime);
+    float g = 0.5 + 0.5 * sin(t * 9.42 + uTime + 2.09);
+    float b = 0.5 + 0.5 * sin(t * 9.42 + uTime + 4.19);
+
+    FragColor = vec4(r * escaped, g * escaped, b * escaped, 1.0);
+}

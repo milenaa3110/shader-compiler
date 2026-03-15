@@ -1,0 +1,37 @@
+# tunnel_fs.src — Infinite tunnel effect using polar coordinates + fract
+# Demonstrates: fract/floor tiling, atan approximation via geometry
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float dx = vUV.x - 0.5;
+    float dy = vUV.y - 0.5;
+    float r  = sqrt(dx * dx + dy * dy) + 0.0001;
+
+    # Approximate angle: atan2(dy, dx) via normalized vector
+    float nx = dx / r;
+    float ny = dy / r;
+    # angle in [0,1]: use (nx+1)/2 as "horizontal angle proxy" and flip by sign(dy)
+    float angle = (nx + 1.0) * 0.25 + step(0.0, -ny) * 0.5;
+
+    float depth   = 1.0 / r;
+    float tAngle  = fract(angle * 8.0 + uTime * 0.05);
+    float tDepth  = fract(depth * 0.4 - uTime * 0.8);
+
+    # Ring and spoke pattern
+    float ringMask  = smoothstep(0.1, 0.4, tDepth) * smoothstep(0.9, 0.6, tDepth);
+    float spokeMask = smoothstep(0.0, 0.1, tAngle) * smoothstep(1.0, 0.9, tAngle);
+
+    float bright = max(ringMask, spokeMask);
+    float fade   = clamp(1.0 - r * 2.0, 0.0, 1.0);
+
+    float col = fract(depth * 0.4 - uTime * 0.8 + angle * 0.2);
+    float rc  = 0.5 + 0.5 * sin(col * 6.28 + uTime);
+    float gc  = 0.5 + 0.5 * sin(col * 6.28 + uTime + 2.09);
+    float bc  = 0.5 + 0.5 * sin(col * 6.28 + uTime + 4.19);
+
+    FragColor = vec4(rc * bright * fade, gc * bright * fade, bc * bright * fade, 1.0);
+}

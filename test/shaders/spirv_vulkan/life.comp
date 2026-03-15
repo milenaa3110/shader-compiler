@@ -1,0 +1,42 @@
+#version 450
+// Conway's Game of Life — one generation per dispatch.
+// binding 0 = read grid, binding 1 = write grid (ping-pong)
+// push constants: width, height
+// workgroup: 16x16
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly  buffer In  { uint src[]; };
+layout(std430, binding = 1) writeonly buffer Out { uint dst[]; };
+
+layout(push_constant) uniform PC {
+    uint width;
+    uint height;
+} pc;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) return;
+
+    uint W = pc.width;
+    uint H = pc.height;
+
+    // Count live neighbours (8-connected, wrap-around)
+    uint alive = 0u;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            uint nx = (x + uint(dx + int(W))) % W;
+            uint ny = (y + uint(dy + int(H))) % H;
+            alive += src[ny * W + nx];
+        }
+    }
+
+    uint cell = src[y * W + x];
+    // Conway rules: live cell survives with 2 or 3 neighbours;
+    //               dead cell is born with exactly 3 neighbours.
+    uint next = ((cell == 1u && (alive == 2u || alive == 3u)) ||
+                 (cell == 0u &&  alive == 3u)) ? 1u : 0u;
+    dst[y * W + x] = next;
+}

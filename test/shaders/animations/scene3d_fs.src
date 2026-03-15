@@ -1,0 +1,137 @@
+# scene3d_fs.src — Analytical 3D ray tracer: two animated spheres + checker floor
+# Demonstrates: 3D ray-object intersection, Blinn-Phong shading on RISC-V RVV
+# No loops — O(1) per pixel; contrast with GPU's massively parallel execution
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    # ── Camera: orbits around origin ─────────────────────────────────────────
+    float camX = sin(uTime * 0.35) * 3.8;
+    float camY = 1.6;
+    float camZ = cos(uTime * 0.35) * 3.8;
+
+    # Normalize forward vector toward origin
+    float fwdLen = sqrt(camX*camX + camY*camY + camZ*camZ);
+    float fwdX = -camX / fwdLen;
+    float fwdY = -camY / fwdLen;
+    float fwdZ = -camZ / fwdLen;
+
+    # Right = cross(forward, world_up=(0,1,0)) = (fz, 0, -fx)
+    float rightX = fwdZ;
+    float rightZ = -fwdX;
+    float rLen = sqrt(rightX*rightX + rightZ*rightZ);
+    rightX = rightX / rLen;
+    rightZ = rightZ / rLen;
+
+    # Up = cross(right, forward)
+    float upX = 0.0*fwdZ - rightZ*fwdY;
+    float upY = rightZ*fwdX - rightX*fwdZ;
+    float upZ = rightX*fwdY - 0.0*fwdX;
+
+    # Ray direction
+    float su = vUV.x - 0.5;
+    float sv = vUV.y - 0.5;
+    float rdX = fwdX + su*rightX + sv*upX;
+    float rdY = fwdY + sv*upY;
+    float rdZ = fwdZ + su*rightZ + sv*upZ;
+    float rdLen = sqrt(rdX*rdX + rdY*rdY + rdZ*rdZ);
+    rdX = rdX / rdLen;
+    rdY = rdY / rdLen;
+    rdZ = rdZ / rdLen;
+
+    # ── Sphere 1: animated (warm palette) ────────────────────────────────────
+    float s1x = sin(uTime * 1.2) * 0.9;
+    float s1y = abs(sin(uTime * 1.9)) * 0.5 + 0.1;
+    float s1z = cos(uTime * 1.4) * 0.7;
+    float r1 = 0.42;
+
+    float ox1 = camX - s1x; float oy1 = camY - s1y; float oz1 = camZ - s1z;
+    float A1 = rdX*rdX + rdY*rdY + rdZ*rdZ;
+    float B1 = 2.0*(rdX*ox1 + rdY*oy1 + rdZ*oz1);
+    float C1 = ox1*ox1 + oy1*oy1 + oz1*oz1 - r1*r1;
+    float disc1 = B1*B1 - 4.0*A1*C1;
+    float hasHit1 = step(0.0, disc1);
+    float t1raw = (-B1 - sqrt(abs(disc1))) * 0.5;
+    float t1 = hasHit1 * max(0.001, t1raw) + (1.0 - hasHit1) * 9999.0;
+
+    # ── Sphere 2: animated (cool palette) ────────────────────────────────────
+    float s2x = cos(uTime * 0.8) * 0.7;
+    float s2y = 0.15;
+    float s2z = sin(uTime * 1.1) * 0.8;
+    float r2 = 0.30;
+
+    float ox2 = camX - s2x; float oy2 = camY - s2y; float oz2 = camZ - s2z;
+    float B2 = 2.0*(rdX*ox2 + rdY*oy2 + rdZ*oz2);
+    float C2 = ox2*ox2 + oy2*oy2 + oz2*oz2 - r2*r2;
+    float disc2 = B2*B2 - 4.0*C2;
+    float hasHit2 = step(0.0, disc2);
+    float t2raw = (-B2 - sqrt(abs(disc2))) * 0.5;
+    float t2 = hasHit2 * max(0.001, t2raw) + (1.0 - hasHit2) * 9999.0;
+
+    # ── Floor plane y = -0.55 ────────────────────────────────────────────────
+    float tFloor = (-0.55 - camY) / (rdY - 0.0001 * step(0.0, 0.0001 - abs(rdY)));
+    float t3 = max(0.001, tFloor) + step(abs(tFloor), 0.001) * 9999.0;
+
+    # ── Nearest hit ──────────────────────────────────────────────────────────
+    float tmin = min(min(t1, t2), t3);
+    float hs1 = step(tmin, t1 + 0.001) * step(0.0, hasHit1 - 0.5);
+    float hs2 = step(tmin, t2 + 0.001) * step(0.0, hasHit2 - 0.5) * (1.0 - hs1);
+    float hfl = step(tmin, t3 + 0.001) * (1.0 - hs1) * (1.0 - hs2);
+    float hitAny = step(tmin, 999.0);
+
+    float px = camX + rdX * tmin;
+    float py = camY + rdY * tmin;
+    float pz = camZ + rdZ * tmin;
+
+    # ── Normals ───────────────────────────────────────────────────────────────
+    float nx = hs1*(px-s1x)/r1 + hs2*(px-s2x)/r2 + hfl*0.0;
+    float ny = hs1*(py-s1y)/r1 + hs2*(py-s2y)/r2 + hfl*1.0;
+    float nz = hs1*(pz-s1z)/r1 + hs2*(pz-s2z)/r2 + hfl*0.0;
+
+    # ── Materials ─────────────────────────────────────────────────────────────
+    float ph = uTime * 0.4;
+    float m1r = 0.5 + 0.5*cos(ph);
+    float m1g = 0.5 + 0.5*cos(ph + 2.09);
+    float m1b = 0.5 + 0.5*cos(ph + 4.19);
+
+    # Floor checker via sin-grid
+    float chk = step(0.0, sin(px * 6.2832) * sin(pz * 6.2832));
+    float mFr = mix(0.85, 0.2, chk);
+    float mFg = mix(0.85, 0.2, chk);
+    float mFb = mix(0.90, 0.3, chk);
+
+    float matR = hs1*m1r + hs2*0.25 + hfl*mFr;
+    float matG = hs1*m1g + hs2*0.45 + hfl*mFg;
+    float matB = hs1*m1b + hs2*0.95 + hfl*mFb;
+
+    # ── Lighting ──────────────────────────────────────────────────────────────
+    float lx = sin(uTime*0.6)*3.0 - px;
+    float ly = 3.5 - py;
+    float lz = cos(uTime*0.6)*2.5 - pz;
+    float lLen = sqrt(lx*lx + ly*ly + lz*lz);
+    float ldx = lx/lLen; float ldy = ly/lLen; float ldz = lz/lLen;
+
+    float diff = clamp(nx*ldx + ny*ldy + nz*ldz, 0.0, 1.0);
+
+    # Blinn-Phong half-vector
+    float hx = ldx - rdX; float hy = ldy - rdY; float hz = ldz - rdZ;
+    float hLen = sqrt(hx*hx + hy*hy + hz*hz) + 0.001;
+    float spec = pow(clamp((nx*hx + ny*hy + nz*hz)/hLen, 0.0, 1.0), 48.0);
+
+    float ambR = 0.07; float ambG = 0.09; float ambB = 0.12;
+    float fr = (matR*(diff*0.85 + ambR) + spec*0.3) * hitAny;
+    float fg = (matG*(diff*0.85 + ambG) + spec*0.28) * hitAny;
+    float fb = (matB*(diff*0.85 + ambB) + spec*0.25) * hitAny;
+
+    # ── Sky gradient ──────────────────────────────────────────────────────────
+    float sky = 1.0 - hitAny;
+    float sg = 0.5 + 0.5*rdY;
+    fr = fr + sky*mix(0.75, 0.10, sg);
+    fg = fg + sky*mix(0.82, 0.25, sg);
+    fb = fb + sky*mix(0.92, 0.55, sg);
+
+    FragColor = vec4(clamp(fr,0.0,1.0), clamp(fg,0.0,1.0), clamp(fb,0.0,1.0), 1.0);
+}

@@ -1,0 +1,39 @@
+# mandelbrot_fs.src — Mandelbrot set with animated zoom into seahorse valley
+# Demonstrates: iterative loops, complex arithmetic on RISC-V RVV
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    # Animated zoom + pan into seahorse valley
+    float zoom = exp(-uTime * 0.25 + 0.5);
+    float cx = (vUV.x - 0.5) * 2.6 * zoom - 0.7436;
+    float cy = (vUV.y - 0.5) * 2.6 * zoom + 0.1319;
+
+    float zx = 0.0;
+    float zy = 0.0;
+    float iter = 0.0;
+
+    for (float i = 0.0; i < 80.0; i = i + 1.0) {
+        if (zx * zx + zy * zy < 4.0) {
+            float nx = zx * zx - zy * zy + cx;
+            float ny = 2.0 * zx * zy + cy;
+            zx = nx;
+            zy = ny;
+            iter = i + 1.0;
+        }
+    }
+
+    float inside = step(3.99, zx * zx + zy * zy);
+    inside = 1.0 - inside;
+
+    # Smooth coloring
+    float t = iter / 80.0 + uTime * 0.1;
+    float r = 0.5 + 0.5 * cos(t * 6.2832 + 0.0);
+    float g = 0.5 + 0.5 * cos(t * 6.2832 + 2.09);
+    float b = 0.5 + 0.5 * cos(t * 6.2832 + 4.19);
+
+    FragColor = vec4(r * inside, g * inside, b * inside, 1.0);
+}

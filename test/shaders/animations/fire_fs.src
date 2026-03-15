@@ -1,0 +1,33 @@
+# fire_fs.src — Procedural fire: layered noise turbulence rising upward
+# Tests: multi-octave sin-based noise, color gradient mapping on RVV
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float u = vUV.x;
+    float v = 1.0 - vUV.y;       # flip: fire rises from bottom
+
+    # Multi-octave turbulence
+    float t = uTime * 1.4;
+    float n  = 0.0;
+    n = n + 0.50 * sin(u * 4.0  + sin(v * 3.0 + t)   + t * 1.1);
+    n = n + 0.25 * sin(u * 9.0  + sin(v * 7.0 + t * 1.7) + t * 2.3);
+    n = n + 0.13 * sin(u * 18.0 + sin(v * 15.0 + t * 3.1) + t * 4.7);
+    n = n + 0.07 * sin(u * 37.0 + sin(v * 31.0 + t * 5.9) + t * 9.1);
+    n = (n + 0.95) / 1.9;         # [0,1]
+
+    # Fire shape: intensity drops toward top and edges
+    float shape  = clamp(1.0 - v, 0.0, 1.0);
+    float edge   = 1.0 - abs(u - 0.5) * 2.2;
+    float heat   = clamp(n * shape * clamp(edge, 0.0, 1.0) * 1.6, 0.0, 1.0);
+
+    # Fire color ramp: black -> red -> orange -> yellow -> white
+    float r = clamp(heat * 3.0, 0.0, 1.0);
+    float g = clamp(heat * 3.0 - 1.0, 0.0, 1.0);
+    float b = clamp(heat * 3.0 - 2.0, 0.0, 1.0);
+
+    FragColor = vec4(r, g, b, 1.0);
+}

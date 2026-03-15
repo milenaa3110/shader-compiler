@@ -1,0 +1,35 @@
+# reaction_fs.src — Turing/reaction-diffusion visual approximation
+# Layered sine patterns at Turing-scale wavelengths, modulated by slower wave
+# Tests: multi-scale sin evaluation across all RVV lanes
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float u = vUV.x * 6.2832;
+    float v = vUV.y * 6.2832;
+
+    # Activator-like field: slow, large-scale
+    float A = 0.0;
+    A = A + sin(u * 1.5 + v * 0.7 + uTime * 0.4);
+    A = A + sin(u * 2.3 - v * 1.1 + uTime * 0.6);
+    A = A + 0.5 * sin(u * 0.9 + v * 1.8 - uTime * 0.3);
+
+    # Inhibitor-like field: fast, small-scale
+    float B = 0.0;
+    B = B + sin(u * 7.1 + v * 5.3 + uTime * 2.1 + A * 1.5);
+    B = B + sin(u * 11.3 - v * 8.7 - uTime * 2.8 + A * 2.0);
+    B = B + 0.5 * sin(u * 15.7 + v * 13.1 + uTime * 3.7 + A);
+
+    float pattern = (A + B * 0.5);
+    pattern = 0.5 + 0.5 * sin(pattern * 1.8);
+
+    # Color: yellow-green spots on deep blue
+    float r = mix(0.05, 0.9, pattern * pattern);
+    float g = mix(0.1,  1.0, pattern);
+    float b = mix(0.4,  0.1, pattern * pattern);
+
+    FragColor = vec4(r, g, b, 1.0);
+}

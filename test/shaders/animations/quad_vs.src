@@ -1,0 +1,28 @@
+# quad_vs.src — Full-screen quad vertex shader for Vulkan animation rendering.
+# Outputs screen-space UV [0,1] at location 0 for all animation fragment shaders.
+# Y is flipped for Vulkan NDC (clip space Y=+1 is top of viewport).
+# uTime is declared so the push_constant layout matches the fragment shader.
+
+uniform float uTime;
+out vec2 vUV;
+
+@entry @stage(vertex)
+fn void main() {
+    float vid = float(gl_VertexID);
+
+    # Six vertices, two triangles covering NDC [-1,1]^2
+    # tri0: BL BR TR   tri1: BL TR TL
+    float px = 0.0;
+    float py = 0.0;
+    if (vid == 0.0) { px = -1.0; py = -1.0; }
+    if (vid == 1.0) { px =  1.0; py = -1.0; }
+    if (vid == 2.0) { px =  1.0; py =  1.0; }
+    if (vid == 3.0) { px = -1.0; py = -1.0; }
+    if (vid == 4.0) { px =  1.0; py =  1.0; }
+    if (vid == 5.0) { px = -1.0; py =  1.0; }
+
+    vUV = vec2((px + 1.0) * 0.5, (py + 1.0) * 0.5);
+
+    # Flip Y for Vulkan NDC
+    gl_Position = vec4(px, -py, 0.0, 1.0);
+}

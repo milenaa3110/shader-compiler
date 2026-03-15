@@ -1,0 +1,59 @@
+# cellular_fs.src — Conway-style cellular automaton visual approximation
+# Deterministic hash-based life-like patterns evolving with time
+# Tests: fract-based hash noise, step thresholding on RVV
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float cellSize = 24.0;
+    float frame    = floor(uTime * 12.0);   # 12 generations/sec
+
+    float cu = floor(vUV.x * cellSize);
+    float cv = floor(vUV.y * cellSize);
+
+    # Count live neighbors using hash-based deterministic cell state
+    float alive = 0.0;
+    float neighbors = 0.0;
+
+    for (float di = -1.0; di <= 1.0; di = di + 1.0) {
+        for (float dj = -1.0; dj <= 1.0; dj = dj + 1.0) {
+            float ni = cu + di;
+            float nj = cv + dj;
+            # Hash: cell(i,j,frame) -> 0 or 1
+            float seed = sin(ni * 127.1 + nj * 311.7 + frame * 74.9) * 43758.5;
+            seed = fract(seed);
+            float state = step(0.6, seed);   # ~40% alive initially
+            if (di == 0.0) {
+                if (dj == 0.0) {
+                    alive = state;
+                }
+            }
+            neighbors = neighbors + state;
+        }
+    }
+
+    neighbors = neighbors - alive;   # exclude self
+
+    # Conway rules approximation (probabilistic)
+    float survives  = alive * step(2.0, neighbors) * step(neighbors, 3.5);
+    float born      = (1.0 - alive) * step(3.0, neighbors) * step(neighbors, 3.5);
+    float nextAlive = clamp(survives + born, 0.0, 1.0);
+
+    # UV within cell for smooth rendering
+    float fx = fract(vUV.x * cellSize);
+    float fy = fract(vUV.y * cellSize);
+    float cellMask = smoothstep(0.05, 0.15, fx) * smoothstep(0.95, 0.85, fx)
+                   * smoothstep(0.05, 0.15, fy) * smoothstep(0.95, 0.85, fy);
+
+    float hue = sin(cu * 0.37 + cv * 0.59 + frame * 0.13);
+    float r = 0.5 + 0.5 * sin(hue * 3.14 + 1.0);
+    float g = 0.5 + 0.5 * sin(hue * 3.14 + 3.0);
+    float b = 0.5 + 0.5 * sin(hue * 3.14 + 5.0);
+
+    FragColor = vec4(r * nextAlive * cellMask,
+                     g * nextAlive * cellMask,
+                     b * nextAlive * cellMask, 1.0);
+}

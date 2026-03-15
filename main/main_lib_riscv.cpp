@@ -24,7 +24,8 @@ static void InitializeModule() {
     Builder   = std::make_unique<llvm::IRBuilder<>>(*Context);
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    const char* outPath = (argc >= 2) ? argv[1] : "module.ll";
     InitializeModule();
     NamedValues.clear();
 
@@ -59,9 +60,9 @@ int main() {
     }
 
     std::error_code EC;
-    llvm::raw_fd_ostream OS("module.ll", EC, llvm::sys::fs::OF_Text);
-    if (EC) { std::cerr << "Cannot open module.ll: " << EC.message() << "\n"; return 1; }
+    llvm::raw_fd_ostream OS(outPath, EC, llvm::sys::fs::OF_Text);
+    if (EC) { std::cerr << "Cannot open " << outPath << ": " << EC.message() << "\n"; return 1; }
     TheModule->print(OS, nullptr);
-    std::cout << "Wrote module.ll (RISC-V + RVV target)\n";
+    std::cout << "Wrote " << outPath << " (RISC-V + RVV target)\n";
     return 0;
 }

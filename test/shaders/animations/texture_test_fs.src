@@ -1,0 +1,79 @@
+# texture_test_fs.src — Procedural marble texture with 9-tap multi-sample
+# CPU-side counterpart to test/shaders/spirv_vulkan/texture_test.frag.
+#
+# GPU uses VkImage + VkSampler: each tap is one TMU instruction — hardware
+# bilinear interpolation for free, with a dedicated texture cache.
+# CPU must evaluate the marble formula 9x per pixel — pure ALU, no silicon shortcut.
+#
+# Marble formula (matches spirv_vulkan_texture_host.cpp procedural texture):
+#   n = sin((u*8 + sin(v*6 + sin(u*3 + v*2)*1.5))*1.5)*0.5 + 0.5
+#   R=n, G=n*0.7, B=n*0.4
+#
+# Demonstrates: TMU hardware advantage — GPU texture sampling vs CPU ALU math.
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    # ── Animated UV warp (matches GPU shader) ─────────────────────────────────
+    float wu = vUV.x + sin(vUV.y * 12.0 + uTime * 2.1) * 0.015;
+    float wv = vUV.y + cos(vUV.x * 10.0 + uTime * 1.7) * 0.015;
+
+    # ── 9-tap 3x3 multi-sample ────────────────────────────────────────────────
+    # GPU: 9 TMU fetches with hardware bilinear filter (essentially free)
+    # CPU: 9x marble formula evaluation — each costs ~10 transcendental ops
+    float ts = 1.0 / 512.0;
+
+    # tap (-1,-1)
+    float u00 = wu - ts;  float v00 = wv - ts;
+    float n00 = sin((u00*8.0 + sin(v00*6.0 + sin(u00*3.0 + v00*2.0)*1.5))*1.5)*0.5 + 0.5;
+    # tap ( 0,-1)
+    float u10 = wu;       float v10 = wv - ts;
+    float n10 = sin((u10*8.0 + sin(v10*6.0 + sin(u10*3.0 + v10*2.0)*1.5))*1.5)*0.5 + 0.5;
+    # tap (+1,-1)
+    float u20 = wu + ts;  float v20 = wv - ts;
+    float n20 = sin((u20*8.0 + sin(v20*6.0 + sin(u20*3.0 + v20*2.0)*1.5))*1.5)*0.5 + 0.5;
+    # tap (-1, 0)
+    float u01 = wu - ts;  float v01 = wv;
+    float n01 = sin((u01*8.0 + sin(v01*6.0 + sin(u01*3.0 + v01*2.0)*1.5))*1.5)*0.5 + 0.5;
+    # tap ( 0, 0) — center
+    float u11 = wu;       float v11 = wv;
+    float n11 = sin((u11*8.0 + sin(v11*6.0 + sin(u11*3.0 + v11*2.0)*1.5))*1.5)*0.5 + 0.5;
+    # tap (+1, 0)
+    float u21 = wu + ts;  float v21 = wv;
+    float n21 = sin((u21*8.0 + sin(v21*6.0 + sin(u21*3.0 + v21*2.0)*1.5))*1.5)*0.5 + 0.5;
+    # tap (-1,+1)
+    float u02 = wu - ts;  float v02 = wv + ts;
+    float n02 = sin((u02*8.0 + sin(v02*6.0 + sin(u02*3.0 + v02*2.0)*1.5))*1.5)*0.5 + 0.5;
+    # tap ( 0,+1)
+    float u12 = wu;       float v12 = wv + ts;
+    float n12 = sin((u12*8.0 + sin(v12*6.0 + sin(u12*3.0 + v12*2.0)*1.5))*1.5)*0.5 + 0.5;
+    # tap (+1,+1)
+    float u22 = wu + ts;  float v22 = wv + ts;
+    float n22 = sin((u22*8.0 + sin(v22*6.0 + sin(u22*3.0 + v22*2.0)*1.5))*1.5)*0.5 + 0.5;
+
+    # Average 9 samples (matching GPU 3x3 box filter)
+    float avg = (n00 + n10 + n20 + n01 + n11 + n21 + n02 + n12 + n22) / 9.0;
+
+    # Marble channels: R=avg, G=avg*0.7, B=avg*0.4
+    float cr = avg;
+    float cg = avg * 0.7;
+    float cb = avg * 0.4;
+
+    # ── Color grading (matches GPU shader) ────────────────────────────────────
+    # Saturation boost: mix(lum, color, 1.4)
+    float lum = cr * 0.299 + cg * 0.587 + cb * 0.114;
+    float sr = mix(lum, cr, 1.4);
+    float sg = mix(lum, cg, 1.4);
+    float sb = mix(lum, cb, 1.4);
+
+    # Time-based hue shift
+    float hue = uTime * 0.2;
+    sr = sr * (0.85 + 0.15 * cos(hue + 0.0));
+    sg = sg * (0.85 + 0.15 * cos(hue + 2.09));
+    sb = sb * (0.85 + 0.15 * cos(hue + 4.19));
+
+    FragColor = vec4(clamp(sr, 0.0, 1.0), clamp(sg, 0.0, 1.0), clamp(sb, 0.0, 1.0), 1.0);
+}

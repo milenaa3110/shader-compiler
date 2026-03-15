@@ -17,10 +17,19 @@ LLC           := llc-18
 
 
 # RISC-V toolchain
-QEMU_USER     ?= qemu-riscv64-static
 RISCV_TRIPLE  ?= riscv64-unknown-linux-gnu
 RISCV_SYSROOT ?= /usr/riscv64-linux-gnu
 CROSS_CXX     ?= riscv64-linux-gnu-g++
+
+QEMU_USER := $(shell which qemu-riscv64-static 2>/dev/null || which qemu-riscv64 2>/dev/null)
+NTHREADS  := $(shell nproc)
+
+ifneq ($(QEMU_USER),)
+    RISCV_SIM := $(QEMU_USER) -L $(RISCV_SYSROOT)
+    $(info [riscv] Using QEMU (OpenMP-capable): $(QEMU_USER))
+else
+    RISCV_SIM := echo "ERROR: no RISC-V simulator found (install qemu-user-static)." &&
+endif
 
 # Dirs
 LEXER_DIR      := lexer
@@ -30,20 +39,28 @@ CODEGEN_DIR    := codegen_state
 HELPERS_DIR    := helpers
 MAIN_DIR       := main
 MAINCODEGEN_DIR:= main_codegen
-INPUT_DIR      := input
-TEST_DIR_RISCV := test/riscv
+TEST_DIR_RISCV := test/rv_host
 
 BUILD_DIR      := build
+SPV_DIR        := build/spirv
+RISCV_DIR      := build/riscv
 OBJDIR_LLVM    := $(BUILD_DIR)/llvm
+PASSES_DIR     := passes
+SINCOS_PLUGIN  := $(OBJDIR_LLVM)/sincos_opt.so
 
 PIPELINE_DIR   := pipeline
 
-# Binaries
-TARGET_CODEGEN      := shader_codegen
-TARGET_IRGEN        := irgen
-TARGET_IRGEN_RISCV  := irgen_riscv
-TARGET_IRGEN_SPIRV  := irgen_spirv
-TARGET_PIPELINE     := pipeline_host
+# Binaries — compiler tools
+TARGET_CODEGEN      := $(BUILD_DIR)/shader_codegen
+TARGET_IRGEN_RISCV  := $(RISCV_DIR)/irgen_riscv
+TARGET_IRGEN_SPIRV  := $(SPV_DIR)/irgen_spirv
+
+# Binaries — Vulkan hosts
+VK_HOST         := $(SPV_DIR)/spirv_vulkan_host
+VK_COMPUTE_HOST := $(SPV_DIR)/spirv_vulkan_compute_host
+VK_LIFE_HOST    := $(SPV_DIR)/spirv_vulkan_life_host
+VK_TEXTURE_HOST := $(SPV_DIR)/spirv_vulkan_texture_host
+
 
 # Sources (shared)
 COMMON_SRCS := \
@@ -55,22 +72,26 @@ COMMON_SRCS := \
   $(HELPERS_DIR)/assignment_helpers.cpp
 
 CODEGEN_SRCS       := $(COMMON_SRCS) $(MAINCODEGEN_DIR)/main_codegen.cpp
-IRGEN_SRCS         := $(COMMON_SRCS) $(MAIN_DIR)/main_lib.cpp
 IRGEN_RISCV_SRCS   := $(COMMON_SRCS) $(MAIN_DIR)/main_lib_riscv.cpp
 IRGEN_SPIRV_SRCS   := $(COMMON_SRCS) $(MAIN_DIR)/main_lib_spirv.cpp
 
 CODEGEN_OBJS       := $(patsubst %.cpp,$(OBJDIR_LLVM)/%.o,$(notdir $(CODEGEN_SRCS)))
-IRGEN_OBJS         := $(patsubst %.cpp,$(OBJDIR_LLVM)/irgen_%.o,$(notdir $(IRGEN_SRCS)))
 IRGEN_RISCV_OBJS   := $(patsubst %.cpp,$(OBJDIR_LLVM)/irgen_riscv_%.o,$(notdir $(IRGEN_RISCV_SRCS)))
 IRGEN_SPIRV_OBJS   := $(patsubst %.cpp,$(OBJDIR_LLVM)/irgen_spirv_%.o,$(notdir $(IRGEN_SPIRV_SRCS)))
 
 # ---- default ----
 .PHONY: all
-all: $(TARGET_CODEGEN) $(TARGET_IRGEN) $(TARGET_IRGEN_RISCV) $(TARGET_IRGEN_SPIRV)
+all: $(TARGET_CODEGEN) $(TARGET_IRGEN_RISCV) $(TARGET_IRGEN_SPIRV) $(SINCOS_PLUGIN)
 
-# ---- build dir ----
+# ---- build dirs ----
 $(OBJDIR_LLVM):
 	@mkdir -p $(OBJDIR_LLVM)
+
+$(RISCV_DIR):
+	@mkdir -p $(RISCV_DIR)
+
+$(SPV_DIR):
+	@mkdir -p $(SPV_DIR)
 
 # ---- compile rules ----
 # CODEGEN objects
@@ -115,20 +136,6 @@ $(OBJDIR_LLVM)/irgen_spirv_%.o: $(AST_DIR)/%.cpp | $(OBJDIR_LLVM)
 $(OBJDIR_LLVM)/irgen_spirv_%.o: $(HELPERS_DIR)/%.cpp | $(OBJDIR_LLVM)
 	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -MMD -MP -fPIC -c $< -o $@
 
-# IRGEN objects (prefix irgen_)
-$(OBJDIR_LLVM)/irgen_%.o: $(MAIN_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -MMD -MP -fPIC -c $< -o $@
-$(OBJDIR_LLVM)/irgen_%.o: $(LEXER_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -MMD -MP -fPIC -c $< -o $@
-$(OBJDIR_LLVM)/irgen_%.o: $(PARSER_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
-$(OBJDIR_LLVM)/irgen_%.o: $(CODEGEN_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
-$(OBJDIR_LLVM)/irgen_%.o: $(AST_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
-$(OBJDIR_LLVM)/irgen_%.o: $(HELPERS_DIR)/%.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -MMD -MP -fPIC -c $< -o $@
-
 # Auto-generated header dependencies
 -include $(wildcard $(OBJDIR_LLVM)/*.d)
 
@@ -136,54 +143,18 @@ $(OBJDIR_LLVM)/irgen_%.o: $(HELPERS_DIR)/%.cpp | $(OBJDIR_LLVM)
 $(TARGET_CODEGEN): $(OBJDIR_LLVM) $(CODEGEN_OBJS)
 	$(CXX) $(CODEGEN_OBJS) -o $@ $(LLVM_LDFLAGS) -lfmt
 
-$(TARGET_IRGEN): $(OBJDIR_LLVM) $(IRGEN_OBJS)
-	$(CXX) $(IRGEN_OBJS) -o $@ $(LLVM_LDFLAGS) -lfmt
-
-$(TARGET_IRGEN_RISCV): $(OBJDIR_LLVM) $(IRGEN_RISCV_OBJS)
+$(TARGET_IRGEN_RISCV): $(OBJDIR_LLVM) $(RISCV_DIR) $(IRGEN_RISCV_OBJS)
 	$(CXX) $(IRGEN_RISCV_OBJS) -o $@ $(LLVM_LDFLAGS) -lfmt
 
-$(TARGET_IRGEN_SPIRV): $(OBJDIR_LLVM) $(IRGEN_SPIRV_OBJS)
+$(TARGET_IRGEN_SPIRV): $(OBJDIR_LLVM) $(SPV_DIR) $(IRGEN_SPIRV_OBJS)
 	$(CXX) $(IRGEN_SPIRV_OBJS) -o $@ $(LLVM_LDFLAGS) -lfmt
 
-# ---- IR pipeline ----
-module.ll: $(INPUT_DIR)/shader.src $(TARGET_IRGEN)
-	./$(TARGET_IRGEN) < $<
-
-module.opt.ll: module.ll
-	$(LLVM_OPT) -O3 -S module.ll -o module.opt.ll
-
-# ---- RISC-V build from OPTIMIZED IR ----
-shader.o: module.opt.ll
-	$(LLC) -O3 -filetype=obj -relocation-model=pic -mtriple=$(RISCV_TRIPLE) \
-		-mattr=+d,+f -float-abi=hard -o $@ $<
-
-librvshade.so: shader.o
-	$(CROSS_CXX) -shared -fPIC shader.o -o $@
-
-test_host.rv: $(TEST_DIR_RISCV)/test_host.cpp librvshade.so
-	$(CROSS_CXX) -O3 -flto $< -L. -lrvshade -Wl,-rpath,'$$ORIGIN' -o $@
+# ── LLVM pass plugins ────────────────────────────────────────────────────────
+# sincos_opt: combines llvm.sin.f32(X)+llvm.cos.f32(X) pairs → sincosf(X,&s,&c)
+$(SINCOS_PLUGIN): $(PASSES_DIR)/sincos_opt.cpp | $(OBJDIR_LLVM)
+	$(CXX) -std=c++17 -fPIC -shared $(LLVM_CXXFLAGS) $< -o $@
 
 RESULT_DIR     := result
-TEST_HOST_SRC  := $(TEST_DIR_RISCV)/test_host.cpp
-
-# ---- native render (no QEMU, host architecture) ----
-shader_native.o: module.opt.ll
-	llc-18 -O3 -filetype=obj -o $@ $<
-
-render_host: $(TEST_HOST_SRC) shader_native.o
-	$(CXX) $(CXXSTD) -O3 $(TEST_HOST_SRC) shader_native.o -o $@
-
-.PHONY: render
-render: module.opt.ll render_host
-	@mkdir -p $(RESULT_DIR)
-	./render_host
-	@echo "Image: $(RESULT_DIR)/shader_out.ppm"
-
-# ---- RISC-V render (requires QEMU) ----
-.PHONY: run-riscv
-run-riscv: test_host.rv
-	@mkdir -p $(RESULT_DIR)
-	$(QEMU_USER) -L $(RISCV_SYSROOT) ./test_host.rv
 
 # interactive codegen run
 .PHONY: run-codegen
@@ -195,158 +166,259 @@ run-codegen: $(TARGET_CODEGEN)
 run-codegen-opt: $(TARGET_CODEGEN)
 	./$(TARGET_CODEGEN) | $(LLVM_OPT) -O3 -S
 	
-# ---- convenience ----
-.PHONY: ir opt so test
-ir: module.ll
-opt: module.opt.ll
-so: librvshade.so
-test: run-riscv
 
-# ---- pipeline render (x86 host, VS+FS linked together) ----
+# ---- pipeline shader sources ----
 PIPELINE_VS_SRC := test/shaders/pipeline/triangle_vs.src
 PIPELINE_FS_SRC := test/shaders/pipeline/triangle_fs.src
 SCENE_VS_SRC    := test/shaders/pipeline/scene_vs.src
 SCENE_FS_SRC    := test/shaders/pipeline/scene_fs.src
 
-vs.ll: $(PIPELINE_VS_SRC) $(TARGET_IRGEN)
-	./$(TARGET_IRGEN) < $< && mv module.ll $@
-
-fs.ll: $(PIPELINE_FS_SRC) $(TARGET_IRGEN)
-	./$(TARGET_IRGEN) < $< && mv module.ll $@
-
-scene_vs.ll: $(SCENE_VS_SRC) $(TARGET_IRGEN)
-	./$(TARGET_IRGEN) < $< && mv module.ll $@
-
-scene_fs.ll: $(SCENE_FS_SRC) $(TARGET_IRGEN)
-	./$(TARGET_IRGEN) < $< && mv module.ll $@
-
-pipeline.ll: vs.ll fs.ll
-	llvm-link-18 vs.ll fs.ll -S -o $@
-
-scene_pipeline.ll: scene_vs.ll scene_fs.ll
-	llvm-link-18 scene_vs.ll scene_fs.ll -S -o $@
-
-$(OBJDIR_LLVM)/pipeline_runtime.o: $(PIPELINE_DIR)/pipeline_runtime.cpp | $(OBJDIR_LLVM)
-	$(CXX) $(CXXSTD) -O3 -fPIC -I$(PIPELINE_DIR) -c $< -o $@
-
-pipeline_shader.o: pipeline.ll
-	$(LLC) -O3 -filetype=obj -relocation-model=pic $< -o $@
-
-$(TARGET_PIPELINE): pipeline_shader.o $(OBJDIR_LLVM)/pipeline_runtime.o $(PIPELINE_DIR)/pipeline_host.cpp
-	$(CXX) $(CXXSTD) -O3 -I$(PIPELINE_DIR) \
-	    $(PIPELINE_DIR)/pipeline_host.cpp pipeline_shader.o \
-	    $(OBJDIR_LLVM)/pipeline_runtime.o -o $@
-
-.PHONY: pipeline
-pipeline: $(TARGET_PIPELINE)
-	@mkdir -p $(RESULT_DIR)
-	./$(TARGET_PIPELINE)
-
-scene_pipeline_shader.o: scene_pipeline.ll
-	$(LLC) -O3 -filetype=obj -relocation-model=pic $< -o $@
-
-scene_pipeline_host: scene_pipeline_shader.o $(OBJDIR_LLVM)/pipeline_runtime.o $(PIPELINE_DIR)/pipeline_host.cpp
-	$(CXX) $(CXXSTD) -O3 -I$(PIPELINE_DIR) \
-	    $(PIPELINE_DIR)/pipeline_host.cpp scene_pipeline_shader.o \
-	    $(OBJDIR_LLVM)/pipeline_runtime.o -o $@ \
-	    -DPIPELINE_VERT_COUNT=6 -DPIPELINE_OUTPUT_PPM='"result/scene_pipeline_out.ppm"'
-
 # ---- RISC-V pipeline (requires riscv64-linux-gnu-g++ + qemu-riscv64) ----
 # Install: sudo apt install gcc-riscv64-linux-gnu g++-riscv64-linux-gnu qemu-user-static
-pipeline_riscv.ll: $(PIPELINE_VS_SRC) $(PIPELINE_FS_SRC) $(TARGET_IRGEN_RISCV)
-	./$(TARGET_IRGEN_RISCV) < $(PIPELINE_VS_SRC) && mv module.ll vs_rv.ll
-	./$(TARGET_IRGEN_RISCV) < $(PIPELINE_FS_SRC) && mv module.ll fs_rv.ll
-	llvm-link-18 vs_rv.ll fs_rv.ll -S -o $@
+$(RISCV_DIR)/pipeline_riscv.ll: $(PIPELINE_VS_SRC) $(PIPELINE_FS_SRC) $(TARGET_IRGEN_RISCV)
+	@mkdir -p $(RISCV_DIR)
+	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/vs_rv.ll < $(PIPELINE_VS_SRC)
+	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/fs_rv.ll < $(PIPELINE_FS_SRC)
+	llvm-link-18 $(RISCV_DIR)/vs_rv.ll $(RISCV_DIR)/fs_rv.ll -S -o $@
 
-pipeline_riscv.o: pipeline_riscv.ll
+$(RISCV_DIR)/pipeline_riscv.o: $(RISCV_DIR)/pipeline_riscv.ll
 	$(LLC) -O3 -filetype=obj -relocation-model=pic \
 	    -mtriple=$(RISCV_TRIPLE) -mattr=+m,+a,+f,+d,+v \
 	    $< -o $@
 
-pipeline_host.rv: pipeline_riscv.o $(PIPELINE_DIR)/pipeline_runtime.cpp $(PIPELINE_DIR)/pipeline_host.cpp
+$(RISCV_DIR)/pipeline_host.rv: $(RISCV_DIR)/pipeline_riscv.o $(PIPELINE_DIR)/pipeline_runtime.cpp $(PIPELINE_DIR)/pipeline_host.cpp
 	$(CROSS_CXX) $(CXXSTD) -O3 -I$(PIPELINE_DIR) \
 	    $(PIPELINE_DIR)/pipeline_host.cpp \
 	    $(PIPELINE_DIR)/pipeline_runtime.cpp \
-	    pipeline_riscv.o -o $@
+	    $(RISCV_DIR)/pipeline_riscv.o -o $@
 
 .PHONY: pipeline-riscv
-pipeline-riscv: pipeline_host.rv
+pipeline-riscv: $(RISCV_DIR)/pipeline_host.rv
 	@mkdir -p $(RESULT_DIR)
-	$(QEMU_USER) -L $(RISCV_SYSROOT) ./pipeline_host.rv
+	$(RISCV_SIM) ./$(RISCV_DIR)/pipeline_host.rv
 
 # ---- RISC-V animation (multi-frame) ----
 ANIM_VS_SRC := test/shaders/pipeline/anim_vs.src
 ANIM_FS_SRC := test/shaders/pipeline/anim_fs.src
 
-anim_riscv.ll: $(ANIM_VS_SRC) $(ANIM_FS_SRC) $(TARGET_IRGEN_RISCV)
-	./$(TARGET_IRGEN_RISCV) < $(ANIM_VS_SRC) && mv module.ll anim_vs_rv.ll
-	./$(TARGET_IRGEN_RISCV) < $(ANIM_FS_SRC) && mv module.ll anim_fs_rv.ll
-	llvm-link-18 anim_vs_rv.ll anim_fs_rv.ll -S -o $@
+$(RISCV_DIR)/anim_riscv.ll: $(ANIM_VS_SRC) $(ANIM_FS_SRC) $(TARGET_IRGEN_RISCV)
+	@mkdir -p $(RISCV_DIR)
+	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/anim_vs_rv.ll < $(ANIM_VS_SRC)
+	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/anim_fs_rv.ll < $(ANIM_FS_SRC)
+	llvm-link-18 $(RISCV_DIR)/anim_vs_rv.ll $(RISCV_DIR)/anim_fs_rv.ll -S -o $@
 
-anim_riscv.o: anim_riscv.ll
+$(RISCV_DIR)/anim_riscv.o: $(RISCV_DIR)/anim_riscv.ll
 	$(LLC) -O3 -filetype=obj -relocation-model=pic \
 	    -mtriple=$(RISCV_TRIPLE) -mattr=+m,+a,+f,+d,+v \
 	    $< -o $@
 
-anim_host.rv: anim_riscv.o $(PIPELINE_DIR)/pipeline_runtime.cpp test/riscv/anim_host.cpp
+$(RISCV_DIR)/anim_host.rv: $(RISCV_DIR)/anim_riscv.o $(PIPELINE_DIR)/pipeline_runtime.cpp $(PIPELINE_DIR)/anim_host.cpp
 	$(CROSS_CXX) $(CXXSTD) -O3 -I$(PIPELINE_DIR) \
-	    test/riscv/anim_host.cpp \
-	    $(PIPELINE_DIR)/pipeline_runtime.cpp \
-	    anim_riscv.o -o $@
-
-.PHONY: anim-riscv
-anim-riscv: anim_host.rv
-	@mkdir -p $(RESULT_DIR)
-	$(QEMU_USER) -L $(RISCV_SYSROOT) ./anim_host.rv
-
-# ---- x86 animation (multi-frame, 60 fps, encodes result/anim_x86.mp4) ----
-anim_x86.ll: $(ANIM_VS_SRC) $(ANIM_FS_SRC) $(TARGET_IRGEN)
-	./$(TARGET_IRGEN) < $(ANIM_VS_SRC) && mv module.ll anim_vs_x86.ll
-	./$(TARGET_IRGEN) < $(ANIM_FS_SRC) && mv module.ll anim_fs_x86.ll
-	llvm-link-18 anim_vs_x86.ll anim_fs_x86.ll -S -o $@
-
-anim_x86.o: anim_x86.ll
-	$(LLC) -O3 -filetype=obj -relocation-model=pic $< -o $@
-
-anim_host_x86: anim_x86.o $(PIPELINE_DIR)/pipeline_runtime.cpp $(PIPELINE_DIR)/anim_host.cpp
-	$(CXX) $(CXXSTD) -O3 -I$(PIPELINE_DIR) \
 	    $(PIPELINE_DIR)/anim_host.cpp \
 	    $(PIPELINE_DIR)/pipeline_runtime.cpp \
-	    anim_x86.o -o $@
+	    $(RISCV_DIR)/anim_riscv.o -o $@
 
-.PHONY: anim-x86
-anim-x86: anim_host_x86
+.PHONY: anim-riscv
+anim-riscv: $(RISCV_DIR)/anim_host.rv
 	@mkdir -p $(RESULT_DIR)
-	./anim_host_x86
-
-# ---- SPIR-V animation (multi-frame IR + .spv per frame) ----
-.PHONY: anim-spirv
-anim-spirv: $(TARGET_IRGEN_SPIRV)
-	@bash test/run_spirv_anim.sh
+	$(RISCV_SIM) ./$(RISCV_DIR)/anim_host.rv
 
 # ---- Vulkan SPIR-V animation (renders via LavaPipe, encodes result/anim_spirv.mp4) ----
 # Requires: sudo apt install libvulkan-dev glslang-tools
 SPIRV_SHADER_DIR := test/shaders/spirv_vulkan
 GLSLANG := glslangValidator
 
-result/anim.vert.spv: $(SPIRV_SHADER_DIR)/anim.vert
-	@mkdir -p result
+$(SPV_DIR)/anim.vert.spv: $(SPIRV_SHADER_DIR)/anim.vert
+	@mkdir -p $(SPV_DIR)
 	$(GLSLANG) -V $< -o $@
 
-result/anim.frag.spv: $(SPIRV_SHADER_DIR)/anim.frag
-	@mkdir -p result
+$(SPV_DIR)/anim.frag.spv: $(SPIRV_SHADER_DIR)/anim.frag
+	@mkdir -p $(SPV_DIR)
 	$(GLSLANG) -V $< -o $@
 
-spirv_vulkan_host: $(PIPELINE_DIR)/spirv_vulkan_host.cpp
-	$(CXX) $(CXXSTD) -O2 -o $@ $< -lvulkan
+VK_CXXFLAGS := -O2 -Wno-missing-field-initializers
+
+$(VK_HOST): test/vk_host/vk_host_fragment.cpp | $(OBJDIR_LLVM) $(SPV_DIR)
+	$(CXX) $(CXXSTD) $(VK_CXXFLAGS) -o $@ $< -lvulkan
 
 .PHONY: anim-spirv-vulkan
-anim-spirv-vulkan: spirv_vulkan_host result/anim.vert.spv result/anim.frag.spv
+anim-spirv-vulkan: $(VK_HOST) $(SPV_DIR)/anim.vert.spv $(SPV_DIR)/anim.frag.spv
 	@mkdir -p $(RESULT_DIR)
-	./spirv_vulkan_host result/anim.vert.spv result/anim.frag.spv
+	$(VK_HOST) $(SPV_DIR)/anim.vert.spv $(SPV_DIR)/anim.frag.spv
+
+ANIM_SHADER_DIR := test/shaders/animations
+
+# ---- Vulkan quad VS — compiled from quad_vs.src via irgen_spirv ----
+$(SPV_DIR)/quad.vert.spv: $(ANIM_SHADER_DIR)/quad_vs.src $(TARGET_IRGEN_SPIRV)
+	@mkdir -p $(SPV_DIR)
+	./$(TARGET_IRGEN_SPIRV) $@ < $(ANIM_SHADER_DIR)/quad_vs.src
+
+# ── Macro: one Vulkan animation target ─────────────────────────────────────
+# Usage: $(call VULKAN_ANIM,name)
+#   Compiles $(ANIM_SHADER_DIR)/<name>_fs.src → module.spv via irgen_spirv.
+#   Produces: result/<name>.frag.spv  +  .PHONY target  vk-<name>
+define VULKAN_ANIM
+$(SPV_DIR)/$(1).frag.spv: $(ANIM_SHADER_DIR)/$(1)_fs.src $(TARGET_IRGEN_SPIRV)
+	@mkdir -p $(SPV_DIR)
+	./$(TARGET_IRGEN_SPIRV) $$@ < $(ANIM_SHADER_DIR)/$(1)_fs.src
+
+.PHONY: vk-$(1)
+vk-$(1): $(VK_HOST) $(SPV_DIR)/quad.vert.spv $(SPV_DIR)/$(1).frag.spv
+	@mkdir -p $(RESULT_DIR)
+	$(VK_HOST) $(SPV_DIR)/quad.vert.spv $(SPV_DIR)/$(1).frag.spv $(1) 60 512 512
+endef
+
+# ── Macro: one RISC-V animation target ─────────────────────────────────────
+# Usage: $(call RISCV_ANIM,name)
+define RISCV_ANIM
+$(RISCV_DIR)/$(1)_rv.ll: $(ANIM_SHADER_DIR)/$(1)_fs.src test/shaders/pipeline/scene_vs.src $(TARGET_IRGEN_RISCV)
+	@mkdir -p $(RISCV_DIR)
+	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/$(1)_vs_rv.ll < test/shaders/pipeline/scene_vs.src
+	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/$(1)_fs_rv.ll < $(ANIM_SHADER_DIR)/$(1)_fs.src
+	llvm-link-18 $(RISCV_DIR)/$(1)_vs_rv.ll $(RISCV_DIR)/$(1)_fs_rv.ll -S -o $$@
+
+$(RISCV_DIR)/$(1)_rv.o: $(RISCV_DIR)/$(1)_rv.ll $(SINCOS_PLUGIN)
+	$(LLVM_OPT) -O3 --enable-unsafe-fp-math --fp-contract=fast -S \
+	    $$< -o $(RISCV_DIR)/$(1)_rv.gvn.ll
+	$(LLVM_OPT) -load-pass-plugin=./$(SINCOS_PLUGIN) \
+	    -passes='sincos-opt,mem2reg,instcombine' -S \
+	    $(RISCV_DIR)/$(1)_rv.gvn.ll -o $(RISCV_DIR)/$(1)_rv.opt.ll
+	$(LLC) -O3 --fp-contract=fast -filetype=obj -relocation-model=pic \
+	    -mtriple=$(RISCV_TRIPLE) -mattr=+m,+a,+f,+d,+v $(RISCV_DIR)/$(1)_rv.opt.ll -o $$@
+
+$(RISCV_DIR)/$(1).rv: $(RISCV_DIR)/$(1)_rv.o $(PIPELINE_DIR)/pipeline_runtime.cpp test/rv_host/rv_host_fragment.cpp
+	$(CROSS_CXX) $(CXXSTD) -O3 -static -fopenmp -I$(PIPELINE_DIR) \
+	    -DANIM_NAME='"$(1)"' -DNFRAMES=60 -DWIDTH=512 -DHEIGHT=512 \
+	    test/rv_host/rv_host_fragment.cpp $(PIPELINE_DIR)/pipeline_runtime.cpp \
+	    $$< -o $$@
+
+.PHONY: rv-$(1)
+rv-$(1): $(RISCV_DIR)/$(1).rv
+	@mkdir -p $(RESULT_DIR)
+	OMP_NUM_THREADS=$(NTHREADS) $(RISCV_SIM) ./$(RISCV_DIR)/$(1).rv
+endef
+
+# ── Animation lists ────────────────────────────────────────────────────────
+# Procedural fragment shaders (no texture sampler) — compiled by irgen_spirv.
+ANIMATIONS_PROC := mandelbrot julia voronoi waves tunnel ripple galaxy fire reaction cellular earth scene3d diverge
+
+# All animations including texture_test — used for RISC-V and the full list.
+ANIMATIONS := $(ANIMATIONS_PROC) texture_test
+
+$(foreach A,$(ANIMATIONS_PROC),$(eval $(call VULKAN_ANIM,$(A))))
+$(foreach A,$(ANIMATIONS),$(eval $(call RISCV_ANIM,$(A))))
+
+.PHONY: all-vk all-rv
+all-vk: $(VK_HOST) $(SPV_DIR)/quad.vert.spv \
+        $(foreach A,$(ANIMATIONS_PROC),$(SPV_DIR)/$(A).frag.spv)
+	@for A in $(ANIMATIONS_PROC); do \
+	    echo "=== Vulkan: $$A ==="; \
+	    $(VK_HOST) $(SPV_DIR)/quad.vert.spv $(SPV_DIR)/$$A.frag.spv $$A 60 512 512; \
+	done
+
+all-rv: $(foreach A,$(ANIMATIONS),$(RISCV_DIR)/$(A).rv)
+	@for A in $(ANIMATIONS); do \
+	    echo "=== RISC-V: $$A ($(NTHREADS) threads) ==="; \
+	    OMP_NUM_THREADS=$(NTHREADS) $(RISCV_SIM) ./$(RISCV_DIR)/$$A.rv; \
+	done
+
+# ---- Vulkan Compute host ----
+$(VK_COMPUTE_HOST): test/vk_host/vk_host_compute_blur.cpp | $(OBJDIR_LLVM) $(SPV_DIR)
+	$(CXX) $(CXXSTD) $(VK_CXXFLAGS) -o $@ $< -lvulkan
+
+$(SPV_DIR)/blur.comp.spv: $(SPIRV_SHADER_DIR)/blur.comp
+	@mkdir -p $(SPV_DIR)
+	$(GLSLANG) -V $< -o $@
+
+.PHONY: benchmark-compute-blur
+benchmark-compute-blur: $(VK_COMPUTE_HOST) $(SPV_DIR)/blur.comp.spv
+	@mkdir -p $(RESULT_DIR)
+	@bash test/script/run_benchmark_compute_blur.sh
+
+# ---- Vulkan Life host ----
+$(VK_LIFE_HOST): test/vk_host/vk_host_compute.cpp | $(OBJDIR_LLVM) $(SPV_DIR)
+	$(CXX) $(CXXSTD) $(VK_CXXFLAGS) -o $@ $< -lvulkan
+
+$(SPV_DIR)/life.comp.spv: $(SPIRV_SHADER_DIR)/life.comp
+	@mkdir -p $(SPV_DIR)
+	$(GLSLANG) -V $< -o $@
+
+.PHONY: benchmark-compute
+benchmark-compute: $(VK_LIFE_HOST) $(SPV_DIR)/life.comp.spv
+	@mkdir -p $(RESULT_DIR)
+	@bash test/script/run_benchmark_compute.sh --tiny
+
+.PHONY: benchmark-compute-sweep
+benchmark-compute-sweep: $(VK_LIFE_HOST) $(SPV_DIR)/life.comp.spv
+	@mkdir -p $(RESULT_DIR)
+	@bash test/script/run_benchmark_compute.sh --sweep
+
+.PHONY: benchmark-compute-animate
+benchmark-compute-animate: $(VK_LIFE_HOST) $(SPV_DIR)/life.comp.spv
+	@mkdir -p $(RESULT_DIR)
+	@bash test/script/run_benchmark_compute.sh --animate
+
+# ---- Vulkan Texture host ----
+$(VK_TEXTURE_HOST): test/vk_host/vk_host_texture.cpp | $(OBJDIR_LLVM) $(SPV_DIR)
+	$(CXX) $(CXXSTD) $(VK_CXXFLAGS) -o $@ $< -lvulkan
+
+$(SPV_DIR)/texture_test.frag.spv: $(ANIM_SHADER_DIR)/texture_test_gpu_fs.src $(TARGET_IRGEN_SPIRV)
+	@mkdir -p $(SPV_DIR)
+	./$(TARGET_IRGEN_SPIRV) $@ < $(ANIM_SHADER_DIR)/texture_test_gpu_fs.src
+
+.PHONY: vk-texture
+vk-texture: $(VK_TEXTURE_HOST) $(SPV_DIR)/quad.vert.spv $(SPV_DIR)/texture_test.frag.spv
+	@mkdir -p $(RESULT_DIR)
+	$(VK_TEXTURE_HOST) $(SPV_DIR)/quad.vert.spv $(SPV_DIR)/texture_test.frag.spv texture_test 60 512 512
+
+# ---- Terrain mesh animation (vertex shader drives a 32x32 grid, 6144 verts) ----
+# Vulkan: compile terrain_vs_vk.src (negated Y) + terrain_fs.src → SPV
+$(SPV_DIR)/terrain.vert.spv: $(ANIM_SHADER_DIR)/terrain_vs_vk.src $(TARGET_IRGEN_SPIRV)
+	@mkdir -p $(SPV_DIR)
+	./$(TARGET_IRGEN_SPIRV) $@ < $(ANIM_SHADER_DIR)/terrain_vs_vk.src
+
+$(SPV_DIR)/terrain.frag.spv: $(ANIM_SHADER_DIR)/terrain_fs.src $(TARGET_IRGEN_SPIRV)
+	@mkdir -p $(SPV_DIR)
+	./$(TARGET_IRGEN_SPIRV) $@ < $(ANIM_SHADER_DIR)/terrain_fs.src
+
+.PHONY: vk-terrain
+vk-terrain: $(VK_HOST) $(SPV_DIR)/terrain.vert.spv $(SPV_DIR)/terrain.frag.spv
+	@mkdir -p $(RESULT_DIR)
+	$(VK_HOST) $(SPV_DIR)/terrain.vert.spv $(SPV_DIR)/terrain.frag.spv terrain 60 512 512 6144
+
+.PHONY: benchmark-vertex
+benchmark-vertex: $(VK_HOST) $(RISCV_DIR)/terrain.rv
+	@bash test/script/run_benchmark_vertex.sh
+
+# RISC-V: compile terrain_vs.src (standard Y) + terrain_fs.src → linked LL → .o → .rv
+$(RISCV_DIR)/terrain_rv.ll: $(ANIM_SHADER_DIR)/terrain_vs.src $(ANIM_SHADER_DIR)/terrain_fs.src $(TARGET_IRGEN_RISCV)
+	@mkdir -p $(RISCV_DIR)
+	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/terrain_vs_rv.ll < $(ANIM_SHADER_DIR)/terrain_vs.src
+	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/terrain_fs_rv.ll < $(ANIM_SHADER_DIR)/terrain_fs.src
+	llvm-link-18 $(RISCV_DIR)/terrain_vs_rv.ll $(RISCV_DIR)/terrain_fs_rv.ll -S -o $@
+
+$(RISCV_DIR)/terrain_rv.o: $(RISCV_DIR)/terrain_rv.ll $(SINCOS_PLUGIN)
+	$(LLVM_OPT) -O3 --enable-unsafe-fp-math --fp-contract=fast -S \
+	    $< -o $(RISCV_DIR)/terrain_rv.gvn.ll
+	$(LLVM_OPT) -load-pass-plugin=./$(SINCOS_PLUGIN) \
+	    -passes='sincos-opt,mem2reg,instcombine' -S \
+	    $(RISCV_DIR)/terrain_rv.gvn.ll -o $(RISCV_DIR)/terrain_rv.opt.ll
+	$(LLC) -O3 --fp-contract=fast -filetype=obj -relocation-model=pic \
+	    -mtriple=$(RISCV_TRIPLE) -mattr=+m,+a,+f,+d,+v $(RISCV_DIR)/terrain_rv.opt.ll -o $@
+
+$(RISCV_DIR)/terrain.rv: $(RISCV_DIR)/terrain_rv.o $(PIPELINE_DIR)/pipeline_runtime.cpp test/rv_host/rv_host_fragment.cpp
+	$(CROSS_CXX) $(CXXSTD) -O3 -static -fopenmp -I$(PIPELINE_DIR) \
+	    -DANIM_NAME='"terrain"' -DNFRAMES=60 -DWIDTH=512 -DHEIGHT=512 -DVERT_COUNT=6144 \
+	    test/rv_host/rv_host_fragment.cpp $(PIPELINE_DIR)/pipeline_runtime.cpp \
+	    $< -o $@
+
+.PHONY: rv-terrain
+rv-terrain: $(RISCV_DIR)/terrain.rv
+	@mkdir -p $(RESULT_DIR)
+	OMP_NUM_THREADS=$(NTHREADS) $(RISCV_SIM) ./$(RISCV_DIR)/terrain.rv
 
 # ---- unit tests ----
-TEST_SCRIPT := test/run_tests.sh
+TEST_SCRIPT := test/script/run_tests.sh
 
 .PHONY: check check-verbose
 check: all
@@ -355,20 +427,40 @@ check: all
 check-verbose: all
 	@bash $(TEST_SCRIPT) --no-build --verbose
 
-.PHONY: check-pipeline
-check-pipeline: all
-	@bash test/run_pipeline_tests.sh
+
+.PHONY: cpu-scaling
+cpu-scaling: $(TARGET_IRGEN_RISCV)
+	@bash test/script/run_cpu_scaling.sh
+
+.PHONY: cpu-scaling-quick
+cpu-scaling-quick: $(TARGET_IRGEN_RISCV)
+	@bash test/script/run_cpu_scaling.sh --quick
+
+.PHONY: bench-rvv-width
+bench-rvv-width: $(TARGET_IRGEN_RISCV)
+	@bash test/script/run_cpu_scaling.sh --rvv-only
+
+.PHONY: benchmark-fragment
+benchmark-fragment: $(TARGET_IRGEN_RISCV) $(VK_HOST)
+	@bash test/script/run_benchmark_fragment.sh
+
+.PHONY: benchmark-fragment-quick
+benchmark-fragment-quick: $(TARGET_IRGEN_RISCV) $(VK_HOST)
+	@bash test/script/run_benchmark_fragment.sh --quick
+
+.PHONY: benchmark-diverge
+benchmark-diverge: $(VK_HOST) $(TARGET_IRGEN_RISCV) $(SPV_DIR)/diverge.frag.spv $(SPV_DIR)/mandelbrot.frag.spv $(SPV_DIR)/quad.vert.spv
+	@mkdir -p $(RESULT_DIR)
+	@bash test/script/run_benchmark_diverge.sh
+
+.PHONY: benchmark-diverge-quick
+benchmark-diverge-quick: $(VK_HOST) $(TARGET_IRGEN_RISCV) $(SPV_DIR)/diverge.frag.spv $(SPV_DIR)/mandelbrot.frag.spv $(SPV_DIR)/quad.vert.spv
+	@mkdir -p $(RESULT_DIR)
+	@bash test/script/run_benchmark_diverge.sh --quick
 
 # ---- clean ----
 .PHONY: clean
 clean:
 	rm -rf $(BUILD_DIR)
-	rm -f $(TARGET_CODEGEN) $(TARGET_IRGEN) $(TARGET_IRGEN_RISCV) $(TARGET_IRGEN_SPIRV) \
-	      $(TARGET_PIPELINE) pipeline_host.rv anim_host.rv anim_host_x86 spirv_vulkan_host scene_pipeline_host \
-	      module.ll module.opt.ll module.spv \
-	      vs.ll fs.ll pipeline.ll scene_vs.ll scene_fs.ll scene_pipeline.ll \
-	      vs_rv.ll fs_rv.ll pipeline_riscv.ll anim_vs_rv.ll anim_fs_rv.ll anim_riscv.ll \
-	      shader.o shader_native.o pipeline_shader.o scene_pipeline_shader.o \
-	      pipeline_riscv.o anim_riscv.o \
-	      librvshade.so test_host.rv render_host
 	rm -rf $(RESULT_DIR)
+

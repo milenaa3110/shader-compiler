@@ -1,0 +1,102 @@
+# terrain_vs.src — Animated wave terrain vertex shader (RISC-V build)
+# 32x32 grid of quads (6144 vertices). All geometry + lighting done in vertex stage.
+# Camera orbits slowly; perspective projection computed per-vertex.
+# Fragment shader just outputs interpolated vColor.
+
+uniform float uTime;
+out vec4 vColor;
+
+@entry @stage(vertex)
+fn void main() {
+    # ── Grid position from vertex ID ──────────────────────────────────────────
+    float GRID = 32.0;
+    float vid = float(gl_VertexID);
+    float quadIdx = floor(vid / 6.0);
+    float corner  = vid - quadIdx * 6.0;
+
+    float gx = floor(quadIdx / GRID);
+    float gz = quadIdx - gx * GRID;
+
+    # Corner offsets — two CCW triangles per quad
+    # tri0: 0=(0,0) 1=(1,0) 2=(1,1)   tri1: 3=(0,0) 4=(1,1) 5=(0,1)
+    float dx = 0.0;
+    float dz = 0.0;
+    if (corner == 1.0 || corner == 2.0 || corner == 4.0) { dx = 1.0; }
+    if (corner == 2.0 || corner == 4.0 || corner == 5.0) { dz = 1.0; }
+
+    float fx = (gx + dx) / GRID * 4.0 - 2.0;
+    float fz = (gz + dz) / GRID * 4.0 - 2.0;
+
+    # ── Wave height displacement ───────────────────────────────────────────────
+    float fy = sin(fx * 1.9 + uTime * 1.1) * cos(fz * 2.4 + uTime * 0.85) * 0.32
+             + sin(fx * 4.2 + fz * 3.3 + uTime * 1.6) * 0.13
+             + cos(sqrt(fx*fx + fz*fz) * 2.8 - uTime * 2.1) * 0.09;
+
+    # ── Approximate surface normal (gradient of displacement) ─────────────────
+    float r = sqrt(fx*fx + fz*fz) + 0.001;
+    float dydx = cos(fx * 1.9 + uTime * 1.1) * 1.9 * 0.32
+               + cos(fx * 4.2 + fz * 3.3 + uTime * 1.6) * 4.2 * 0.13
+               - (fx / r) * 2.8 * sin(r * 2.8 - uTime * 2.1) * 0.09;
+    float dydz = -sin(fz * 2.4 + uTime * 0.85) * 2.4 * 0.32
+               + cos(fx * 4.2 + fz * 3.3 + uTime * 1.6) * 3.3 * 0.13
+               - (fz / r) * 2.8 * sin(r * 2.8 - uTime * 2.1) * 0.09;
+
+    float nLen = sqrt(dydx*dydx + 1.0 + dydz*dydz);
+    float nxV = -dydx / nLen;
+    float nyV =  1.0  / nLen;
+    float nzV = -dydz / nLen;
+
+    # ── Directional sun + sky lighting ────────────────────────────────────────
+    float sunX = 0.5; float sunY = 0.8; float sunZ = 0.3;
+    float sLen = sqrt(sunX*sunX + sunY*sunY + sunZ*sunZ);
+    float diff = clamp(nxV*sunX/sLen + nyV*sunY/sLen + nzV*sunZ/sLen, 0.0, 1.0);
+    float light = diff * 0.75 + 0.25;
+
+    # ── Color by terrain height ────────────────────────────────────────────────
+    float h = clamp((fy + 0.5) / 1.0, 0.0, 1.0);
+    float isWater = step(h, 0.28);
+    float isSnow  = step(0.70, h);
+    float isLand  = 1.0 - isWater - isSnow;
+
+    float cr = isWater*0.08 + isLand*(0.18 + h*0.38) + isSnow*0.93;
+    float cg = isWater*0.32 + isLand*(0.52 + h*0.12) + isSnow*0.94;
+    float cb = isWater*0.72 + isLand*0.17 + isSnow*0.98;
+
+    vColor = vec4(cr*light, cg*light, cb*light, 1.0);
+
+    # ── Perspective projection: orbiting camera ────────────────────────────────
+    float camAngle = uTime * 0.18;
+    float camX = sin(camAngle) * 5.0;
+    float camY = 3.2;
+    float camZ = cos(camAngle) * 5.0;
+
+    float fLen = sqrt(camX*camX + camY*camY + camZ*camZ);
+    float fwdX = -camX/fLen;
+    float fwdY = -camY/fLen;
+    float fwdZ = -camZ/fLen;
+
+    float rX = fwdZ;
+    float rZ = -fwdX;
+    float rLen = sqrt(rX*rX + rZ*rZ);
+    rX = rX/rLen;
+    rZ = rZ/rLen;
+
+    float upX = -rZ*fwdY;
+    float upY =  rZ*fwdX - rX*fwdZ;
+    float upZ =  rX*fwdY;
+
+    float dvX = fx - camX;
+    float dvY = fy - camY;
+    float dvZ = fz - camZ;
+
+    # Camera-space coordinates
+    float cx = rX*dvX + 0.0*dvY + rZ*dvZ;
+    float cy = upX*dvX + upY*dvY + upZ*dvZ;
+    float cz = fwdX*dvX + fwdY*dvY + fwdZ*dvZ;
+
+    # Perspective: FOV=60deg (f=1.732), near=0.1, far=20
+    # clip = (f*cx, f*cy, A*cz+B, cz)  where cz>0=in-front
+    # A=-(far+near)/(far-near)=-1.01005, B=-2*far*near/(far-near)=-0.20101
+    float f = 1.732;
+    gl_Position = vec4(f*cx, f*cy, -1.01005*cz - 0.20101, cz);
+}

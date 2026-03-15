@@ -1,0 +1,36 @@
+# texture_test_gpu_fs.src — GPU texture-sampling benchmark fragment shader.
+# Samples a 512×512 procedural marble texture with animated 9-tap UV distortion.
+#
+# GPU advantage: hardware TMU does bilinear filtering at zero ALU cost.
+# CPU counterpart (texture_test_fs.src) replicates the marble formula in software.
+# Demonstrates: TMU vs ALU — GPU texture bandwidth vs CPU compute throughput.
+
+uniform float uTime;
+uniform sampler2D tex;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float t = uTime;
+    vec4 sum = vec4(0.0, 0.0, 0.0, 0.0);
+
+    # 9-tap 3×3 multi-sample with animated UV distortion
+    int dy = -1;
+    while (dy <= 1) {
+        int dx = -1;
+        while (dx <= 1) {
+            float fdx = float(dx);
+            float fdy = float(dy);
+            float ux = vUV.x + fdx * 0.003;
+            float uy = vUV.y + fdy * 0.003;
+            ux = ux + sin(uy * 8.0 + t) * 0.02;
+            uy = uy + cos(ux * 6.0 + t) * 0.015;
+            vec2 uv = vec2(ux, uy);
+            sum = sum + texture(tex, uv);
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    FragColor = sum * 0.111111;
+}

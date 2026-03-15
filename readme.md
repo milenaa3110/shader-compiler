@@ -1,390 +1,253 @@
-# GLSL-sličan kompajler -> LLVM IR
+# GLSL Compiler — RISC-V + Vulkan SPIR-V
 
-Ovaj projekat predstavlja istraživačko-edukativni kompajler za GLSL-sličan jezik koji parsira shader-like kod i generiše korektan, verifikabilan LLVM IR. Fokus projekta je na preciznoj semantici jezika, ispravnom modelovanju tipova, izraza i kontrole toka. Sve optimizacije se za sad prepuštaju LLVM infrastrukturi.
+A research compiler for a GLSL-inspired language that compiles shaders to two targets:
+- **RISC-V LLVM IR** — runs on CPU via QEMU, parallelised with OpenMP, with optional RVV (RISC-V Vector Extension) auto-vectorisation
+- **Vulkan SPIR-V** — runs on GPU via the Vulkan API (LavaPipe software renderer or real GPU)
 
-Projekat je trenutno u CPU-like fazi izvršavanja. GPU shader pipeline još uvek nije implementiran, ali je jasno planiran kao sledeći korak.
+The primary goal is to compare GPU and CPU execution of the same shader logic, measure GPU dispatch overhead, observe OpenMP thread scaling, and demonstrate RVV vectorisation.
 
-## Status projekta i plan razvoja
+---
 
-### Trenutna faza
+## Project structure
 
-U trenutnoj fazi implementirano je:
-
-- **GLSL-inspirisan jezik**, nezavisan od konkretnog GPU pipeline-a
-- **Generisanje LLVM IR-a** koji prolazi LLVM verifier
-- **Podrška za**:
-  - skalarne tipove, vektore, matrice i strukture
-  - swizzle operacije (čitanje i pisanje)
-  - built-in matematičke i vektorske funkcije
-  - kontrolu toka (if, for, while, break, return)
-  - eksperimentalno ciljanje RISC-V backend-a (CPU)
-
-### Sledeće faze (planirano)
-
-**Razdvajanje CPU i GPU modela izvršavanja**
-
-**Dodavanje GPU pipeline nivoa**:
-- različiti tipovi shadera (vertex, fragment, compute)
-- resursi: teksture, sampleri, uniform i storage bufferi
-- OpenGL-like operacije sa host strane
-
-**Implementacija GPU backend-a**:
-- potencijalno SPIR-V ili sličan IR
-
-**OpenMP backend za CPU**:
-- imitacija SIMD/SIMT ponašanja
-- poređenje CPU i GPU izvršavanja istih shader-a
-
-## Ciljevi dizajna
-
-Ciljevi projekta su:
-
-- dizajn jezika inspirisan GLSL-om, ali bez zavisnosti od GPU specifikacije
-- precizno modelovanje semantike izraza, tipova i kontrole toka
-- generisanje strogo korektnog i verifikabilnog LLVM IR-a
-- jasna separacija parsera, AST-a, codegen-a i pomoćnih modula
-
-Projekat je istraživačkog karaktera i nije zamišljen kao zamena za postojeći GLSL/SPIR-V toolchain.
-
-## Model izvršavanja i ograničenja
-
-Jezik koristi CPU-like model izvršavanja zasnovan na LLVM IR-u:
-
-- svaka funkcija se kompajlira u LLVM Function
-- kontrolni tok je eksplicitno modelovan pomoću BasicBlock-ova
-- svi skokovi i povratne instrukcije su eksplicitno generisani u LLVM IR-u;
-funkcije tipa void koje nemaju eksplicitni return u izvornom jeziku automatski se završavaju instrukcijom ret void
-
-U ovoj fazi nije implementirano:
-
-- SIMT / warp / wavefront izvršavanje
-- shader stage semantika
-- ugrađene GLSL promenljive (gl_Position, gl_FragCoord)
-- implicitna paralelizacija niti
-
-## Zavisnosti
-
-- **LLVM 18**
-- **C++20** kompatibilan kompajler
-- **fmt** biblioteka
-
-## Trenutno korišćenje
-
-### Generisanje LLVM IR-a
-
-```bash
-./shader_codegen < input/shader.src
+```
+.
+├── lexer/              Tokeniser
+├── parser/             Recursive-descent parser → AST
+├── ast/                AST node definitions
+├── codegen_state/      Codegen context and symbol table
+├── main/               irgen_riscv and irgen_spirv entry points
+├── main_codegen/       shader_codegen (interactive IR dump tool)
+├── helpers/            call_helpers, assignment_helpers
+├── passes/             sincos_opt.cpp — LLVM pass plugin
+├── pipeline/           Software rasterizer (pipeline_runtime.cpp/h, pipeline_abi.h)
+├── test/
+│   ├── rv_host/        RISC-V benchmark hosts (cross-compiled, run under QEMU)
+│   │   ├── rv_host_fragment.cpp      generic animation host
+│   │   ├── rv_host_compute.cpp       Game of Life CPU host
+│   │   └── rv_host_compute_blur.cpp  Gaussian blur CPU host
+│   ├── vk_host/        Vulkan host programs (run on the host, drive the GPU)
+│   │   ├── vk_host_fragment.cpp      offscreen animation renderer
+│   │   ├── vk_host_compute.cpp       Game of Life Vulkan host
+│   │   ├── vk_host_compute_blur.cpp  Gaussian blur Vulkan host
+│   │   └── vk_host_texture.cpp       texture sampling Vulkan host
+│   ├── script/         Shell scripts (benchmarks, tests)
+│   └── shaders/
+│       ├── animations/   Fragment + vertex + compute shader sources (.src, .comp)
+│       ├── pipeline/     Pipeline test shaders
+│       └── compiler_tests/  Compiler unit test shaders
+└── build/
+    ├── riscv/          irgen_riscv binary, .ll / .o / .rv intermediates
+    ├── spirv/          irgen_spirv binary, Vulkan hosts, .spv bytecode
+    └── llvm/           sincos_opt.so, compiler object files
 ```
 
-Generiše se fajl `module.ll`.
+---
 
-### Provera ispravnosti
-
-```bash
-llvm-as module.ll -o /dev/null
-```
-
-### Interaktivno testiranje kompajalera
-
-#### `make run-codegen`
-
-Pokreće glavni kompajler u interaktivnom modu:
+## Dependencies
 
 ```bash
-make run-codegen
+# LLVM 18
+sudo apt install llvm-18 clang-18
+
+# RISC-V cross-compiler and QEMU user-mode emulation
+sudo apt install gcc-riscv64-linux-gnu g++-riscv64-linux-gnu qemu-user-static
+
+# Vulkan (GPU tests, uses LavaPipe software renderer if no GPU)
+sudo apt install libvulkan-dev glslang-tools mesa-vulkan-drivers
+
+# ffmpeg (MP4 output)
+sudo apt install ffmpeg
 ```
 
-Kompajler čita shader kod sa standardnog ulaza i generiše LLVM IR na standardnom izlazu. Možete direktno unositi kod ili preusmeriti ulaz iz fajla:
+---
+
+## Build
 
 ```bash
-./shader_codegen < input/shader.src
+make          # builds: build/riscv/irgen_riscv, build/spirv/irgen_spirv,
+              #         build/shader_codegen, build/llvm/sincos_opt.so
+make clean    # removes build/ and result/
 ```
 
-#### `make run-codegen-opt`
+---
 
-Pokreće kompajler i direktno propušta generisani IR kroz LLVM optimizator:
+## How a shader becomes a video
 
+```
+shader_fs.src
+  │
+  ├─ irgen_riscv → vs.ll + fs.ll → llvm-link → opt -O3 → sincos_opt.so → llc → .o
+  │                                                                              │
+  │                                             rv_host_fragment.cpp + pipeline_runtime.cpp
+  │                                                                              │
+  │                                                          riscv64 ELF (.rv)
+  │                                                                              │
+  │                                                      QEMU + OpenMP → frames → MP4
+  │
+  └─ irgen_spirv → GLSL 450 → glslangValidator → .spv
+                                                    │
+                              vk_host_fragment + Vulkan API (LavaPipe) → frames → MP4
+```
+
+The sincos pass fuses `sin(x) + cos(x)` pairs into a single `sincosf(x, &s, &c)` call after `opt -O3` has unified duplicate arguments via GVN.
+
+---
+
+## Make targets
+
+### Compiler unit tests
 ```bash
-make run-codegen-opt
+make check            # compile all test shaders, validate IR with llvm-as
+make check-verbose    # same with per-test output
 ```
 
-Ekvivalentno je sledećem pipeline-u:
-
+### Single-shader Vulkan animations
 ```bash
-./shader_codegen < input/shader.src | opt -O3 -S
+make vk-mandelbrot    # renders 60 frames → result/mandelbrot.mp4
+make vk-julia
+make vk-voronoi
+make vk-waves
+make vk-tunnel
+make vk-fire
+make vk-galaxy
+make vk-ripple
+make vk-reaction
+make vk-cellular
+make vk-earth
+make vk-scene3d
+make vk-texture       # texture sampling demo
+make vk-terrain       # vertex shader — procedural terrain mesh
+make all-vk           # all 13 fragment animations
 ```
 
-Generiše optimizovani LLVM IR koji se ispisuje na standardni izlaz. Koristi se za brzu proveru optimizovanog koda bez kreiranja privremenih fajlova.
-
-### End-to-end testiranje (RISC-V backend)
-
-#### `make test`
-
-Alias za `make run-riscv`. Izvršava kompletan pipeline od kompilacije shader-a do izvršavanja na RISC-V arhitekturi putem emulatora:
-
+### Single-shader RISC-V animations
 ```bash
-make test
+make rv-mandelbrot    # renders 60 frames via QEMU → result/mandelbrot_rv.mp4
+make rv-terrain
+make all-rv
 ```
 
-**Šta se dešava (korak po korak):**
+### Benchmarks
+| Target | What it measures |
+|--------|-----------------|
+| `make benchmark-fragment` | GPU vs CPU across all 12 fragment shaders |
+| `make benchmark-fragment-quick` | Same, fewer frames |
+| `make benchmark-vertex` | Terrain vertex shader: GPU vs CPU |
+| `make benchmark-compute` | Game of Life: GPU dispatch overhead at small grids |
+| `make benchmark-compute-sweep` | Life crossover: grid sizes 16→512 |
+| `make benchmark-compute-animate` | Life: GPU + CPU MP4 output |
+| `make benchmark-compute-blur` | Gaussian blur: GPU compute vs CPU throughput |
+| `make benchmark-diverge` | Branch divergence + warp boundary effect |
+| `make benchmark-diverge-quick` | Quick divergence demo |
+| `make cpu-scaling` | OpenMP thread scaling + Amdahl fit + RVV instruction count |
+| `make cpu-scaling-quick` | Faster version |
+| `make bench-rvv-width` | RVV vector width only (VLEN=128/256/512 under QEMU) |
 
-1. **Generisanje IR-a** (`module.ll`)
-   - Kompajler `irgen` čita `input/shader.src`
-   - Generiše neoptimizovan LLVM IR
+---
 
-2. **Optimizacija** (`module.opt.ll`)
-   - LLVM `opt` primenjuje `-O3` optimizacije
-   - Kreira optimizovani IR modul
+## Language specification
 
-3. **Kompilacija u RISC-V objekat** (`shader.o`)
-   - `llc` kompajler backend generiše RISC-V mašinski kod
-   - Target: `riscv64-unknown-linux-gnu`
-   - Float ABI: hard (sa HW podrškom za FP instrukcije)
-   - ISA ekstenzije: `+d,+f` (double i float)
+### Types
+- **Scalars**: `float`, `double`, `int`, `uint`, `bool`
+- **Vectors**: `vec2`, `vec3`, `vec4`
+- **Matrices**: `mat2x2` through `mat4x4`
+- **Structs**: user-defined `struct`
+- **Arrays**: local and uniform
 
-4. **Kreiranje deljene biblioteke** (`librvshade.so`)
-   - RISC-V cross-compiler linkuje objekat u `.so`
-   - Position-independent code (PIC)
+### Operators
+- Arithmetic: `+`, `-`, `*`, `/`, unary `-` — on scalars and vectors
+- Relational: `<`, `<=`, `>`, `>=`, `==`, `!=` — via `fcmp` / `icmp`
+- Logical: `&&`, `||`, `!` — with short-circuit evaluation via conditional branches and phi nodes
 
-5. **Kompilacija host programa** (`test_host.rv`)
-   - Cross-kompajlira `test/riscv/test_host.cpp`
-   - Linkuje sa `librvshade.so`
-   - Dinamički linkovanje sa rpath=`$ORIGIN`
+### Control flow
+`if` / `else`, `while`, `for`, `break`, `return`. Every basic block has an explicit terminator; `void` functions without an explicit `return` get `ret void` automatically.
 
-6. **Izvršavanje kroz QEMU**
-   - `qemu-riscv64` emulira RISC-V izvršavanje
-   - Program poziva `shade_wrapper` funkciju iz shader-a
-   - Renderuje 2048×2048 sliku
-   - Generiše `result/riscv_out.ppm`
-   - Ispisuje vreme renderovanja
+### Built-in functions
+`sin`, `cos`, `sqrt`, `floor`, `fract`, `dot`, `length`, `normalize`, `mix`, `clamp`, `min`, `max`, `mod`
 
-#### Fajlovi koji učestvuju u `make test`
-
-**Ulazni fajlovi:**
-
-- [`input/shader.src`](input/shader.src) – izvorni shader kod (funkcija `shade`)
-- [`test/riscv/test_host.cpp`](test/riscv/test_host.cpp) – C++ host program za testiranje
-
-**Generisani fajlovi:**
-
-- `module.ll` – neoptimizovan LLVM IR
-- `module.opt.ll` – optimizovan LLVM IR
-- `shader.o` – RISC-V objekat fajl
-- `librvshade.so` – RISC-V deljena biblioteka
-- `test_host.rv` – RISC-V izvršni fajl
-- `result/riscv_out.ppm` – renderovana slika
-
-**Host program (`test_host.cpp`):**
-
-Program iterira kroz svaki piksel slike (2048×2048), izračunava UV koordinate (0–1), poziva `shade_wrapper(u, v, rgba)` iz kompajliranog shader-a, i čuva rezultat u PPM formatu.
-
-Funkcija `shade_wrapper` je C linkage wrapper koji poziva `shade` funkciju iz shader koda.
-
-#### Zavisnosti
-
-Za `make test` potrebno je:
-
-- **LLVM toolchain**: `llc`, `opt`
-- **RISC-V cross-kompajler**: `riscv64-linux-gnu-g++`
-- **QEMU user-mode emulator**: `qemu-riscv64`
-- **RISC-V sysroot**: `/usr/riscv64-linux-gnu`
-
-#### Dodatni target-i
-
-```bash
-make ir         # samo generiše module.ll
-make opt        # samo generiše module.opt.ll
-make so         # samo generiše librvshade.so
-```
-
-### Optimizacija
-
-```bash
-opt -O3 module.ll -S -o module.opt.ll
-```
-
-Koristi se novi LLVM pass manager.
-
-## Specifikacija jezika (trenutna faza)
-
-### Tipovi
-
-- **Skalari**: `float`, `double`, `int`, `uint`, `bool`
-- **Vektori**: `vec2`, `vec3`, `vec4`
-- **Matrice**: kvadratne i nekvadratne dimenzija 2–4
-- **Strukture**: korisnički definisani `struct`
-- **Nizovi**: lokalni i uniform
-
-### Operatori i izrazi
-
-#### Aritmetički operatori
-
-`+`, `-`, `*`, `/`, unarni `-`
-
-Podržani nad skalarima i vektorima.
-
-#### Relacioni operatori
-
-`<`, `<=`, `>`, `>=`, `==`, `!=`
-
-Implementirani preko `fcmp` i `icmp`.
-
-#### Logički operatori
-
-- `&&`, `||` sa short-circuit evaluacijom
-- `!` logička negacija
-
-Short-circuit je implementiran pomoću:
-- uslovnih skokova (br)
-- phi čvorova
-- eksplicitnih merge blokova
-
-### Kontrola toka
-
-Podržano:
-
-- `if` / `else`
-- `while`, `for`
-- `break`
-- `return`
-
-Svaki BasicBlock mora imati terminator.
-`void` funkcije bez eksplicitnog `return` automatski dobijaju `ret void`.
-
-LLVM verifier se koristi za proveru ispravnosti IR-a.
-
-### Built-in funkcije
-
-Implementirane preko LLVM intrinsics i helper funkcija:
-
-- `sin`, `cos`, `sqrt`, `floor`, `fract`
-- `dot`, `length`, `normalize`
-- `mix`, `clamp`, `min`, `max`, `mod`
-
-Validira se:
-- broj argumenata
-- tipovi
-- dimenzije vektora
-
-### Swizzle operacije
-
-- **Čitanje**: `shufflevector`
-- **Pisanje**: validacija + `insertelement` lanac
-
-Primeri:
-
+### Swizzle
 ```glsl
-// Swizzle čitanje
-vec3 v = c.xyz;      // ekstrakcija komponenti
-vec3 v = c.xxx;      // replikacija komponente (splat)
-vec2 p = v.xy;       // parcijalni vektor
-vec3 rev = v.zyx;    // permutacija
+vec3 v = c.xyz;       // read: shufflevector
+vec2 p = v.xy;
+vec3 rev = v.zyx;
 
-// Swizzle pisanje
-v.xy = vec2(1.0, 2.0);
+v.xy = vec2(1.0, 2.0);  // write: insertelement chain
 v.zyx = vec3(3.0, 2.0, 1.0);
 ```
 
-## Konstruktori i helper sloj
-
-### Konstruktori
-
-- **Vektori**: splat i kombinacije
-- **Matrice**: identitet, dijagonala, kolone
-- **Strukture**: `insertvalue` sekvence
-
-### Helper moduli
-
-**call_helpers**:
-- pozivi funkcija
-- built-in funkcije
-- konstruktori
-
-**assignment_helpers**:
-- validacija l-value izraza
-- swizzle assignment
-- dodela članova struktura
-
-Cilj helper sloja je da AST ostane čist, a složena logika centralizovana.
-
-### Uniform promenljive
-
-Uniform promenljive predstavljaju ulazne parametre shader-a koji su konstantni tokom jednog renderovanja.
-
-**Implementacija:**
-
-- generišu se kao LLVM `GlobalVariable` sa `ExternalLinkage`
-- inicijalizuju se sa `getNullValue`
-- konstante tokom jednog izvršavanja shader funkcije
-- host program ih postavlja pre svakog poziva
-
-**Definisanje uniform promenljivih:**
-
+### Uniforms
+Declared with the `uniform` qualifier, emitted as LLVM `GlobalVariable` with `ExternalLinkage`:
 ```glsl
-uniform vec3 lightPos;
-uniform float time;
+uniform float uTime;
+uniform vec3  lightPos;
 uniform mat4x4 MVP;
 ```
 
-Uniform promenljive se deklarišu na početku shader koda koristeći `uniform` kvalifikator, nakon čega sledi tip i ime promenljive.
-
-**Problem poravnanja (alignment):**
-
-Kada host program (C++) prenosi uniform podatke shader-u, mora da poštuje LLVM-ovo poravnanje tipova. Vec3 tipovi su problematični jer LLVM koristi 16-bajtno poravnanje za vektore (zbog SIMD), dok C++ `struct` sa tri float-a zauzima samo 12 bajtova.
-
-**Rešenje:**
-
-Host strukture moraju da dodaju padding polje (`_pad`) nakon vec3 tipova:
-
+`vec3` uniforms require 16-byte alignment — host structs must add a `_pad` field:
 ```cpp
-struct Vec3Uniform {
-    float x, y, z;
-    float _pad;  // poravnanje na 16B
-};
+struct Vec3Uniform { float x, y, z, _pad; };
 ```
 
-Ovo osigurava da veličina strukture bude 16 bajtova, što odgovara LLVM očekivanjima. Bez ovog padding-a dolazi do neusklađenosti memorijskog layout-a između host programa i kompajliranog shader koda.
+---
+
+## Compilation pipeline details
+
+### RISC-V path
+
+```bash
+# 1. Compile shader to LLVM IR
+./build/riscv/irgen_riscv < shader_fs.src          # → module.ll
+
+# 2. Link vertex + fragment modules
+llvm-link-18 vs.ll fs.ll -S -o combined.ll
+
+# 3. Optimise
+opt-18 -O3 --enable-unsafe-fp-math --fp-contract=fast -S combined.ll -o opt.ll
+
+# 4. sincos pass
+opt-18 --load-pass-plugin=build/llvm/sincos_opt.so \
+       -passes='sincos-opt,mem2reg,instcombine' -S opt.ll -o final.ll
+
+# 5. Compile to RISC-V object
+llc-18 -O3 --fp-contract=fast -filetype=obj \
+       -mtriple=riscv64-unknown-linux-gnu -mattr=+m,+a,+f,+d,+v final.ll -o shader.o
+
+# 6. Link with host + rasterizer
+riscv64-linux-gnu-g++ -O3 -static -fopenmp -Ipipeline \
+    -DANIM_NAME='"mandelbrot"' -DNFRAMES=60 \
+    test/rv_host/rv_host_fragment.cpp pipeline/pipeline_runtime.cpp \
+    shader.o -o mandelbrot.rv
+
+# 7. Run under QEMU
+OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu ./mandelbrot.rv
+```
+
+### SPIR-V path
+
+```bash
+# 1. Compile shader to GLSL 450
+./build/spirv/irgen_spirv < shader_fs.src           # → module.glsl
+
+# 2. Compile to SPIR-V
+glslangValidator -V --target-env vulkan1.0 module.glsl -o shader.frag.spv
+
+# 3. Run via Vulkan host
+./build/spirv/spirv_vulkan_host \
+    build/spirv/quad.vert.spv shader.frag.spv mandelbrot 60 512 512
+```
+
+---
 
 ## Error handling
 
-Determinističan i eksplicitan:
+The compiler reports errors via `logError` and aborts code generation. Caught errors include:
+- Syntax errors, type mismatches
+- Invalid function calls, wrong argument counts
+- Invalid swizzle or assignment targets
+- Unknown struct fields
 
-- `logError` + prekid codegen-a
+---
 
-Hvata:
-- sintaksne greške
-- tipne greške
-- nevalidne pozive
-- nevalidan swizzle ili assignment
-- nepostojeća polja struktura
-
-Trenutno nema linija/kolona u porukama o grešci (planirano unapređenje).
-
-## Primeri testova
-
-### Aritmetika
-
-```glsl
-fn float test(float a, float b) {
-    return a + b * 2.0;
-}
-```
-
-### Short-circuit
-
-```glsl
-fn bool test(bool a, bool b) {
-    return a && b || !a;
-}
-```
-
-### Swizzle
-
-```glsl
-fn vec3 test() {
-    vec3 v = vec3(1.0, 2.0, 3.0);
-    v.xy = vec2(5.0, 6.0);
-    return v;
-}
-```
-Testovi su sačuvani u tests.md fajlu
+For benchmark details and test categories see [TESTING.md](TESTING.md).
+For source layout and design decisions see [ARCHITECTURE.md](ARCHITECTURE.md).

@@ -1,0 +1,40 @@
+#version 450
+// 5-tap Gaussian blur (separable horizontal pass) on RGBA float image.
+// binding 0 = input  vec4 buffer (W*H pixels, row-major)
+// binding 1 = output vec4 buffer
+// push constants: width, height
+// workgroup: 16x16
+// Kernel: [1, 4, 6, 4, 1] / 16  (applied in X; mirrors blur_cs.src)
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly  buffer In  { vec4 src[]; };
+layout(std430, binding = 1) writeonly buffer Out { vec4 dst[]; };
+
+layout(push_constant) uniform PC {
+    uint width;
+    uint height;
+} pc;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) return;
+
+    uint W = pc.width;
+
+    // Clamp-to-edge for border pixels
+    uint x0 = x > 0u        ? x - 1u : 0u;
+    uint x1 = x;
+    uint x2 = x + 1u < W    ? x + 1u : W - 1u;
+    uint x3 = x + 2u < W    ? x + 2u : W - 1u;
+    uint xm1= x > 1u        ? x - 2u : 0u;
+
+    vec4 a = src[y * W + xm1];
+    vec4 b = src[y * W + x0];
+    vec4 c = src[y * W + x1];
+    vec4 d = src[y * W + x2];
+    vec4 e = src[y * W + x3];
+
+    dst[y * W + x] = (a + e) * 0.0625 + (b + d) * 0.25 + c * 0.375;
+}

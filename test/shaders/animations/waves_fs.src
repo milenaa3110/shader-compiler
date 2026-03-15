@@ -1,0 +1,43 @@
+# waves_fs.src — Ocean surface: sum of sine waves with Phong-style shading
+# Tests: multi-frequency wave interference on RVV
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float u = vUV.x * 6.28318;
+    float v = vUV.y * 6.28318;
+
+    # Four waves with different frequencies and travel directions
+    float h  = 0.0;
+    h = h + 0.35 * sin(u * 1.2 - uTime * 1.8 + v * 0.3);
+    h = h + 0.20 * sin(u * 2.7 - uTime * 2.3 - v * 0.8);
+    h = h + 0.12 * sin(u * 5.1 + uTime * 3.1 + v * 1.4);
+    h = h + 0.08 * sin(u * 8.3 - uTime * 4.0 - v * 2.1);
+    h = (h + 0.75) / 1.5;
+
+    # Normal approximation from nearby samples
+    float eps = 0.01;
+    float hx  = 0.0;
+    hx = hx + 0.35 * sin((u + eps) * 1.2 - uTime * 1.8 + v * 0.3);
+    hx = hx + 0.20 * sin((u + eps) * 2.7 - uTime * 2.3 - v * 0.8);
+    hx = (hx + 0.75) / 1.5;
+
+    float slope = clamp((hx - h) / eps * 0.5, -1.0, 1.0);
+
+    # Deep-sea color ramp
+    float depth = 1.0 - h;
+    float r = mix(0.0,  0.9, h * h);
+    float g = mix(0.15, 1.0, h * 0.7);
+    float b = mix(0.35, 1.0, h * 0.4 + 0.3);
+
+    # Specular highlight on wave crests
+    float spec = pow(clamp(slope + 0.5, 0.0, 1.0), 8.0) * 0.6;
+    r = r + spec;
+    g = g + spec;
+    b = b + spec;
+
+    FragColor = vec4(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0), 1.0);
+}

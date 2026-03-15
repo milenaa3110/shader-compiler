@@ -1,0 +1,61 @@
+# earth_fs.src — Rotating sphere with procedural land/ocean, Phong shading
+# Demonstrates: sphere raycasting, procedural noise, lighting on RVV
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    # Ray setup for sphere at origin, radius 0.85, camera at z=2
+    float rx = (vUV.x - 0.5) * 2.0;
+    float ry = (vUV.y - 0.5) * 2.0;
+    float rz = -1.0;
+    float rlen = sqrt(rx * rx + ry * ry + rz * rz);
+    rx = rx / rlen; ry = ry / rlen; rz = rz / rlen;
+
+    # Ray-sphere intersection (sphere at origin r=0.85, camera at z=2)
+    # b = 2*dot(ro, rd) = 2*(rz*2),  c = |ro|^2 - r^2 = 4 - 0.7225
+    float bq = 2.0 * (rz * 2.0);
+    float cq = 3.2775;
+    float disc = bq * bq - 4.0 * cq;
+
+    float hit = step(0.0, disc);
+    float t   = (-bq - sqrt(abs(disc) + 0.001)) * 0.5;
+
+    # Hit point and normal
+    float hx = rx * t;
+    float hy = ry * t;
+    float hz = rz * t + 2.0;
+    float hn = sqrt(hx * hx + hy * hy + hz * hz) + 0.0001;
+    float nx = hx / hn; float ny = hy / hn; float nz = hz / hn;
+
+    # Spherical UV with rotation
+    float lon = (nx + 1.0) * 0.5 + uTime * 0.05;
+    float lat = ny * 0.5 + 0.5;
+
+    # Procedural terrain
+    float land = 0.0;
+    land = land + sin(lon * 14.0) * sin(lat * 9.0) * 0.5;
+    land = land + sin(lon * 31.0 + 1.3) * sin(lat * 21.0 + 0.7) * 0.25;
+    land = land + sin(lon * 67.0 + 2.1) * sin(lat * 43.0 + 1.9) * 0.13;
+    float isLand = step(0.0, land);
+
+    # Colors
+    float oceanR = 0.1; float oceanG = 0.3; float oceanB = 0.7;
+    float landR  = 0.2; float landG  = 0.55; float landB  = 0.15;
+    float cr = mix(oceanR, landR, isLand);
+    float cg = mix(oceanG, landG, isLand);
+    float cb = mix(oceanB, landB, isLand);
+
+    # Phong lighting: sun at fixed direction
+    float lx = 0.577; float ly = 0.577; float lz = 0.577;
+    float diff = clamp(nx * lx + ny * ly + nz * lz, 0.0, 1.0);
+    float spec = pow(clamp(diff, 0.0, 1.0), 32.0) * (1.0 - isLand) * 0.6;
+
+    cr = cr * diff + spec;
+    cg = cg * diff + spec;
+    cb = cb * diff + spec;
+
+    FragColor = vec4(cr * hit, cg * hit, cb * hit, 1.0);
+}
