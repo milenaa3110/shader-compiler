@@ -85,9 +85,6 @@ if [[ "$SWEEP" -eq 1 ]]; then
 
     echo ""
     echo -e "${BOLD}Grid-size sweep — ${SWEEP_GENS} generations, ${NTHREADS} CPU threads${RESET}"
-    echo -e "  Goal: observe how GPU/CPU balance shifts across grid sizes."
-    echo -e "  Under QEMU, GPU wins at all sizes — emulation overhead masks CPU cache advantage."
-    echo -e "  On real RISC-V hardware, small grids (L1 cache, low GPU occupancy) would favor CPU."
     echo ""
     echo -e "${BOLD}┌────────────┬──────────────┬──────────────┬─────────┬──────────────┐${RESET}"
     echo -e "${BOLD}│ Grid       │ GPU ms/gen   │ CPU ms/gen   │ Speedup │ Winner       │${RESET}"
@@ -99,19 +96,6 @@ if [[ "$SWEEP" -eq 1 ]]; then
 
     echo -e "${BOLD}└────────────┴──────────────┴──────────────┴─────────┴──────────────┘${RESET}"
     echo ""
-    echo -e "${BOLD}What this shows:${RESET}"
-    echo -e "  GPU uses pipeline barriers — all generations in one command buffer, one submit."
-    echo -e "  CPU uses OpenMP with cache-friendly sequential access."
-    echo -e "  Under QEMU, the crossover does not appear — emulation overhead keeps CPU slower at all sizes."
-    echo -e "  On real hardware: small grid (L1, low occupancy) → CPU wins; large grid → GPU wins."
-    echo -e "  GPU uses one submit for all ${SWEEP_GENS} generations via pipeline barriers (no roundtrip)."
-    echo ""
-    echo -e "  Cells in memory per grid:"
-    for g in "${SWEEP_GRIDS[@]}"; do
-        kb=$(( g * g * 4 / 1024 ))
-        if (( kb < 64 )); then cache="L1"; elif (( kb < 512 )); then cache="L2"; else cache="L3+"; fi
-        printf "    %4d×%-4d = %5d KB  (%s cache)\n" "$g" "$g" "$kb" "$cache"
-    done
     exit 0
 fi
 
@@ -170,8 +154,6 @@ if [[ "$TINY" -eq 1 ]]; then
 
     echo ""
     echo -e "${BOLD}━━━ 32×32 — low GPU occupancy case ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "  At this grid size GPU occupancy is very low (4 workgroups of 16×16)."
-    echo -e "  Data fits in CPU L1 cache — theoretically favours CPU, but QEMU overhead still applies."
     echo ""
 
     gpu_tiny_out=$(./build/spirv/spirv_vulkan_life_host build/spirv/life.comp.spv "$TINY_GENS" "$TINY_GRID" 2>/dev/null || true)
@@ -215,10 +197,6 @@ if [[ "$TINY" -eq 1 ]]; then
         fi
     fi
     echo -e "${BOLD}└────────────────────┴──────────────────┴──────────────────┴──────────┘${RESET}"
-    echo ""
-    echo -e "  32×32 = 1024 cells = ${BOLD}4 KB${RESET} — fits entirely in L1 cache."
-    echo -e "  4 workgroups → GPU underutilized. Under QEMU, GPU still wins due to emulation overhead."
-    echo -e "  On real RISC-V hardware (e.g. Banana Pi F3), expect CPU to win at this size."
     echo ""
 fi
 
@@ -270,12 +248,5 @@ elif [[ "$CPU_MSPG" != "N/A" ]]; then
 fi
 
 echo -e "${BOLD}└────────────────────┴──────────────────┴──────────────────┴──────────┘${RESET}"
-
-echo ""
-echo -e "${BOLD}What this shows:${RESET}"
-echo -e "  GPU: pipeline barriers between dispatches — no CPU roundtrip per generation."
-echo -e "       All ${GENS} generations in one command buffer, one vkQueueSubmit."
-echo -e "  CPU: ${GENS} iterations in a tight OpenMP loop, ${NTHREADS} threads."
-echo -e "       ${GRID}×${GRID} grid = $((GRID * GRID * 4)) bytes."
 echo ""
 echo -e "  Flags: ${BOLD}--tiny${RESET} (32×32)  ${BOLD}--sweep${RESET} (crossover chart)  ${BOLD}--animate${RESET} (MP4)"

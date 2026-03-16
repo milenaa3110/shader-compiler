@@ -70,8 +70,3 @@ echo -e "${BOLD}└────────────────────�
 
 echo ""
 echo -e "${CYAN}Output images: result/blur_gpu.ppm  result/blur_cpu.ppm${RESET}"
-echo -e "${BOLD}What this shows:${RESET}"
-echo -e "  GPU: all ${BOLD}$((512*512/16/16))${RESET} workgroups dispatched simultaneously"
-echo -e "  CPU: ${NTHREADS} OpenMP threads, each processes a stripe of rows"
-echo -e "  Compute shaders are the GPU's ${GREEN}main advantage${RESET} for image processing,"
-echo -e "  matrix ops, ML inference, physics simulation."

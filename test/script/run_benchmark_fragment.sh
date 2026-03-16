@@ -188,23 +188,3 @@ for A in "${ANIMATIONS[@]}"; do
     mp4="${RV_MP4[$A]:-}"; [[ "$mp4" != "-" && -n "$mp4" ]] && echo "    $mp4"
 done
 
-# ── what these numbers mean ───────────────────────────────────────────────────
-echo ""
-echo -e "${BOLD}What the numbers show:${RESET}"
-echo -e "  ${GREEN}GPU wins on all tests here${RESET} — by design."
-echo -e "  Fragment shaders and compute are embarrassingly parallel: each pixel/texel"
-echo -e "  is independent, which is exactly what GPUs are built for. Hundreds of shader"
-echo -e "  units run in parallel vs a handful of RISC-V threads."
-echo ""
-echo -e "  ${BOLD}Speedup column:${RESET} how many times faster the GPU is for each workload."
-echo -e "  ${BOLD}RV instrs:${RESET}     static count of compiled shader instructions (objdump)."
-echo -e "               More instructions = more complex shader math."
-echo -e "  ${BOLD}SPIR-V KB:${RESET}     compact IR bytecode (not machine code — no ELF overhead)."
-echo -e "  ${BOLD}RV .o KB:${RESET}      ELF object with machine code + symbol table + relocations."
-echo -e "               SPIR-V being smaller does NOT mean the GPU does less work —"
-echo -e "               it is a different format (portable bytecode vs native object)."
-echo ""
-echo -e "${CYAN}Notes:${RESET}"
-echo -e "  RISC-V runs via QEMU user-mode JIT (${NTHREADS} OpenMP threads on real CPU cores)."
-echo -e "  QEMU adds JIT overhead on top of the RISC-V thread count disadvantage."
-echo -e "  Instruction counts from objdump (static analysis of compiled shader object)."

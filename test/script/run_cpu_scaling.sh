@@ -150,8 +150,6 @@ mkdir -p result
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${BOLD}━━━ 1. Thread Scaling — Fragment Shaders (${FRAG_W}×${FRAG_H}, ${FRAG_FRAMES} frames) ━━━━━━━━━━━${RESET}"
-echo -e "  Pipeline: rasterizer → ${BOLD}dynamic,1${RESET} row scheduling → fragment shader"
-echo -e "  Pixels are independent → should scale near-linearly up to thread count."
 echo ""
 
 for anim in mandelbrot diverge; do
@@ -180,9 +178,6 @@ done
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${BOLD}━━━ 2. Thread Scaling — Game of Life 256×256 (${LIFE_GENS} generations) ━━━━━━━━━━━━━${RESET}"
-echo -e "  Within each generation: all cells independent → parallelizable."
-echo -e "  Between generations: strict serial dependency → Amdahl serial fraction > 0."
-echo -e "  OpenMP: ${BOLD}static collapse(2)${RESET} (individual cells assigned to threads)."
 echo ""
 
 echo -e "${CYAN}Building life 256×256…${RESET}"
@@ -207,9 +202,6 @@ print_scaling_table "life-256" "" "$life_t1" "${life_times[@]}"
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${BOLD}━━━ 3. Cache-Size Effect on Thread Scaling ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "  Same workload (Game of Life), three grid sizes with different cache residency."
-echo -e "  Smaller grid → data stays in L1/L2 → threads share hot cache → better scaling."
-echo -e "  Larger grid → L3 / DRAM pressure → memory bandwidth becomes the bottleneck."
 echo ""
 
 declare -A cache_label=([32]="L1 (4 KB)" [128]="L2 (64 KB)" [256]="L3+ (256 KB)")
@@ -249,22 +241,12 @@ done
 
 echo -e "${BOLD}└──────────────┴────────────┴──────────────────────────────────────────────┘${RESET}"
 echo ""
-echo -e "  ${BOLD}Expected pattern:${RESET}"
-echo -e "    32×32  (L1):  best scaling — entire grid fits per-thread in L1, no bandwidth wall"
-echo -e "    128×128 (L2): moderate scaling — some threads share L2 lines, mild false-sharing risk"
-echo -e "    256×256 (L3+): scaling limited by memory bandwidth as thread count exceeds L2 ways"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. SCHEDULING EFFECT — static vs dynamic for diverge
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${BOLD}━━━ 4. Scheduling Effect — static vs dynamic (diverge shader) ━━━━━━━━━━━━━━${RESET}"
-echo -e "  diverge: left half (x<0.5) = 4 trig ops, right half = 96-iter Mandelbrot."
-echo -e "  ${BOLD}static${RESET} scheduling: each thread gets a fixed block of rows."
-echo -e "    Each row has 50/50 light/heavy pixels → blocks are roughly equal work."
-echo -e "  ${BOLD}dynamic,1${RESET} scheduling: rows assigned on demand one at a time."
-echo -e "    Adaptive — faster threads pick up more rows as heavy threads lag behind."
-echo -e "  For mandelbrot (uniform): static ≈ dynamic (no load imbalance to correct)."
 echo ""
 
 echo -e "${CYAN}Building mandelbrot static / dynamic…${RESET}"
@@ -297,26 +279,13 @@ done
 
 echo -e "${BOLD}└──────────────┴──────────┴──────────┴───────────┴──────────────────────────────┘${RESET}"
 rm -f "$BUILD_DIR"/_sched_mandelbrot*.rv "$BUILD_DIR"/_sched_diverge*.rv
-
 echo ""
-echo -e "${BOLD}Interpretation:${RESET}"
-echo -e "  mandelbrot: static ≈ dynamic — uniform work, no benefit from dynamic stealing."
-echo -e "  diverge:    each row is 50% light + 50% heavy → per-row load is still balanced."
-echo -e "    Dynamic scheduling adds overhead (atomic counter) with little gain here."
-echo -e "    ${BOLD}Key insight${RESET}: diverge would benefit from dynamic scheduling only if"
-echo -e "    rows themselves were imbalanced (e.g. if the split were horizontal, y<0.5)."
-echo -e "    With a vertical split (x<0.5), every row already has equal total work."
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. RVV VECTOR WIDTH SCALING
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${BOLD}━━━ 5. RVV Vector Width Scaling ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "  The RVV spec allows VLEN=128/256/512/1024 bits (hardware choice)."
-echo -e "  LLVM emits scalable-vector code with ${BOLD}vsetvli${RESET}: one instruction adapts"
-echo -e "  to any VLEN at runtime — the static binary is IDENTICAL for all widths."
-echo -e "  The meaningful metric is ${BOLD}scalar vs. vector${RESET}: how many fewer instructions"
-echo -e "  LLVM generates when the +v extension is enabled."
 echo ""
 
 # ── part A: build probe binary first, then test QEMU vlen= with it ───────────
@@ -405,30 +374,12 @@ else
                 "${vlen}-bit" "${ms}ms" "$sp" "$note"
         done
         echo -e "${BOLD}   └──────────┴──────────────┴──────────┴─────────────────────────────────────┘${RESET}"
-        echo -e "   ${YELLOW}Note:${RESET} QEMU may report equal or worse time at wider VLEN — this is expected."
-        echo -e "   QEMU simulates RVV memory ops (vle/vse) as individual transfers, so wider"
-        echo -e "   vectors require more simulated memory transactions per instruction, not fewer."
-        echo -e "   On real RVV hardware expect ~2× (256-bit) / ~4× (512-bit) for float loops."
-        echo -e "   The meaningful metric is static instruction count — see Part C below."
     fi
 fi
 
 # ── part C: scalar float ops vs. RVV float ops ───────────────────────────────
 echo ""
 echo -e "${BOLD}C) RVV vectorization — 5-tap Gaussian blur row (same kernel as blur.comp):${RESET}"
-echo -e "   out[i] = 0.0625*in[i] + 0.25*in[i+1] + 0.375*in[i+2] + 0.25*in[i+3] + 0.0625*in[i+4]"
-echo -e "   Fixed-count loop, 9 FP ops/element (5 muls + 4 adds), no cross-iteration dependencies."
-echo -e "   ${YELLOW}Why shader loops don't auto-vectorize:${RESET} the Mandelbrot inner loop exits when"
-echo -e "   |z|² ≥ 4.0 — different for every pixel. Game of Life uses wrap-around neighbor"
-echo -e "   indexing ((x+dx)%W) which prevents contiguous vector loads. Both are data-dependent."
-echo -e "   Blur is the cleanest case: purely fixed-count, contiguous memory, no early exits."
-echo -e "   ${YELLOW}Non-FP instructions in the scalar build:${RESET}"
-echo -e "     flw/fsw  — float loads and stores"
-echo -e "     addi     — pointer and loop-counter increments"
-echo -e "     blt/beqz — branch to loop-back or exit"
-echo -e "     ret      — return"
-echo -e "   These collapse into vle32.v/vse32.v + a few vfmacc.vf in the RVV build."
-echo -e "   Each vector op processes VLEN/32 floats — at VLEN=128: 4 floats/insn."
 echo ""
 
 {
@@ -488,10 +439,6 @@ CPPSRC
         if [[ "$vfp_v" -gt 0 && "$sfp_s" -gt 0 ]]; then
             ratio=$(awk "BEGIN { printf \"%.1f\", $sfp_s / $vfp_v }")
             echo -e "   ${BOLD}${sfp_s} scalar FP ops → ${vfp_v} vector FP ops${RESET}"
-            echo -e "   Each vector op replaces ~${ratio} scalar ops on average."
-            echo -e "   At VLEN=128: each vfadd.vv/vfmul.vf handles 4 floats simultaneously."
-            echo -e "   At VLEN=512: same instruction handles 16 floats — ${BOLD}4× more work per cycle.${RESET}"
-            echo -e "   The blur kernel has 9 FP ops/element → expect ~9 vector FP insns/iter in the +v build."
         fi
     else
         echo -e "   ${YELLOW}clang-18 RISC-V target not available — skipping vectorization demo.${RESET}"
@@ -499,35 +446,5 @@ CPPSRC
 
     rm -f "$rt_scalar" "$rt_vector"
 }
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SUMMARY
-# ══════════════════════════════════════════════════════════════════════════════
-echo ""
-echo -e "${BOLD}━━━ Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "  ${BOLD}Fragment shaders${RESET} (mandelbrot, diverge):"
-echo -e "    Near-linear scaling up to ~${MAX_THREADS} threads. Dynamic row scheduling"
-echo -e "    adds minimal overhead vs static for this vertical-split diverge."
-echo ""
-echo -e "  ${BOLD}Game of Life${RESET} (multi-pass):"
-echo -e "    Intra-generation parallelism scales well. Between-gen serialization"
-echo -e "    sets a hard ceiling — Amdahl serial fraction grows with smaller grids"
-echo -e "    (fewer cells per thread → synchronization dominates)."
-echo ""
-echo -e "  ${BOLD}Cache effect${RESET}:"
-echo -e "    Smallest grid (32×32) often scales WORST per-thread because:"
-echo -e "    - QEMU JIT overhead amortized over tiny work chunks"
-echo -e "    - Thread launch cost >> compute time per generation"
-echo -e "    Largest grid (256×256) scales better in absolute speedup but"
-echo -e "    still below linear as threads compete for L3 bandwidth."
-echo ""
-echo -e "  All of these effects are ${BOLD}absent on the GPU${RESET}: thousands of shader"
-echo -e "  units run in lock-step with no OpenMP overhead, no false sharing,"
-echo -e "  and no dispatch-per-generation cost for fragment shaders."
-echo ""
-echo -e "  ${BOLD}RVV vector width${RESET} (section 5):"
-echo -e "    Wider VLEN reduces instruction count for float loops."
-echo -e "    Under QEMU the wall-clock gain is small; on real RVV hardware"
-echo -e "    expect ~2× (256-bit) or ~4× (512-bit) for shader inner loops."
 
 fi  # end RVV_ONLY guard

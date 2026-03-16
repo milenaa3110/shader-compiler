@@ -95,26 +95,22 @@ bash test/run_benchmark_fragment.sh --vk-only    # skip RISC-V
 ```
 **Goal:** Compare GPU (Vulkan SPIR-V) vs CPU (RISC-V + OpenMP via QEMU) for 12 fragment
 shaders. Measures ms/frame, speedup factor, SPIR-V binary size, RV object size, and
-instruction count. GPU wins on all fragment shaders — this is expected and demonstrates
-why GPUs exist.
+instruction count.
 
 ---
 
 ### 5. Game of Life Benchmark (multi-pass dependency)
 ```bash
-make benchmark-compute         # 32×32 CPU-wins case + 256×256 main run
-make benchmark-compute-sweep   # grid sizes 16→512, shows GPU/CPU crossover point
+make benchmark-compute         # 32×32 + 256×256
+make benchmark-compute-sweep   # grid sizes 16→512
 make benchmark-compute-animate # records 600 generations as MP4 (GPU + CPU)
 
-bash test/run_benchmark_compute.sh --tiny    # 32×32 only
-bash test/run_benchmark_compute.sh --sweep   # crossover table
-bash test/run_benchmark_compute.sh --animate # MP4 output
-bash test/run_benchmark_compute.sh --grid 128 --gens 500
+bash test/script/run_benchmark_compute.sh --tiny    # 32×32 only
+bash test/script/run_benchmark_compute.sh --sweep   # crossover table
+bash test/script/run_benchmark_compute.sh --animate # MP4 output
+bash test/script/run_benchmark_compute.sh --grid 128 --gens 500
 ```
-**Goal:** Show that GPU advantage is not universal. Game of Life requires N sequential
-dispatches (one per generation) — each carrying ~0.15 ms of `vkQueueSubmit` overhead.
-At small grids (≤32×32) this overhead exceeds compute time and the CPU wins.
-**Crossover:** GPU wins above ~64×64, CPU wins below.
+**Goal:** Compare GPU compute (Vulkan pipeline barriers, single submit) vs CPU (RISC-V + OpenMP) for Conway’s Game of Life across grid sizes. Measures ms/generation and speedup per resolution.
 
 ---
 
@@ -127,11 +123,9 @@ bash test/run_benchmark_diverge.sh
 bash test/run_benchmark_diverge.sh --quick
 ```
 Three measurements:
-1. **Divergence penalty** — `diverge.frag` (50/50 light/heavy pixels) vs `mandelbrot.frag`
-   (uniform). GPU efficiency drops to ~50% because warps straddling x=0.5 execute all
-   iterations for every lane. CPU threads run each branch independently → ~100% efficiency.
-2. **Dispatch overhead isolation** — 1×1 pixel render isolates the fixed `vkQueueSubmit`
-   cost (~0.15–0.35 ms/frame regardless of pixel count).
+1. **Divergence penalty** — `diverge_fs.src` (50/50 light/heavy pixels) vs `mandelbrot_fs.src`
+   (uniform). Measures the cost of unbalanced logic
+2. **Dispatch overhead isolation** — 1×1 pixel render isolates the fixed cost for using GPU
 3. **Warp boundary dilution** — same diverge shader at 64/256/512 resolution shows the
    penalty shrinks as boundary warps become a smaller fraction of total pixels.
 
@@ -143,8 +137,7 @@ make benchmark-compute-blur
 bash test/run_benchmark_compute_blur.sh
 ```
 **Goal:** GPU Vulkan compute (`blur.comp`, 5×5 Gaussian, 16×16 workgroups) vs CPU
-RISC-V OpenMP blur on the same 512×512 data. Shows raw data-parallel throughput
-(Mpixels/ms). GPU wins by ~40–50× here — compute shaders are the GPU's strongest case.
+RISC-V OpenMP blur on the same 512×512 data. Shows raw data-parallel throughput (Mpixels/ms).
 
 ---
 
@@ -161,24 +154,17 @@ bash test/run_cpu_scaling.sh --rvv-only
 Five analyses on RISC-V + OpenMP via QEMU:
 1. **Thread scaling** — mandelbrot and diverge shaders at 1/2/4/8 threads. Speedup,
    efficiency, and Amdahl prediction.
-2. **Amdahl fit** — estimates serial fraction from T(1) and T(max). Identifies the
-   rasterizer overhead (~12%) as the scaling ceiling for fragment shaders.
+2. **Amdahl fit** — estimates serial fraction from T(1) and T(max).
 3. **Cache-size effect** — Game of Life at 32×32 (L1), 128×128 (L2), 256×256 (L3+).
-   Smaller grids can anti-scale at high thread counts due to QEMU JIT + OpenMP overhead.
 4. **Static vs dynamic scheduling** — OpenMP `schedule(static)` vs `schedule(dynamic,4)`
-   for mandelbrot and diverge. Diverge's vertical split balances each row equally, so
-   dynamic scheduling adds overhead with negligible gain.
+   for mandelbrot and diverge.
 5. **RVV vector width scaling** — three sub-tests:
    - **Runtime VLEN probe** — compiles a `csrr vlenb` binary; runs under QEMU with
      `-cpu rv64,v=true,vlen=128/256/512` to confirm which VLEN QEMU is simulating.
-   - **Timing benchmark** — mandelbrot rendered at VLEN=128/256/512. QEMU wall-clock
-     gain is small (simulates each vector op 1:1), but shows the mechanism. On real
-     RVV hardware expect ~2× (256-bit) / ~4× (512-bit) speedup for float-heavy loops.
+   - **Timing benchmark** — mandelbrot rendered at VLEN=128/256/512.
    - **Scalar vs. vector FP ops** — recompiles `mandelbrot_rv.ll` with and without
      `+v` and counts scalar `fadd.s`/`fmul.s` vs. vector `vfadd.vv`/`vfmul.vv` ops
-     via `objdump`. Each vector op replaces N scalar ops (N = VLEN/32). Total
-     instruction count stays similar due to `vsetvli`/`vle`/`vse` overhead, but each
-     vector FP instruction does 4–16× more float work depending on hardware VLEN.
+     via `objdump`.
 
 ---
 
@@ -228,24 +214,6 @@ make build/mandelbrot.rv
 OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu ./build/mandelbrot_scalar.rv
 OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu ./build/mandelbrot.rv
 ```
-
-### Why RVV matters for this project
-
-| Aspect | Benefit |
-|--------|---------|
-| **Fragment shaders** | Inner color-computation loops (sin/cos/multiply chains) vectorize over multiple pixels per thread |
-| **Game of Life** | The 8-neighbor sum loop across a row can be vectorized with integer gather/add |
-| **Compute blur** | The 5×5 convolution inner loop is a natural SIMD reduction |
-| **Instruction count** | RVV should reduce instruction count in `rv_instr_count()` output by 2–8× for math-heavy shaders |
-| **Academic value** | Demonstrates the compiler emitting modern RVV code via LLVM; contrast with GPU SIMT model |
-
-### Expected observation
-
-QEMU does not accelerate RVV instructions (it simulates them 1:1), so wall-clock time
-under QEMU may not improve or could worsen. The meaningful metric is **static instruction
-count** (from `objdump`) — fewer instructions = more work done per clock cycle on real
-hardware. On a real RISC-V board (e.g. StarFive VisionFive 2, Milk-V Pioneer) RVV would
-show a real speedup of 2–4× on float-heavy shaders.
 
 To see instruction count difference:
 ```bash

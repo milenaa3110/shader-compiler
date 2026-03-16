@@ -120,21 +120,6 @@ printf "│ %-56s │\n" "Divergence efficiency (ideal = 50%% of mandelbrot time
 printf "│   GPU: %s   CPU: %s%-30s │\n" "${GPU_EFF}" "${CPU_EFF}" ""
 echo -e "${BOLD}└──────────────────────────────────────────────────────────┘${RESET}"
 
-echo ""
-echo -e "${BOLD}Interpretation:${RESET}"
-echo -e "  ${BOLD}Note:${RESET} mandelbrot.frag uses up to 256 iterations; diverge.frag heavy"
-echo -e "  path uses 96 — so diverge is faster in absolute time on both backends."
-echo -e "  The meaningful metric is ${BOLD}efficiency${RESET}: how close diverge is to the ideal"
-echo -e "  50%% of mandelbrot time (since only half the pixels do the heavy work)."
-echo -e ""
-if [[ "$GPU_EFF" != "N/A" && "$CPU_EFF" != "N/A" ]]; then
-    echo -e "  GPU efficiency ${GPU_EFF}: warps spanning x=0.5 execute ALL iterations for"
-    echo -e "    every lane — the warp runs at the speed of its slowest pixel."
-    echo -e "  CPU efficiency ${CPU_EFF}: each RISC-V thread takes exactly its own branch."
-    echo -e "    Light pixels (~4 ops) and heavy pixels (~768 ops) run independently."
-fi
-echo -e "  GPU speedup: ${GPU_SPD_MANDEL} (uniform mandelbrot) vs ${GPU_SPD_DIVERGE} (divergent) —"
-echo -e "  divergence narrows the advantage by changing the effective workload balance."
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. DISPATCH OVERHEAD ISOLATION
@@ -171,12 +156,6 @@ if [[ "$OVERHEAD_MS" != "N/A" && "$FULL_MS" != "N/A" ]]; then
 fi
 echo -e "${BOLD}└──────────────────────┴──────────────┴─────────────────────────────────┘${RESET}"
 
-echo ""
-echo -e "${BOLD}Interpretation:${RESET}"
-echo -e "  This ~${OVERHEAD_MS}ms is paid on EVERY frame regardless of shader complexity."
-echo -e "  For the Game of Life sweep: grids where compute_time < ${OVERHEAD_MS}ms → CPU wins."
-echo -e "  For fragment shaders: overhead amortized over ${BOLD}W×H pixel invocations${RESET} at once"
-echo -e "  (single dispatch vs N=generations sequential dispatches in Life)."
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. WARP BOUNDARY EFFECT
@@ -215,17 +194,3 @@ done
 
 echo -e "${BOLD}└────────┴────────────────────┴────────────────────┴────────────┴──────────────────────┘${RESET}"
 
-echo ""
-echo -e "${BOLD}Interpretation:${RESET}"
-echo -e "  At 64×64: boundary warps (~32 cols) cover ${BOLD}50%${RESET} of the image → high penalty."
-echo -e "  At 512×512: boundary warps cover only ${BOLD}~6%${RESET} → penalty diluted by uniform pixels."
-echo -e "  Efficiency rises with resolution because interior warps (all heavy or all light)"
-echo -e "  are not divergent — only warps that straddle x=0.5 pay the full penalty."
-echo ""
-echo -e "${CYAN}Summary of all three effects:${RESET}"
-echo -e "  1. ${BOLD}Divergence penalty${RESET}:     GPU speedup on diverge vs uniform workload"
-echo -e "  2. ${BOLD}Dispatch overhead${RESET}:      ~${OVERHEAD_MS}ms per vkQueueSubmit, paid every frame"
-echo -e "  3. ${BOLD}Boundary dilution${RESET}:      penalty shrinks at higher resolution"
-echo -e ""
-echo -e "  Together these explain why GPU advantage varies across workloads:"
-echo -e "  blur (uniform, massively parallel) → diverge (${GPU_SPD_DIVERGE}, warp penalty) → life (sequential gen dependency)."

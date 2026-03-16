@@ -183,9 +183,6 @@ opt-18 --load-pass-plugin=build/llvm/sincos_opt.so
 llc-18 -O3 --fp-contract=fast       # instruction selection → riscv64 machine code (.o)
 ```
 
-Terrain instruction count through the pipeline: 528 → 397 → 351 → 352
-(The sincos pass trades instruction count for fewer trig range-reductions at runtime.)
-
 ---
 
 ## Key design decisions
