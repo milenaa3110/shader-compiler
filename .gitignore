@@ -1,5 +1,7 @@
 /.cache
-/.claude
+/.clangd
+/.idea
 /build/
 /result/
 /module.bc
+*.pdf
