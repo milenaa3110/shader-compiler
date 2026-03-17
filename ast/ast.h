@@ -5,18 +5,25 @@
 #include <vector>
 #include <memory>
 #include <iostream>
+#include <optional>
+#include <array>
+#include <cstdint>
+#include <map>
 #include "../lexer/lexer.h"
 #include <array>
 #include <optional>
 
+// ── Shader stage and function attributes ─────────────────────────────────────
+enum class ShaderStage { Vertex, Fragment, Compute };
+
+struct FunctionAttrs {
+    bool isEntry = false;
+    std::optional<ShaderStage> stage;
+    std::optional<std::array<uint32_t, 3>> workgroupSize;
+};
+
 // Forward declaration of LLVM classes
 namespace llvm { class Value; }
-
-enum class ShaderStage {
-    Vertex,
-    Fragment,
-    Compute
-};
 
 enum class Builtin {
     Position,
@@ -29,12 +36,6 @@ enum class Builtin {
     WorkgroupId,
     NumWorkgroups,
     LocalInvocationIndex
-};
-
-struct FunctionAttrs {
-    bool isEntry = false;
-    std::optional<ShaderStage> stage;
-    std::optional<std::array<uint32_t,3>> workgroupSize;
 };
 
 // Helper function to print indentation
@@ -55,8 +56,10 @@ public:
 class NumberExprAST : public ExprAST {
 public:
     double Val;
+    bool   isInt;  // true if lexed without decimal point (e.g. 3, not 3.0)
 
-    explicit NumberExprAST(double val) : Val(val) {}
+    explicit NumberExprAST(double val, bool isInt_ = false)
+        : Val(val), isInt(isInt_) {}
     llvm::Value* codegen() override;
 
     void print(int indent = 0) const override {
@@ -617,6 +620,29 @@ public:
         printIndent(indent + 2);
         std::cout << "UniformArrayDecl: " << TypeName << " " << Name
                   << "[" << Size << "]\n";
+    }
+};
+
+// STORAGE BUFFER DECLARATION (compute shaders)
+// layout(std430, binding=N) readonly/writeonly buffer ElemType name[];
+class StorageBufferDeclAST : public ExprAST {
+public:
+    std::string ElemType;  // e.g. "uint", "vec4"
+    std::string Name;      // variable name visible in shader body
+    bool isReadOnly;       // true = readonly, false = writeonly
+    int  binding;          // binding index
+
+    StorageBufferDeclAST(std::string elemType, std::string name, bool ro, int bind)
+        : ElemType(std::move(elemType)), Name(std::move(name)),
+          isReadOnly(ro), binding(bind) {}
+
+    llvm::Value* codegen() override;
+    void print(int indent = 0) const override {
+        printIndent(indent + 2);
+        std::cout << "StorageBuffer: "
+                  << (isReadOnly ? "readonly" : "writeonly")
+                  << " " << ElemType << " " << Name
+                  << "[] (binding=" << binding << ")\n";
     }
 };
 

@@ -75,8 +75,8 @@ fn void main() {
     float fwdY = -camY/fLen;
     float fwdZ = -camZ/fLen;
 
-    float rX = fwdZ;
-    float rZ = -fwdX;
+    float rX = -fwdZ;
+    float rZ =  fwdX;
     float rLen = sqrt(rX*rX + rZ*rZ);
     rX = rX/rLen;
     rZ = rZ/rLen;
@@ -96,7 +96,7 @@ fn void main() {
 
     # Perspective: FOV=60deg (f=1.732), near=0.1, far=20
     # clip = (f*cx, f*cy, A*cz+B, cz)  where cz>0=in-front
-    # A=-(far+near)/(far-near)=-1.01005, B=-2*far*near/(far-near)=-0.20101
+    # A=+(far+near)/(far-near)=+1.01005, B=-2*far*near/(far-near)=-0.20101
     float f = 1.732;
-    gl_Position = vec4(f*cx, f*cy, -1.01005*cz - 0.20101, cz);
+    gl_Position = vec4(f*cx, f*cy, 1.01005*cz - 0.20101, cz);
 }

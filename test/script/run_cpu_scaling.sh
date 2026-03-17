@@ -71,7 +71,8 @@ build_life() {
     local grid="$1" out="$2"
     riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
         -DGRID="$grid" -DNGENERATIONS="$LIFE_GENS" \
-        test/rv_host/rv_host_compute.cpp -o "$out" >/dev/null 2>&1
+        test/rv_host/rv_host_compute.cpp \
+        build/riscv/life_cs_rv.o -o "$out" >/dev/null 2>&1
 }
 
 # ── helper: run binary with T threads, return avg ms ─────────────────────────
@@ -377,74 +378,115 @@ else
     fi
 fi
 
-# ── part C: scalar float ops vs. RVV float ops ───────────────────────────────
+# ── part C: RVV vectorization — blur_cs_rv compiled with / without +v ────────
 echo ""
-echo -e "${BOLD}C) RVV vectorization — 5-tap Gaussian blur row (same kernel as blur.comp):${RESET}"
+echo -e "${BOLD}C) RVV vectorization — blur compute shader compiled with and without +v:${RESET}"
+echo ""
+echo -e "   The same optimised IR (blur_cs_rv.opt.ll) is compiled twice by llc."
+echo -e "   cs_dispatch_row is the X-loop over pixels with cs_main inlined inside."
+echo -e "     • with    +v  →  loop is vectorised; each iteration processes multiple pixels"
+echo -e "     • without +v  →  scalar FP only; one pixel per loop iteration"
 echo ""
 
-{
-    rt_src="$BUILD_DIR/_rvv_demo.cpp"
-    rt_scalar="$BUILD_DIR/_rvv_demo_scalar.o"
-    rt_vector="$BUILD_DIR/_rvv_demo_vector.o"
+LLC="${LLC:-llc-18}"
+RISCV_TRIPLE="riscv64-unknown-linux-gnu"
 
-    cat > "$rt_src" <<'CPPSRC'
-// 5-tap Gaussian blur row: [1, 4, 6, 4, 1] / 16 — same kernel as blur.comp.
-// 9 FP ops per element (5 muls + 4 adds), fixed-count loop, no cross-iter deps.
-// __restrict__ lets the compiler prove no aliasing and vectorize freely.
-extern "C" void blur_row(float* __restrict__ out,
-                         const float* __restrict__ in,
-                         int n) {
-    for (int i = 0; i < n; ++i)
-        out[i] = 0.0625f*in[i] + 0.25f*in[i+1] + 0.375f*in[i+2]
-               + 0.25f*in[i+3] + 0.0625f*in[i+4];
+# Extract one function's disassembly, skipping local .L* labels within it.
+dump_fn() {
+    local obj="$1" fn="$2"
+    riscv64-linux-gnu-objdump -d "$obj" 2>/dev/null \
+      | awk "
+          /^[[:xdigit:]]+ <${fn}>:/ { found=1; next }
+          found && /^[[:xdigit:]]+ <[^.>][^>]*>:/ { exit }
+          found { print }
+      "
 }
-CPPSRC
 
-    clang_ok=0
-    if clang-18 --target=riscv64-unknown-linux-gnu -march=rv64gc -mabi=lp64d \
-           -O3 -c "$rt_src" -o "$rt_scalar" 2>/dev/null; then
-        if clang-18 --target=riscv64-unknown-linux-gnu -march=rv64gcv -mabi=lp64d \
-               -O3 -c "$rt_src" -o "$rt_vector" 2>/dev/null; then
-            clang_ok=1
-        fi
-    fi
-    rm -f "$rt_src"
+BLR_OPT_LL="build/riscv/blur_cs_rv.opt.ll"
+if [[ ! -f "$BLR_OPT_LL" ]]; then
+    make "build/riscv/blur_cs_rv.o" >/dev/null 2>&1 || true
+fi
 
-    if [[ "$clang_ok" -eq 1 ]]; then
-        echo -e "${BOLD}   ┌───────────────┬───────────────┬────────────────┬──────────────────────────┐${RESET}"
-        echo -e "${BOLD}   │ Compilation   │ Total insns   │ Scalar FP ops  │ Vector FP ops            │${RESET}"
-        echo -e "${BOLD}   ├───────────────┼───────────────┼────────────────┼──────────────────────────┤${RESET}"
+if [[ ! -f "$BLR_OPT_LL" ]]; then
+    echo -e "   ${YELLOW}blur_cs_rv.opt.ll not found — run 'make benchmark-compute-blur' first.${RESET}"
+else
+    RVV_OBJ="$BUILD_DIR/_blur_rvv.o"
+    NOVEC_OBJ="$BUILD_DIR/_blur_scalar.o"
+    NOVEC_LL="$BUILD_DIR/_blur_novec.ll"
 
-        for pass in scalar vector; do
-            if [[ "$pass" == "scalar" ]]; then label="scalar (no RVV)"; obj="$rt_scalar"
-            else                               label="vector (+v RVV)"; obj="$rt_vector"; fi
-            [[ ! -f "$obj" ]] && continue
-            total=$(riscv64-linux-gnu-objdump -d "$obj" 2>/dev/null \
-                    | grep -cE '^\s+[0-9a-f]+:' || true); total=${total:-N/A}
-            sfp=$(riscv64-linux-gnu-objdump -d "$obj" 2>/dev/null \
-                  | grep -cE '\bf(add|mul|sub|div|madd|msub|sqrt)\.s\b' || true); sfp=${sfp:-0}
-            vfp=$(riscv64-linux-gnu-objdump -d "$obj" 2>/dev/null \
-                  | grep -cE 'vf(add|mul|sub|div|macc|nmacc|sqrt)' || true); vfp=${vfp:-0}
-            printf "   │ %-13s │ %13s │ %14s │ %-24s │\n" \
-                "$label" "$total" "$sfp" "$vfp"
+    # Strip +v from the IR function attributes so llc really generates scalar code.
+    sed 's/"+m,+a,+f,+d,+v[^"]*"/"+m,+a,+f,+d"/' "$BLR_OPT_LL" > "$NOVEC_LL"
+
+    "$LLC" -O3 --fp-contract=fast -filetype=obj -relocation-model=pic \
+        -mtriple="$RISCV_TRIPLE" -mattr=+m,+a,+f,+d,+v \
+        "$BLR_OPT_LL" -o "$RVV_OBJ" 2>/dev/null
+    "$LLC" -O3 --fp-contract=fast -filetype=obj -relocation-model=pic \
+        -mtriple="$RISCV_TRIPLE" -mattr=+m,+a,+f,+d \
+        "$NOVEC_LL" -o "$NOVEC_OBJ" 2>/dev/null
+
+    echo -e "${BOLD}   ┌──────────────────────────┬──────────────┬───────────────┬────────────────┬─────────────────┐${RESET}"
+    echo -e "${BOLD}   │ Compilation              │ Function     │ Total insns   │ Scalar FP ops  │ Vector FP ops   │${RESET}"
+    echo -e "${BOLD}   ├──────────────────────────┼──────────────┼───────────────┼────────────────┼─────────────────┤${RESET}"
+
+    for variant in rvv scalar; do
+        obj=$([[ "$variant" == rvv ]] && echo "$RVV_OBJ" || echo "$NOVEC_OBJ")
+        label=$([[ "$variant" == rvv ]] && echo "with RVV  (+v)" || echo "without RVV")
+        for fn in cs_main cs_dispatch_row; do
+            fn_dump=$(dump_fn "$obj" "$fn")
+            total=$(echo "$fn_dump" | grep -cE '^\s+[0-9a-f]+:' || true); total=${total:-0}
+            sfp=$(echo "$fn_dump" | grep -cE '\bfn?(add|mul|sub|div|madd|msub|max|min|sqrt|cvt|mv|class|sgn)\.s\b' \
+                  || true); sfp=${sfp:-0}
+            vfp=$(echo "$fn_dump" | grep -cE '\bvf[a-z]+\.' || true); vfp=${vfp:-0}
+            printf "   │ %-24s │ %-12s │ %13s │ %14s │ %15s │\n" \
+                "$label" "$fn" "$total" "$sfp" "$vfp"
         done
+        echo -e "${BOLD}   ├──────────────────────────┼──────────────┼───────────────┼────────────────┼─────────────────┤${RESET}"
+    done
 
-        echo -e "${BOLD}   └───────────────┴───────────────┴────────────────┴──────────────────────────┘${RESET}"
-        echo ""
+    echo -e "${BOLD}   └──────────────────────────┴──────────────┴───────────────┴────────────────┴─────────────────┘${RESET}"
+    echo ""
 
-        sfp_s=$(riscv64-linux-gnu-objdump -d "$rt_scalar" 2>/dev/null \
-                | grep -cE '\bf(add|mul|sub|div|madd|msub|sqrt)\.s\b' || true); sfp_s=${sfp_s:-0}
-        vfp_v=$(riscv64-linux-gnu-objdump -d "$rt_vector" 2>/dev/null \
-                | grep -cE 'vf(add|mul|sub|div|macc|nmacc|sqrt)' || true); vfp_v=${vfp_v:-0}
-        if [[ "$vfp_v" -gt 0 && "$sfp_s" -gt 0 ]]; then
-            ratio=$(awk "BEGIN { printf \"%.1f\", $sfp_s / $vfp_v }")
-            echo -e "   ${BOLD}${sfp_s} scalar FP ops → ${vfp_v} vector FP ops${RESET}"
-        fi
+    rvv_vfp=$(dump_fn "$RVV_OBJ"   "cs_dispatch_row" | grep -cE '\bvf[a-z]+\.' || true); rvv_vfp=${rvv_vfp:-0}
+    sc_sfp=$(dump_fn  "$NOVEC_OBJ" "cs_dispatch_row" \
+             | grep -cE '\bfn?(add|mul|sub|div|madd|msub|max|min|sqrt|cvt|mv|class|sgn)\.s\b' \
+             || true); sc_sfp=${sc_sfp:-0}
+    rvv_total=$(dump_fn "$RVV_OBJ"   "cs_dispatch_row" | grep -cE '^\s+[0-9a-f]+:' || true); rvv_total=${rvv_total:-0}
+    sc_total=$(dump_fn  "$NOVEC_OBJ" "cs_dispatch_row" | grep -cE '^\s+[0-9a-f]+:' || true); sc_total=${sc_total:-0}
+
+    # Sample 3 FP instructions from each variant to make the contrast concrete.
+    rvv_samples=$(dump_fn "$RVV_OBJ"   "cs_dispatch_row" \
+        | grep -oE '\bvf[a-z]+\.[a-z]+\s+[^,\n]+,[^,\n]+,[^\n]+' \
+        | head -3 | sed 's/^/      /')
+    sc_samples=$(dump_fn  "$NOVEC_OBJ" "cs_dispatch_row" \
+        | grep -oE '\bfn?(add|mul|sub|div|madd|msub|max|min|sqrt)\.s\s+[^\n]+' \
+        | head -3 | sed 's/^/      /')
+
+    echo -e "   ${BOLD}Sample FP instructions in cs_dispatch_row:${RESET}"
+    echo ""
+    echo -e "   ${GREEN}with RVV (+v) — vector registers, one op covers multiple pixels:${RESET}"
+    if [[ -n "$rvv_samples" ]]; then
+        echo "$rvv_samples"
     else
-        echo -e "   ${YELLOW}clang-18 RISC-V target not available — skipping vectorization demo.${RESET}"
+        echo -e "   ${YELLOW}   (no vf* instructions found)${RESET}"
+    fi
+    echo ""
+    echo -e "   ${YELLOW}without RVV — scalar registers, one op per float value:${RESET}"
+    if [[ -n "$sc_samples" ]]; then
+        echo "$sc_samples"
+    else
+        echo -e "   ${YELLOW}   (no scalar f*.s instructions found)${RESET}"
+    fi
+    echo ""
+
+    if [[ "$rvv_vfp" -gt 0 && "$sc_sfp" -gt 0 ]]; then
+        echo -e "   ${GREEN}RVV replaces ${sc_sfp} scalar FP ops with ${rvv_vfp} vector FP ops in cs_dispatch_row.${RESET}"
+    fi
+    if [[ "$sc_total" -gt 0 && "$rvv_total" -gt 0 ]]; then
+        ratio=$(awk "BEGIN { printf \"%.1f\", $sc_total / $rvv_total }")
+        echo -e "   cs_dispatch_row instruction count: ${BOLD}${ratio}x${RESET} more instructions without RVV."
     fi
 
-    rm -f "$rt_scalar" "$rt_vector"
-}
+    rm -f "$RVV_OBJ" "$NOVEC_OBJ" "$NOVEC_LL"
+fi
 
 fi  # end RVV_ONLY guard

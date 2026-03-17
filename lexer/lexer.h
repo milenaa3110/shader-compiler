@@ -107,7 +107,15 @@ enum Token {
     tok_colon    = -119,  // :
 
     tok_invalid_number = -120,
+
+    // Storage buffer qualifiers (compute shaders)
+    tok_buffer    = -121,
+    tok_readonly  = -122,
+    tok_writeonly = -123,
 };
+
+// Set to true by gettok() when the last tok_number had no decimal point
+extern bool IsIntLiteral;
 
 extern std::string IdentifierStr;
 extern double NumVal;

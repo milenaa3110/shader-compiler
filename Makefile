@@ -326,12 +326,26 @@ all-rv: $(foreach A,$(ANIMATIONS),$(RISCV_DIR)/$(A).rv)
 $(VK_COMPUTE_HOST): test/vk_host/vk_host_compute_blur.cpp | $(OBJDIR_LLVM) $(SPV_DIR)
 	$(CXX) $(CXXSTD) $(VK_CXXFLAGS) -o $@ $< -lvulkan
 
-$(SPV_DIR)/blur.comp.spv: $(SPIRV_SHADER_DIR)/blur.comp
+$(SPV_DIR)/blur.comp.spv: $(ANIM_SHADER_DIR)/blur_cs.src $(TARGET_IRGEN_SPIRV)
 	@mkdir -p $(SPV_DIR)
-	$(GLSLANG) -V $< -o $@
+	./$(TARGET_IRGEN_SPIRV) $@ < $<
+
+$(RISCV_DIR)/blur_cs_rv.ll: $(ANIM_SHADER_DIR)/blur_cs.src $(TARGET_IRGEN_RISCV)
+	@mkdir -p $(RISCV_DIR)
+	./$(TARGET_IRGEN_RISCV) $@ < $<
+
+$(RISCV_DIR)/blur_cs_rv.o: $(RISCV_DIR)/blur_cs_rv.ll $(SINCOS_PLUGIN)
+	$(LLVM_OPT) -O3 --enable-unsafe-fp-math --fp-contract=fast -S \
+	    $< -o $(RISCV_DIR)/blur_cs_rv.gvn.ll
+	$(LLVM_OPT) -load-pass-plugin=./$(SINCOS_PLUGIN) \
+	    -passes='sincos-opt,mem2reg,instcombine' -S \
+	    $(RISCV_DIR)/blur_cs_rv.gvn.ll -o $(RISCV_DIR)/blur_cs_rv.opt.ll
+	$(LLC) -O3 --fp-contract=fast -filetype=obj -relocation-model=pic \
+	    -mtriple=$(RISCV_TRIPLE) -mattr=+m,+a,+f,+d,+v \
+	    $(RISCV_DIR)/blur_cs_rv.opt.ll -o $@
 
 .PHONY: benchmark-compute-blur
-benchmark-compute-blur: $(VK_COMPUTE_HOST) $(SPV_DIR)/blur.comp.spv
+benchmark-compute-blur: $(VK_COMPUTE_HOST) $(SPV_DIR)/blur.comp.spv $(RISCV_DIR)/blur_cs_rv.o
 	@mkdir -p $(RESULT_DIR)
 	@bash test/script/run_benchmark_compute_blur.sh
 
@@ -339,22 +353,36 @@ benchmark-compute-blur: $(VK_COMPUTE_HOST) $(SPV_DIR)/blur.comp.spv
 $(VK_LIFE_HOST): test/vk_host/vk_host_compute.cpp | $(OBJDIR_LLVM) $(SPV_DIR)
 	$(CXX) $(CXXSTD) $(VK_CXXFLAGS) -o $@ $< -lvulkan
 
-$(SPV_DIR)/life.comp.spv: $(SPIRV_SHADER_DIR)/life.comp
+$(SPV_DIR)/life.comp.spv: $(ANIM_SHADER_DIR)/life_cs.src $(TARGET_IRGEN_SPIRV)
 	@mkdir -p $(SPV_DIR)
-	$(GLSLANG) -V $< -o $@
+	./$(TARGET_IRGEN_SPIRV) $@ < $<
+
+$(RISCV_DIR)/life_cs_rv.ll: $(ANIM_SHADER_DIR)/life_cs.src $(TARGET_IRGEN_RISCV)
+	@mkdir -p $(RISCV_DIR)
+	./$(TARGET_IRGEN_RISCV) $@ < $<
+
+$(RISCV_DIR)/life_cs_rv.o: $(RISCV_DIR)/life_cs_rv.ll $(SINCOS_PLUGIN)
+	$(LLVM_OPT) -O3 --enable-unsafe-fp-math --fp-contract=fast -S \
+	    $< -o $(RISCV_DIR)/life_cs_rv.gvn.ll
+	$(LLVM_OPT) -load-pass-plugin=./$(SINCOS_PLUGIN) \
+	    -passes='sincos-opt,mem2reg,instcombine' -S \
+	    $(RISCV_DIR)/life_cs_rv.gvn.ll -o $(RISCV_DIR)/life_cs_rv.opt.ll
+	$(LLC) -O3 --fp-contract=fast -filetype=obj -relocation-model=pic \
+	    -mtriple=$(RISCV_TRIPLE) -mattr=+m,+a,+f,+d,+v \
+	    $(RISCV_DIR)/life_cs_rv.opt.ll -o $@
 
 .PHONY: benchmark-compute
-benchmark-compute: $(VK_LIFE_HOST) $(SPV_DIR)/life.comp.spv
+benchmark-compute: $(VK_LIFE_HOST) $(SPV_DIR)/life.comp.spv $(RISCV_DIR)/life_cs_rv.o
 	@mkdir -p $(RESULT_DIR)
 	@bash test/script/run_benchmark_compute.sh --tiny
 
 .PHONY: benchmark-compute-sweep
-benchmark-compute-sweep: $(VK_LIFE_HOST) $(SPV_DIR)/life.comp.spv
+benchmark-compute-sweep: $(VK_LIFE_HOST) $(SPV_DIR)/life.comp.spv $(RISCV_DIR)/life_cs_rv.o
 	@mkdir -p $(RESULT_DIR)
 	@bash test/script/run_benchmark_compute.sh --sweep
 
 .PHONY: benchmark-compute-animate
-benchmark-compute-animate: $(VK_LIFE_HOST) $(SPV_DIR)/life.comp.spv
+benchmark-compute-animate: $(VK_LIFE_HOST) $(SPV_DIR)/life.comp.spv $(RISCV_DIR)/life_cs_rv.o
 	@mkdir -p $(RESULT_DIR)
 	@bash test/script/run_benchmark_compute.sh --animate
 
@@ -429,15 +457,15 @@ check-verbose: all
 
 
 .PHONY: cpu-scaling
-cpu-scaling: $(TARGET_IRGEN_RISCV)
+cpu-scaling: $(TARGET_IRGEN_RISCV) $(RISCV_DIR)/life_cs_rv.o $(RISCV_DIR)/blur_cs_rv.o
 	@bash test/script/run_cpu_scaling.sh
 
 .PHONY: cpu-scaling-quick
-cpu-scaling-quick: $(TARGET_IRGEN_RISCV)
+cpu-scaling-quick: $(TARGET_IRGEN_RISCV) $(RISCV_DIR)/life_cs_rv.o $(RISCV_DIR)/blur_cs_rv.o
 	@bash test/script/run_cpu_scaling.sh --quick
 
 .PHONY: bench-rvv-width
-bench-rvv-width: $(TARGET_IRGEN_RISCV)
+bench-rvv-width: $(TARGET_IRGEN_RISCV) $(RISCV_DIR)/life_cs_rv.o $(RISCV_DIR)/blur_cs_rv.o
 	@bash test/script/run_cpu_scaling.sh --rvv-only
 
 .PHONY: benchmark-fragment

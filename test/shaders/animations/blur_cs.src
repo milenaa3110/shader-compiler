@@ -1,77 +1,40 @@
-# blur_cs.src — Gaussian blur workload (CPU/RISC-V reference)
-# Counterpart to test/shaders/spirv_vulkan/blur.comp.
+# blur_cs.src — 5-tap horizontal Gaussian blur (separable pass) on RGBA float image.
+# Compiled by irgen_spirv to build/spirv/blur.comp.spv.
 #
-# NOTE: @stage(compute) and storage buffers are not yet supported by the compiler.
-# This file is written as @stage(fragment) for illustration — it shows the
-# per-pixel computation the CPU must do for each output texel.
+# binding 0 = input  vec4 buffer (W*H pixels, row-major)
+# binding 1 = output vec4 buffer
+# push constants: width, height
+# workgroup: 16×16
+# Kernel: [1, 4, 6, 4, 1] / 16  (applied in X)
 #
-# GPU (compute): dispatches 16x16 workgroups; each thread reads 25 neighbors
-# from a storage buffer in shared L1/L2, with hardware memory coalescing.
-# CPU (RISC-V): each pixel independently reads 25 neighbors — no coalescing,
-# no dedicated shared memory — but OpenMP spreads work across all cores.
-#
-# 5x5 Gaussian kernel (sigma≈1, total weight = 273):
-#   1  4  7  4  1
-#   4 16 26 16  4
-#   7 26 41 26  7
-#   4 16 26 16  4
-#   1  4  7  4  1
-#
-# The input "texture" is synthesized procedurally using sin/cos noise
-# (matches compute_host.cpp which fills input with the same formula).
-#
-# Input synthesis: val(u,v) = sin(u*31.0)*cos(v*27.0)*0.5 + 0.5
+# GPU path: dispatched as compute shader via vk_host_compute_blur.
+# CPU path: blur_cs.src is also compiled via irgen_riscv for the RISC-V benchmark.
 
-uniform float uTime;
-in vec2 vUV;
-out vec4 FragColor;
+layout(binding=0) uniform uint width;
+layout(binding=1) uniform uint height;
 
-@entry @stage(fragment)
+layout(std430, binding=0) readonly  buffer vec4 src[];
+layout(std430, binding=1) writeonly buffer vec4 dst[];
+
+@entry @stage(compute) @workgroup_size(16, 16, 1)
 fn void main() {
-    float ts = 1.0 / 512.0;
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= width || y >= height) return;
 
-    # ── Synthesize 5x5 neighborhood from procedural noise ─────────────────────
-    # Row y-2
-    float s00 = sin((vUV.x-2.0*ts)*31.0)*cos((vUV.y-2.0*ts)*27.0)*0.5 + 0.5;
-    float s10 = sin((vUV.x-1.0*ts)*31.0)*cos((vUV.y-2.0*ts)*27.0)*0.5 + 0.5;
-    float s20 = sin((vUV.x       )*31.0)*cos((vUV.y-2.0*ts)*27.0)*0.5 + 0.5;
-    float s30 = sin((vUV.x+1.0*ts)*31.0)*cos((vUV.y-2.0*ts)*27.0)*0.5 + 0.5;
-    float s40 = sin((vUV.x+2.0*ts)*31.0)*cos((vUV.y-2.0*ts)*27.0)*0.5 + 0.5;
-    # Row y-1
-    float s01 = sin((vUV.x-2.0*ts)*31.0)*cos((vUV.y-1.0*ts)*27.0)*0.5 + 0.5;
-    float s11 = sin((vUV.x-1.0*ts)*31.0)*cos((vUV.y-1.0*ts)*27.0)*0.5 + 0.5;
-    float s21 = sin((vUV.x       )*31.0)*cos((vUV.y-1.0*ts)*27.0)*0.5 + 0.5;
-    float s31 = sin((vUV.x+1.0*ts)*31.0)*cos((vUV.y-1.0*ts)*27.0)*0.5 + 0.5;
-    float s41 = sin((vUV.x+2.0*ts)*31.0)*cos((vUV.y-1.0*ts)*27.0)*0.5 + 0.5;
-    # Row y (center)
-    float s02 = sin((vUV.x-2.0*ts)*31.0)*cos((vUV.y       )*27.0)*0.5 + 0.5;
-    float s12 = sin((vUV.x-1.0*ts)*31.0)*cos((vUV.y       )*27.0)*0.5 + 0.5;
-    float s22 = sin((vUV.x       )*31.0)*cos((vUV.y       )*27.0)*0.5 + 0.5;
-    float s32 = sin((vUV.x+1.0*ts)*31.0)*cos((vUV.y       )*27.0)*0.5 + 0.5;
-    float s42 = sin((vUV.x+2.0*ts)*31.0)*cos((vUV.y       )*27.0)*0.5 + 0.5;
-    # Row y+1
-    float s03 = sin((vUV.x-2.0*ts)*31.0)*cos((vUV.y+1.0*ts)*27.0)*0.5 + 0.5;
-    float s13 = sin((vUV.x-1.0*ts)*31.0)*cos((vUV.y+1.0*ts)*27.0)*0.5 + 0.5;
-    float s23 = sin((vUV.x       )*31.0)*cos((vUV.y+1.0*ts)*27.0)*0.5 + 0.5;
-    float s33 = sin((vUV.x+1.0*ts)*31.0)*cos((vUV.y+1.0*ts)*27.0)*0.5 + 0.5;
-    float s43 = sin((vUV.x+2.0*ts)*31.0)*cos((vUV.y+1.0*ts)*27.0)*0.5 + 0.5;
-    # Row y+2
-    float s04 = sin((vUV.x-2.0*ts)*31.0)*cos((vUV.y+2.0*ts)*27.0)*0.5 + 0.5;
-    float s14 = sin((vUV.x-1.0*ts)*31.0)*cos((vUV.y+2.0*ts)*27.0)*0.5 + 0.5;
-    float s24 = sin((vUV.x       )*31.0)*cos((vUV.y+2.0*ts)*27.0)*0.5 + 0.5;
-    float s34 = sin((vUV.x+1.0*ts)*31.0)*cos((vUV.y+2.0*ts)*27.0)*0.5 + 0.5;
-    float s44 = sin((vUV.x+2.0*ts)*31.0)*cos((vUV.y+2.0*ts)*27.0)*0.5 + 0.5;
+    uint W = width;
 
-    # ── 5x5 Gaussian blur (kernel normalized by 1/273) ────────────────────────
-    float blurred =
-        ( 1.0*s00 +  4.0*s10 +  7.0*s20 +  4.0*s30 +  1.0*s40
-        + 4.0*s01 + 16.0*s11 + 26.0*s21 + 16.0*s31 +  4.0*s41
-        + 7.0*s02 + 26.0*s12 + 41.0*s22 + 26.0*s32 +  7.0*s42
-        + 4.0*s03 + 16.0*s13 + 26.0*s23 + 16.0*s33 +  4.0*s43
-        + 1.0*s04 +  4.0*s14 +  7.0*s24 +  4.0*s34 +  1.0*s44
-        ) / 273.0;
+    # Clamp-to-edge for border pixels
+    uint xm2 = x > uint(1)        ? x - uint(2) : uint(0);
+    uint xm1 = x > uint(0)        ? x - uint(1) : uint(0);
+    uint xp1 = x + uint(1) < W    ? x + uint(1) : W - uint(1);
+    uint xp2 = x + uint(2) < W    ? x + uint(2) : W - uint(1);
 
-    # Output greyscale blurred image
-    float v = clamp(blurred, 0.0, 1.0);
-    FragColor = vec4(v, v, v, 1.0);
+    vec4 a = src[y * W + xm2];
+    vec4 b = src[y * W + xm1];
+    vec4 c = src[y * W + x  ];
+    vec4 d = src[y * W + xp1];
+    vec4 e = src[y * W + xp2];
+
+    dst[y * W + x] = (a + e) * 0.0625 + (b + d) * 0.25 + c * 0.375;
 }

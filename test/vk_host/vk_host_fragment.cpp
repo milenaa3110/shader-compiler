@@ -158,6 +158,30 @@ int main(int argc, char** argv) {
     VK(vkAllocateMemory(device, &imgAlloc, nullptr, &imgMem));
     VK(vkBindImageMemory(device, colorImage, imgMem, 0));
 
+    // ── Depth image ──────────────────────────────────────────────────────────
+    static const VkFormat DEPTH_FMT = VK_FORMAT_D32_SFLOAT;
+    VkImageCreateInfo depthImgCI{};
+    depthImgCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    depthImgCI.imageType = VK_IMAGE_TYPE_2D;
+    depthImgCI.format = DEPTH_FMT;
+    depthImgCI.extent = {(uint32_t)W, (uint32_t)H, 1};
+    depthImgCI.mipLevels = 1; depthImgCI.arrayLayers = 1;
+    depthImgCI.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthImgCI.tiling = VK_IMAGE_TILING_OPTIMAL;
+    depthImgCI.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depthImgCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage depthImage;
+    VK(vkCreateImage(device, &depthImgCI, nullptr, &depthImage));
+    VkMemoryRequirements depthReqs;
+    vkGetImageMemoryRequirements(device, depthImage, &depthReqs);
+    VkMemoryAllocateInfo depthAlloc{};
+    depthAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    depthAlloc.allocationSize = depthReqs.size;
+    depthAlloc.memoryTypeIndex = findMem(depthReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkDeviceMemory depthMem;
+    VK(vkAllocateMemory(device, &depthAlloc, nullptr, &depthMem));
+    VK(vkBindImageMemory(device, depthImage, depthMem, 0));
+
     // Readback buffer
     VkDeviceSize readSz = (VkDeviceSize)W * H * 4;
     VkBufferCreateInfo bufCI{};
@@ -188,43 +212,69 @@ int main(int argc, char** argv) {
     VkImageView colorView;
     VK(vkCreateImageView(device, &ivCI, nullptr, &colorView));
 
+    // ── Depth image view ─────────────────────────────────────────────────────
+    VkImageViewCreateInfo divCI{};
+    divCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    divCI.image = depthImage;
+    divCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    divCI.format = DEPTH_FMT;
+    divCI.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    VkImageView depthView;
+    VK(vkCreateImageView(device, &divCI, nullptr, &depthView));
+
     // ── Render pass ──────────────────────────────────────────────────────────
-    VkAttachmentDescription colorAtt{};
-    colorAtt.format = COLOR_FMT;
-    colorAtt.samples = VK_SAMPLE_COUNT_1_BIT;
-    colorAtt.loadOp  = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAtt.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    colorAtt.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    colorAtt.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    colorAtt.finalLayout   = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkAttachmentDescription attachments[2]{};
+    // attachment 0 — color
+    attachments[0].format = COLOR_FMT;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp  = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[0].finalLayout   = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    // attachment 1 — depth
+    attachments[1].format = DEPTH_FMT;
+    attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[1].loadOp  = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[1].finalLayout   = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &colorRef;
+    subpass.pDepthStencilAttachment = &depthRef;
 
     VkSubpassDependency dep{};
     dep.srcSubpass = VK_SUBPASS_EXTERNAL;
     dep.dstSubpass = 0;
-    dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
     VkRenderPassCreateInfo rpCI{};
     rpCI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    rpCI.attachmentCount = 1; rpCI.pAttachments = &colorAtt;
+    rpCI.attachmentCount = 2; rpCI.pAttachments = attachments;
     rpCI.subpassCount    = 1; rpCI.pSubpasses   = &subpass;
     rpCI.dependencyCount = 1; rpCI.pDependencies = &dep;
     VkRenderPass renderPass;
     VK(vkCreateRenderPass(device, &rpCI, nullptr, &renderPass));
 
     // ── Framebuffer ──────────────────────────────────────────────────────────
+    VkImageView fbViews[2] = {colorView, depthView};
     VkFramebufferCreateInfo fbCI{};
     fbCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fbCI.renderPass = renderPass;
-    fbCI.attachmentCount = 1; fbCI.pAttachments = &colorView;
+    fbCI.attachmentCount = 2; fbCI.pAttachments = fbViews;
     fbCI.width = W; fbCI.height = H; fbCI.layers = 1;
     VkFramebuffer framebuffer;
     VK(vkCreateFramebuffer(device, &fbCI, nullptr, &framebuffer));
@@ -288,6 +338,12 @@ int main(int argc, char** argv) {
     msState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     msState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+    VkPipelineDepthStencilStateCreateInfo dsState{};
+    dsState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    dsState.depthTestEnable  = VK_TRUE;
+    dsState.depthWriteEnable = VK_TRUE;
+    dsState.depthCompareOp   = VK_COMPARE_OP_LESS;
+
     VkPipelineColorBlendAttachmentState cbAtt{};
     cbAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -303,6 +359,7 @@ int main(int argc, char** argv) {
     gpCI.pViewportState      = &vpState;
     gpCI.pRasterizationState = &rsState;
     gpCI.pMultisampleState   = &msState;
+    gpCI.pDepthStencilState  = &dsState;
     gpCI.pColorBlendState    = &cbState;
     gpCI.layout     = pipelineLayout;
     gpCI.renderPass = renderPass;
@@ -357,14 +414,15 @@ int main(int argc, char** argv) {
             beginI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             VK(vkBeginCommandBuffer(cmds[frame], &beginI));
 
-            VkClearValue clearVal{};
-            clearVal.color = {{0.f, 0.f, 0.f, 1.f}};
+            VkClearValue clearVals[2]{};
+            clearVals[0].color = {{0.f, 0.f, 0.f, 1.f}};
+            clearVals[1].depthStencil = {1.f, 0};
             VkRenderPassBeginInfo rpBegin{};
             rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
             rpBegin.renderPass  = renderPass;
             rpBegin.framebuffer = framebuffer;
             rpBegin.renderArea  = {{0,0},{(uint32_t)W,(uint32_t)H}};
-            rpBegin.clearValueCount = 1; rpBegin.pClearValues = &clearVal;
+            rpBegin.clearValueCount = 2; rpBegin.pClearValues = clearVals;
 
             vkCmdBeginRenderPass(cmds[frame], &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
             vkCmdBindPipeline(cmds[frame], VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -399,6 +457,9 @@ int main(int argc, char** argv) {
         vkDestroyShaderModule(device, fragMod, nullptr);
         vkDestroyFramebuffer(device, framebuffer, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
+        vkDestroyImageView(device, depthView, nullptr);
+        vkDestroyImage(device, depthImage, nullptr);
+        vkFreeMemory(device, depthMem, nullptr);
         vkDestroyImageView(device, colorView, nullptr);
         vkDestroyImage(device, colorImage, nullptr);
         vkFreeMemory(device, imgMem, nullptr);
@@ -421,14 +482,15 @@ int main(int argc, char** argv) {
         VkCommandBufferBeginInfo beginI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VK(vkBeginCommandBuffer(cmd, &beginI));
 
-        VkClearValue clearVal{};
-        clearVal.color = {{0.f, 0.f, 0.f, 1.f}};
+        VkClearValue clearVals[2]{};
+        clearVals[0].color = {{0.f, 0.f, 0.f, 1.f}};
+        clearVals[1].depthStencil = {1.f, 0};
         VkRenderPassBeginInfo rpBegin{};
         rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpBegin.renderPass  = renderPass;
         rpBegin.framebuffer = framebuffer;
         rpBegin.renderArea  = {{0,0},{(uint32_t)W,(uint32_t)H}};
-        rpBegin.clearValueCount = 1; rpBegin.pClearValues = &clearVal;
+        rpBegin.clearValueCount = 2; rpBegin.pClearValues = clearVals;
 
         vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -492,6 +554,9 @@ int main(int argc, char** argv) {
     vkDestroyShaderModule(device, fragMod, nullptr);
     vkDestroyFramebuffer(device, framebuffer, nullptr);
     vkDestroyRenderPass(device, renderPass, nullptr);
+    vkDestroyImageView(device, depthView, nullptr);
+    vkDestroyImage(device, depthImage, nullptr);
+    vkFreeMemory(device, depthMem, nullptr);
     vkDestroyImageView(device, colorView, nullptr);
     vkDestroyImage(device, colorImage, nullptr);
     vkFreeMemory(device, imgMem, nullptr);

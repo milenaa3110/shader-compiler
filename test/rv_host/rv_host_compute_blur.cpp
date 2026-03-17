@@ -1,11 +1,11 @@
 // rv_host_compute_blur.cpp — CPU-side Gaussian blur benchmark (RISC-V + OpenMP).
-// Implements the same 5x5 Gaussian blur as blur.comp but entirely in C++,
+// Dispatches the compiled blur_cs.src shader via cs_invoke() per invocation,
 // parallelized with OpenMP.  Shows CPU thread-parallel vs GPU compute-shader.
 //
 // Compile for RISC-V:
 //   riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
 //       -DWIDTH=512 -DHEIGHT=512 -DNRUNS=100 \
-//       test/rv_host/rv_host_compute_blur.cpp -o blur.rv
+//       test/rv_host/rv_host_compute_blur.cpp build/riscv/blur_cs_rv.o -o blur.rv
 //
 // Run:
 //   OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu ./blur.rv
@@ -33,40 +33,21 @@
 
 static constexpr int W = WIDTH, H = HEIGHT;
 
-// 5x5 Gaussian kernel (matches blur.comp)
-static const float kernel[5][5] = {
-    {1,  4,  7,  4, 1},
-    {4, 16, 26, 16, 4},
-    {7, 26, 41, 26, 7},
-    {4, 16, 26, 16, 4},
-    {1,  4,  7,  4, 1}
-};
-static constexpr float kernelSum = 273.f;
-
-static void blur(const std::vector<float>& in, std::vector<float>& out) {
-    #pragma omp parallel for schedule(static) collapse(2)
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
-            float r = 0, g = 0, b = 0;
-            for (int ky = -2; ky <= 2; ky++) {
-                for (int kx = -2; kx <= 2; kx++) {
-                    int sx = std::max(0, std::min(W-1, x + kx));
-                    int sy = std::max(0, std::min(H-1, y + ky));
-                    int idx = (sy * W + sx) * 4;
-                    float w = kernel[ky+2][kx+2];
-                    r += in[idx+0] * w;
-                    g += in[idx+1] * w;
-                    b += in[idx+2] * w;
-                }
-            }
-            int oidx = (y * W + x) * 4;
-            out[oidx+0] = r / kernelSum;
-            out[oidx+1] = g / kernelSum;
-            out[oidx+2] = b / kernelSum;
-            out[oidx+3] = in[oidx+3];
-        }
-    }
+// ── Shader ABI ────────────────────────────────────────────────────────────────
+// src / dst are external declarations in the shader module; host provides the
+// definitions so the linker can resolve them.
+extern "C" {
+    void* src;
+    void* dst;
 }
+// width / height are defined in the shader module (zero-initialized globals);
+// the host sets them once before the first dispatch.
+extern "C" uint32_t width;
+extern "C" uint32_t height;
+// Row dispatcher emitted by emit_trampolines into blur_cs_rv.o.
+// Loops over X internally so llc can inline cs_main and vectorise with RVV.
+extern "C" void cs_dispatch_row(uint32_t y, uint32_t width);
+// ─────────────────────────────────────────────────────────────────────────────
 
 static void writePPM(const char* path, const std::vector<float>& rgba) {
     std::ofstream f(path, std::ios::binary);
@@ -97,20 +78,30 @@ int main() {
     }
 
     int nthreads = 1;
-    #ifdef _OPENMP
+#ifdef _OPENMP
     nthreads = omp_get_max_threads();
-    #endif
+#endif
 
     std::cout << "[blur] CPU RISC-V+OpenMP: " << W << "x" << H
               << " Gaussian blur, " << NRUNS << " runs, " << nthreads << " threads\n";
 
+    // Set push constants once
+    width  = (uint32_t)W;
+    height = (uint32_t)H;
+    src    = (void*)inBuf.data();
+    dst    = (void*)outBuf.data();
+
     // Warmup
-    blur(inBuf, outBuf);
+    #pragma omp parallel for schedule(static)
+    for (int y = 0; y < H; y++)
+        cs_dispatch_row((uint32_t)y, (uint32_t)W);
 
     double total_ms = 0.0;
     for (int run = 0; run < NRUNS; run++) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        blur(inBuf, outBuf);
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < H; y++)
+            cs_dispatch_row((uint32_t)y, (uint32_t)W);
         auto t1 = std::chrono::high_resolution_clock::now();
         total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
     }

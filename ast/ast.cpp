@@ -12,6 +12,9 @@
 
 using namespace llvm;
 
+std::vector<StageVar> StageInputVars;
+std::vector<StageVar> StageOutputVars;
+
 // Check if all paths in a function return a value
 static bool allPathsReturn(const ExprAST* body) {
     if (!body) return false;
@@ -151,6 +154,11 @@ Value* BinaryExprAST::codegen() {
     if (Op == tok_divide || Op == '/') {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFDiv(L, R, "divtmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateSDiv(L, R, "divtmp");
+    }
+
+    if (Op == '%') {
+        if (opType->isFPOrFPVectorTy()) return Builder->CreateFRem(L, R, "remtmp");
+        if (opType->isIntOrIntVectorTy()) return Builder->CreateURem(L, R, "remtmp");
     }
 
     // comparison operators
@@ -679,6 +687,29 @@ Value *MatrixAccessExprAST::codegen() {
         return Builder->CreateExtractElement(col, jVal, "m.elem");
     }
 
+    // Storage buffer (compute shader): @name = external global ptr
+    auto sit = StorageBufferInfos.find(lhsVar->Name);
+    if (sit != StorageBufferInfos.end()) {
+        auto& info = sit->second;
+        auto* ptrTy = PointerType::getUnqual(*Context);
+        // Load the pointer: %p = load ptr, ptr @name
+        // Mark invariant.load so LICM can hoist this out of any surrounding loop —
+        // the pointer stored in @src / @dst doesn't change during a dispatch.
+        auto* ptrLoad = Builder->CreateLoad(ptrTy, info.gv, lhsVar->Name + ".ptr");
+        ptrLoad->setMetadata(llvm::LLVMContext::MD_invariant_load,
+                             llvm::MDNode::get(*Context, {}));
+        Value* bufPtr = ptrLoad;
+        // Compute the index
+        Value* iVal = Index->codegen();
+        if (!iVal) return nullptr;
+        iVal = toI32(iVal);
+        if (!iVal) { logError("Storage buffer index not convertible to i32"); return nullptr; }
+        // GEP into the buffer: getelementptr elemTy, ptr %p, i32 idx
+        Value* elemPtr = Builder->CreateInBoundsGEP(
+            info.elemTy, bufPtr, {iVal}, lhsVar->Name + ".elem.ptr");
+        return Builder->CreateLoad(info.elemTy, elemPtr, lhsVar->Name + ".elem");
+    }
+
     auto uit = UniformArrays.find(lhsVar->Name);
     if (uit == UniformArrays.end()) {
         logError(fmt::format("Unknown variable '{}' in matrix/array access", lhsVar->Name));
@@ -739,6 +770,81 @@ Value *MatrixAccessExprAST::codegen() {
     }
 
     return Builder->CreateExtractElement(col, jVal, "u.m.elem");
+}
+
+// Matrix / storage-buffer element assignment: a[i] = val  or  a[i][j] = val
+Value* MatrixAssignmentExprAST::codegen() {
+    auto* lhsVar = dynamic_cast<VariableExprAST*>(Object.get());
+    if (!lhsVar) {
+        logError("Array assignment LHS must be a named variable");
+        return nullptr;
+    }
+
+    // Storage buffer write: dst[idx] = val
+    auto sit = StorageBufferInfos.find(lhsVar->Name);
+    if (sit != StorageBufferInfos.end()) {
+        auto& info = sit->second;
+        auto* ptrTy = PointerType::getUnqual(*Context);
+        auto* wrPtrLoad = Builder->CreateLoad(ptrTy, info.gv, lhsVar->Name + ".ptr");
+        wrPtrLoad->setMetadata(llvm::LLVMContext::MD_invariant_load,
+                               llvm::MDNode::get(*Context, {}));
+        Value* bufPtr = wrPtrLoad;
+        Value* iVal = Index->codegen();
+        if (!iVal) return nullptr;
+        iVal = toI32(iVal);
+        if (!iVal) { logError("Storage buffer index not convertible to i32"); return nullptr; }
+        Value* elemPtr = Builder->CreateInBoundsGEP(
+            info.elemTy, bufPtr, {iVal}, lhsVar->Name + ".wr.ptr");
+        Value* rhs = RHS->codegen();
+        if (!rhs) return nullptr;
+        if (rhs->getType() != info.elemTy) {
+            if (info.elemTy->isIntegerTy() && rhs->getType()->isIntegerTy())
+                rhs = Builder->CreateIntCast(rhs, info.elemTy, false, "sb.cast");
+            else if (info.elemTy->isFloatTy() && rhs->getType()->isDoubleTy())
+                rhs = Builder->CreateFPTrunc(rhs, info.elemTy, "sb.cast");
+            else if (info.elemTy->isIntegerTy() && rhs->getType()->isFloatingPointTy())
+                rhs = Builder->CreateFPToUI(rhs, info.elemTy, "sb.cast");
+        }
+        Builder->CreateStore(rhs, elemPtr);
+        return rhs;
+    }
+
+    // Local array write: arr[i] = val
+    auto it = NamedValues.find(lhsVar->Name);
+    if (it == NamedValues.end()) {
+        logError(fmt::format("Unknown variable '{}' in array assignment", lhsVar->Name));
+        return nullptr;
+    }
+    AllocaInst* alloca = it->second;
+    Type* matTy = alloca->getAllocatedType();
+    if (!matTy->isArrayTy()) {
+        logError(fmt::format("'{}' is not an array type", lhsVar->Name));
+        return nullptr;
+    }
+    auto* arrTy = cast<ArrayType>(matTy);
+    Type* colTy = arrTy->getElementType();
+    Value* iVal = Index->codegen();
+    if (!iVal) return nullptr;
+    iVal = toI32(iVal);
+    Value* zero   = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+    Value* colPtr = Builder->CreateInBoundsGEP(matTy, alloca, {zero, iVal},
+                                               lhsVar->Name + ".col.ptr");
+    if (!Index2) {
+        Value* rhs = RHS->codegen();
+        if (!rhs) return nullptr;
+        Builder->CreateStore(rhs, colPtr);
+        return rhs;
+    }
+    auto* vecColTy = cast<FixedVectorType>(colTy);
+    Value* rhs = RHS->codegen();
+    if (!rhs) return nullptr;
+    Value* jVal = Index2->codegen();
+    if (!jVal) return nullptr;
+    jVal = toI32(jVal);
+    Value* col  = Builder->CreateLoad(vecColTy, colPtr, lhsVar->Name + ".col");
+    Value* upd  = Builder->CreateInsertElement(col, rhs, jVal, lhsVar->Name + ".upd");
+    Builder->CreateStore(upd, colPtr);
+    return rhs;
 }
 
 // FUNCTION DECLARATION
@@ -1270,83 +1376,7 @@ Value* ArrayInitExprAST::codegen() {
     return tmpAlloca;
 }
 
-// Matrix element assignment: mat[i] = col  or  mat[i][j] = scalar
-Value* MatrixAssignmentExprAST::codegen() {
-    auto* lhsVar = dynamic_cast<VariableExprAST*>(Object.get());
-    if (!lhsVar) {
-        logError("Matrix assignment LHS must be a named variable");
-        return nullptr;
-    }
-
-    auto it = NamedValues.find(lhsVar->Name);
-    if (it == NamedValues.end()) {
-        logError(fmt::format("Unknown variable '{}' in matrix assignment", lhsVar->Name));
-        return nullptr;
-    }
-
-    AllocaInst* alloca = it->second;
-    Type* matTy = alloca->getAllocatedType();
-    if (!matTy->isArrayTy()) {
-        logError(fmt::format("'{}' is not a matrix/array type", lhsVar->Name));
-        return nullptr;
-    }
-
-    auto* arrTy = cast<ArrayType>(matTy);
-    Type* colTy  = arrTy->getElementType();
-
-    Value* iVal = Index->codegen();
-    if (!iVal) return nullptr;
-    iVal = toI32(iVal);
-    if (!iVal) return nullptr;
-
-    Value* zero   = ConstantInt::get(Type::getInt32Ty(*Context), 0);
-    Value* colPtr = Builder->CreateInBoundsGEP(matTy, alloca, {zero, iVal},
-                                               lhsVar->Name + ".col.ptr");
-
-    if (!Index2) {
-        // mat[i] = col_vec — assign entire column
-        Value* rhs = RHS->codegen();
-        if (!rhs) return nullptr;
-        if (rhs->getType() != colTy) {
-            logError("Type mismatch in matrix column assignment");
-            return nullptr;
-        }
-        Builder->CreateStore(rhs, colPtr);
-        return rhs;
-    }
-
-    // mat[i][j] = scalar — update one element
-    if (!colTy->isVectorTy()) {
-        logError("Second index is only valid for matrix (array-of-vector) types");
-        return nullptr;
-    }
-
-    auto* vecColTy  = cast<FixedVectorType>(colTy);
-    Type* scalarTy = vecColTy->getElementType();
-
-    Value* rhs = RHS->codegen();
-    if (!rhs) return nullptr;
-    if (rhs->getType() != scalarTy) {
-        rhs = castScalarTo(rhs, scalarTy);
-        if (!rhs) {
-            logError("Cannot cast RHS to matrix element scalar type");
-            return nullptr;
-        }
-    }
-
-    Value* jVal = Index2->codegen();
-    if (!jVal) return nullptr;
-    jVal = toI32(jVal);
-    if (!jVal) return nullptr;
-
-    Value* col    = Builder->CreateLoad(vecColTy, colPtr, lhsVar->Name + ".col");
-    Value* newCol = Builder->CreateInsertElement(col, rhs, jVal, "mat.elem.ins");
-    Builder->CreateStore(newCol, colPtr);
-    return rhs;
-}
-
 // ArrayDeclExprAST codegen
-
 Value* ArrayDeclExprAST::codegen() {
     // Resolve element type
     Type* elemType = resolveTypeByName(ElementType);
@@ -1449,5 +1479,31 @@ Value* UniformArrayDeclExprAST::codegen() {
         }
     }
     UniformArrays[Name] = G;
+    return G;
+}
+
+// Storage buffer declaration (compute shaders)
+// Declares an external global pointer: e.g. @src = external global ptr
+Value* StorageBufferDeclAST::codegen() {
+    Type* elemTy = resolveTypeByName(ElemType);
+    if (!elemTy) {
+        logError(fmt::format("Unknown element type for storage buffer: {}", ElemType));
+        return nullptr;
+    }
+    // Declare as an external opaque pointer global.
+    // The host sets this pointer before calling cs_invoke().
+    auto* ptrTy = PointerType::getUnqual(*Context);
+    GlobalVariable* G = TheModule->getGlobalVariable(Name);
+    if (!G) {
+        G = new GlobalVariable(
+            *TheModule,
+            ptrTy,
+            false,                          // not constant
+            GlobalValue::ExternalLinkage,
+            nullptr,                        // external — no initializer
+            Name
+        );
+    }
+    StorageBufferInfos[Name] = {G, elemTy, isReadOnly};
     return G;
 }

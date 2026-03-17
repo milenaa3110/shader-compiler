@@ -4,6 +4,7 @@
 
 std::string IdentifierStr;
 double NumVal;
+bool IsIntLiteral = false;
 
 static std::unordered_map<std::string, int> keywords = {
     {"if", tok_if},
@@ -57,9 +58,13 @@ static std::unordered_map<std::string, int> keywords = {
     {"samplerCube", tok_samplerCube},
     {"image2D",     tok_image2D},
     // Additional keywords
-    {"continue", tok_continue},
-    {"discard",  tok_discard},
-    {"const",    tok_const},
+    {"continue",   tok_continue},
+    {"discard",    tok_discard},
+    {"const",      tok_const},
+    // Storage buffer qualifiers (compute shaders)
+    {"buffer",    tok_buffer},
+    {"readonly",  tok_readonly},
+    {"writeonly", tok_writeonly},
 };
 
 int gettok() {
@@ -80,6 +85,8 @@ int gettok() {
     // Number (integer or decimal)
     if (isdigit(LastChar) || LastChar == '.') {
         std::string NumStr;
+        bool hasDot = false;
+        bool hasExp = false;
 
         if (LastChar == '.') {
             int C = getchar();
@@ -90,6 +97,7 @@ int gettok() {
             NumStr += '.';
             NumStr += static_cast<char>(C);
             LastChar = getchar();
+            hasDot = true;
         } else {
             do {
                 NumStr += LastChar;
@@ -98,6 +106,7 @@ int gettok() {
             if (LastChar == '.') {
                 NumStr += LastChar;
                 LastChar = getchar();
+                hasDot = true;
             }
         }
         while (isdigit(LastChar)) {
@@ -108,6 +117,7 @@ int gettok() {
         if (LastChar == 'e' || LastChar == 'E') {
             NumStr += LastChar;
             LastChar = getchar();
+            hasExp = true;
             if (LastChar == '+' || LastChar == '-') {
                 NumStr += LastChar;
                 LastChar = getchar();
@@ -117,7 +127,12 @@ int gettok() {
                 LastChar = getchar();
             }
         }
+        // Consume optional 'u'/'U' unsigned suffix (e.g. 0u, 1u)
+        if (LastChar == 'u' || LastChar == 'U') {
+            LastChar = getchar();
+        }
         NumVal = strtod(NumStr.c_str(), nullptr);
+        IsIntLiteral = !hasDot && !hasExp;
         return tok_number;
     }
 

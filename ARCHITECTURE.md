@@ -66,7 +66,7 @@ shader_fs.src
 |------|------|
 | `main_lib_riscv.cpp` | Entry point for `irgen_riscv` — emits LLVM IR with `riscv64` target triple and RVV feature flags; emits VS+FS trampolines for the pipeline ABI |
 | `main_lib_spirv.cpp` | Entry point for `irgen_spirv` — walks the AST and emits GLSL 450 source, then shells out to `glslangValidator` to produce `.spv` |
-| `emit_trampolines.h` | Emits `vs_invoke` / `fs_invoke` wrapper functions and layout constants (`vs_total_floats`, `vs_varying_floats`) that the pipeline runtime calls |
+| `emit_trampolines.h` | Emits `vs_invoke` / `fs_invoke` wrapper functions and layout constants (`vs_total_floats`, `vs_varying_floats`) that the pipeline runtime calls; also emits `cs_invoke` (single-invocation) and `cs_dispatch_row` (X-loop over pixels, enables RVV auto-vectorization) for compute shaders |
 
 ### `main_codegen/`
 | File | Role |
@@ -118,8 +118,8 @@ shader_fs.src
 | `terrain_vs_vk.src` | VS | Same terrain mesh — Vulkan build (Y negated for Vulkan NDC, Vulkan z in [0,1]) |
 | `terrain_fs.src` | FS | Pass-through fragment shader for terrain (outputs `vColor`) |
 | `quad_vs.src` | VS | Screen-covering quad used as the VS for all fragment-only animations |
-| `life.comp` | CS | Game of Life compute shader (GLSL, compiled with glslangValidator) |
-| `blur.comp` | CS | Blur compute shader (GLSL, compiled with glslangValidator) |
+| `life_cs.src` | CS | Game of Life compute shader — compiled via `irgen_spirv` (SPIR-V) and `irgen_riscv` (RISC-V) |
+| `blur_cs.src` | CS | 5-tap horizontal Gaussian blur — compiled via `irgen_spirv` and `irgen_riscv` |
 
 ### `test/rv_host/`
 RISC-V host programs — cross-compiled to `riscv64` and run under QEMU.

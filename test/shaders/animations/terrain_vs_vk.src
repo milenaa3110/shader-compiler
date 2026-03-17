@@ -66,8 +66,8 @@ fn void main() {
     float fwdY = -camY/fLen;
     float fwdZ = -camZ/fLen;
 
-    float rX = fwdZ;
-    float rZ = -fwdX;
+    float rX = -fwdZ;
+    float rZ =  fwdX;
     float rLen = sqrt(rX*rX + rZ*rZ);
     rX = rX/rLen;
     rZ = rZ/rLen;

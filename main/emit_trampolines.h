@@ -169,4 +169,70 @@ static void emitPipelineTrampolines() {
             Builder->CreateRetVoid();
         }
     }
+
+    // ── CS trampolines ─────────────────────────────────────────────────────────
+    Function* csFunc = TheModule->getFunction("cs_main");
+    if (csFunc) {
+        auto* uvec3Ty = FixedVectorType::get(i32Ty, 3);
+
+        // cs_invoke(i32 gid_x, i32 gid_y, i32 gid_z) — single-invocation helper
+        // (kept for debugging / flexibility; hot path uses cs_dispatch_row)
+        {
+            auto* invokeTy = FunctionType::get(voidTy, {i32Ty, i32Ty, i32Ty}, false);
+            auto* invoke   = Function::Create(invokeTy, Function::ExternalLinkage,
+                                              "cs_invoke", TheModule.get());
+            auto csArgs = invoke->arg_begin();
+            Value* gx = &*csArgs++; gx->setName("gid_x");
+            Value* gy = &*csArgs++; gy->setName("gid_y");
+            Value* gz = &*csArgs;   gz->setName("gid_z");
+
+            auto* BB = BasicBlock::Create(*Context, "entry", invoke);
+            Builder->SetInsertPoint(BB);
+
+            Value* zero3 = Constant::getNullValue(uvec3Ty);
+            Value* gid   = Builder->CreateInsertElement(zero3, gx, Builder->getInt32(0));
+            gid          = Builder->CreateInsertElement(gid,   gy, Builder->getInt32(1));
+            gid          = Builder->CreateInsertElement(gid,   gz, Builder->getInt32(2));
+            Builder->CreateCall(csFunc, {gid, zero3, zero3, zero3});
+            Builder->CreateRetVoid();
+        }
+
+        // cs_dispatch_row(i32 y, i32 width) — inner X loop compiled with cs_main.
+        // Because the loop lives in the same module as cs_main, llc can inline the
+        // shader body and auto-vectorise the X walk with RVV.
+        // The host OpenMP loop iterates over Y rows; this function handles X.
+        {
+            auto* dispTy = FunctionType::get(voidTy, {i32Ty, i32Ty}, false);
+            auto* disp   = Function::Create(dispTy, Function::ExternalLinkage,
+                                            "cs_dispatch_row", TheModule.get());
+            auto dArgs = disp->arg_begin();
+            Value* argY = &*dArgs++; argY->setName("y");
+            Value* argW = &*dArgs;   argW->setName("width");
+
+            auto* entryBB = BasicBlock::Create(*Context, "entry", disp);
+            auto* loopBB  = BasicBlock::Create(*Context, "loop",  disp);
+            auto* exitBB  = BasicBlock::Create(*Context, "exit",  disp);
+
+            Builder->SetInsertPoint(entryBB);
+            Builder->CreateBr(loopBB);
+
+            Builder->SetInsertPoint(loopBB);
+            PHINode* xPhi = Builder->CreatePHI(i32Ty, 2, "x");
+            xPhi->addIncoming(Builder->getInt32(0), entryBB);
+
+            Value* zero3 = Constant::getNullValue(uvec3Ty);
+            Value* gid   = Builder->CreateInsertElement(zero3, xPhi,              Builder->getInt32(0));
+            gid          = Builder->CreateInsertElement(gid,   argY,              Builder->getInt32(1));
+            gid          = Builder->CreateInsertElement(gid,   Builder->getInt32(0), Builder->getInt32(2));
+            Builder->CreateCall(csFunc, {gid, zero3, zero3, zero3});
+
+            Value* xNext = Builder->CreateAdd(xPhi, Builder->getInt32(1), "x.next");
+            xPhi->addIncoming(xNext, loopBB);
+            Builder->CreateCondBr(Builder->CreateICmpSLT(xNext, argW, "cond"),
+                                  loopBB, exitBB);
+
+            Builder->SetInsertPoint(exitBB);
+            Builder->CreateRetVoid();
+        }
+    }
 }

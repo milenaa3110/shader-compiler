@@ -51,6 +51,8 @@ public:
     std::unique_ptr<ExprAST> parseContinue();
     std::unique_ptr<ExprAST> parseDiscard();
     std::unique_ptr<ExprAST> parseUniform(int binding = -1);
+    
+    std::unique_ptr<ExprAST> parseStorageBuffer(int binding = -1);
 
     std::unique_ptr<ExprAST> parseVarDecl();
 
@@ -114,6 +116,7 @@ private:
             case tok_divide:
             case '*':
             case '/':
+            case '%':
                 return 40;
             default:
                 return -1;
@@ -369,8 +372,10 @@ std::vector<std::unique_ptr<ExprAST> > Parser::ParseProgram() {
             if (peek() == tok_uniform)      stmt = parseUniform(binding);
             else if (peek() == tok_in)      stmt = parseStageVarDecl(true, binding);
             else if (peek() == tok_out)     stmt = parseStageVarDecl(false, binding);
+            else if (peek() == tok_readonly || peek() == tok_writeonly || peek() == tok_buffer)
+                                            stmt = parseStorageBuffer(binding);
             else {
-                logError("Expected 'uniform', 'in', or 'out' after layout(...)");
+                logError("Expected 'uniform', 'in', 'out', or 'buffer' after layout(...)");
                 while (peek() != tok_semicolon && peek() != tok_eof) next();
                 if (peek() == tok_semicolon) next();
             }
@@ -529,6 +534,57 @@ std::unique_ptr<ExprAST> Parser::parseUniform(int /*binding*/) {
         return std::make_unique<UniformArrayDeclExprAST>(type, name, arraySize);
     }
     return std::make_unique<UniformDeclExprAST>(type, name);
+}
+
+// Storage buffer declaration (compute shaders)
+// Syntax: layout(std430, binding=N) readonly buffer ElemType name[];
+std::unique_ptr<ExprAST> Parser::parseStorageBuffer(int binding) {
+    bool isReadOnly = true;
+    if (peek() == tok_readonly) {
+        isReadOnly = true;
+        next(); // 'readonly'
+    } else if (peek() == tok_writeonly) {
+        isReadOnly = false;
+        next(); // 'writeonly'
+    }
+
+    if (peek() != tok_buffer) {
+        logError("Expected 'buffer' in storage buffer declaration");
+        return nullptr;
+    }
+    next(); // 'buffer'
+
+    // Element type
+    std::string elemType;
+    if (isTypeTok(peek())) {
+        elemType = std::string(tokToTypeName(peek()));
+        next();
+    } else if (peek() == tok_identifier) {
+        elemType = IdentifierStr;
+        next();
+    } else {
+        logError("Expected element type in buffer declaration");
+        return nullptr;
+    }
+
+    // Variable name
+    if (peek() != tok_identifier) {
+        logError("Expected buffer variable name");
+        return nullptr;
+    }
+    std::string name = IdentifierStr;
+    next(); // name
+
+    // Consume unsized [] array suffix
+    if (peek() == tok_lbracket) {
+        next(); // '['
+        if (peek() == tok_rbracket) next(); // ']'
+    }
+
+    // Consume ';'
+    if (peek() == tok_semicolon) next();
+
+    return std::make_unique<StorageBufferDeclAST>(elemType, name, isReadOnly, binding);
 }
 
 
@@ -1317,7 +1373,7 @@ std::unique_ptr<ExprAST> Parser::parsePrimary() {
 // number literal
 // example: 42, 3.14
 std::unique_ptr<ExprAST> Parser::parseNumberExpr() {
-    auto result = std::make_unique<NumberExprAST>(NumVal);
+    auto result = std::make_unique<NumberExprAST>(NumVal, IsIntLiteral);
     next();
     return result;
 }

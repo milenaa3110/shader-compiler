@@ -42,11 +42,13 @@ extern std::vector<llvm::BasicBlock*> BreakStack;
 extern std::vector<llvm::BasicBlock*> ContinueStack;  // for 'continue' statement
 extern std::map<std::string, llvm::GlobalVariable*> UniformArrays;
 
-// Stage variable registries — populated by StageVarDeclAST::codegen()
-extern std::vector<StageVar> StageInputVars;
-extern std::vector<StageVar> StageOutputVars;
-// Resource bindings for samplers/images
-extern std::vector<ResourceBinding> ResourceBindings;
+// Storage buffer descriptors — populated by StorageBufferDeclAST::codegen()
+struct StorageBufferInfo {
+    llvm::GlobalVariable* gv;      // external global ptr variable
+    llvm::Type*           elemTy;  // element type (e.g. i32, <4 x float>)
+    bool                  isReadOnly;
+};
+extern std::map<std::string, StorageBufferInfo> StorageBufferInfos;
 
 inline llvm::AllocaInst* CreateEntryBlockAlloca(llvm::Function* F,
                                                 const std::string& name,

@@ -22,9 +22,7 @@ std::unordered_map<std::string, std::vector<std::string>> StructDependencies;
 std::vector<llvm::BasicBlock*> BreakStack;
 std::vector<llvm::BasicBlock*> ContinueStack;
 std::map<std::string, llvm::GlobalVariable*> UniformArrays;
-std::vector<StageVar> StageInputVars;
-std::vector<StageVar> StageOutputVars;
-std::vector<ResourceBinding> ResourceBindings;
+std::map<std::string, StorageBufferInfo> StorageBufferInfos;
 
 using namespace llvm;
 

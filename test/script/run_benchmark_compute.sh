@@ -51,7 +51,8 @@ run_pair() {
     if [[ -n "$QEMU_BIN" ]]; then
         riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
             -DGRID="$g" -DNGENERATIONS="$n" \
-            test/rv_host/rv_host_compute.cpp -o "$BUILD_DIR/_life_sweep_${g}.rv" >/dev/null 2>&1 || true
+            test/rv_host/rv_host_compute.cpp \
+            build/riscv/life_cs_rv.o -o "$BUILD_DIR/_life_sweep_${g}.rv" >/dev/null 2>&1 || true
         if [[ -f "$BUILD_DIR/_life_sweep_${g}.rv" ]]; then
             cpu_out=$(OMP_NUM_THREADS="${NTHREADS}" "${QEMU_BIN}" \
                 -L "$SYSROOT" "./$BUILD_DIR/_life_sweep_${g}.rv" 2>/dev/null || true)
@@ -120,7 +121,8 @@ if [[ "$ANIMATE" -eq 1 ]]; then
         echo -e "${CYAN}Compiling CPU life (${ANIM_GRID}×${ANIM_GRID}, snap every ${SNAP})…${RESET}"
         riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
             -DGRID="${ANIM_GRID}" -DNGENERATIONS="${ANIM_GENS}" -DSNAP_EVERY="${SNAP}" \
-            test/rv_host/rv_host_compute.cpp -o "$BUILD_DIR/life_anim.rv" 2>/dev/null
+            test/rv_host/rv_host_compute.cpp \
+            build/riscv/life_cs_rv.o -o "$BUILD_DIR/life_anim.rv" 2>/dev/null
         echo -e "${CYAN}CPU animation…${RESET}"
         OMP_NUM_THREADS="${NTHREADS}" "${QEMU_BIN}" \
             -L "$SYSROOT" "./$BUILD_DIR/life_anim.rv"
@@ -143,7 +145,8 @@ if [[ -n "$QEMU_BIN" ]]; then
     echo -e "${CYAN}Compiling RISC-V life host (${GRID}×${GRID}, ${GENS} gens)…${RESET}"
     riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
         -DGRID="${GRID}" -DNGENERATIONS="${GENS}" \
-        test/rv_host/rv_host_compute.cpp -o "$BUILD_DIR/life.rv" 2>/dev/null && \
+        test/rv_host/rv_host_compute.cpp \
+        build/riscv/life_cs_rv.o -o "$BUILD_DIR/life.rv" 2>/dev/null && \
         echo -e "  life.rv  ${GREEN}OK${RESET}" || echo -e "  life.rv  ${YELLOW}FAIL${RESET}"
 fi
 
@@ -163,7 +166,8 @@ if [[ "$TINY" -eq 1 ]]; then
     if [[ -n "$QEMU_BIN" ]]; then
         riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
             -DGRID="${TINY_GRID}" -DNGENERATIONS="${TINY_GENS}" \
-            test/rv_host/rv_host_compute.cpp -o "$BUILD_DIR/_life_tiny.rv" >/dev/null 2>&1 || true
+            test/rv_host/rv_host_compute.cpp \
+            build/riscv/life_cs_rv.o -o "$BUILD_DIR/_life_tiny.rv" >/dev/null 2>&1 || true
         if [[ -f "$BUILD_DIR/_life_tiny.rv" ]]; then
             cpu_tiny_out=$(OMP_NUM_THREADS="${NTHREADS}" "${QEMU_BIN}" \
                 -L "$SYSROOT" "./$BUILD_DIR/_life_tiny.rv" 2>/dev/null || true)

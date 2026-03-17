@@ -1,14 +1,16 @@
 // rv_host_compute.cpp — Conway's Game of Life CPU benchmark (RISC-V + OpenMP).
 //
-// Runs NGENERATIONS generations on a GRID×GRID toroidal grid.
-// Each generation: OpenMP parallel over all pixels → no dispatch overhead.
-// Small grids fit in L1/L2 cache — data stays on-chip across all generations.
+// Dispatches the compiled life_cs.src shader via cs_invoke() per invocation,
+// parallelized with OpenMP.  The shader reads/writes the src/dst globals set
+// below before each generation.
 //
-// Compare with spirv_vulkan_life_host: same logic, but CPU pays zero submission cost.
-// Compile:
+// Compare with spirv_vulkan_life_host: same shader logic, but CPU pays zero
+// submission cost and dispatches with OpenMP instead of Vulkan compute.
+//
+// Compile (invoked by run_benchmark_compute.sh):
 //   riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
 //       -DGRID=256 -DNGENERATIONS=1000 \
-//       test/rv_host/rv_host_compute.cpp -o life.rv
+//       test/rv_host/rv_host_compute.cpp build/riscv/life_cs_rv.o -o life.rv
 // Run:
 //   OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu ./life.rv
 
@@ -33,6 +35,22 @@
 #define SNAP_EVERY 0   // 0 = no animation; N = save a frame every N generations
 #endif
 
+// ── Shader ABI ────────────────────────────────────────────────────────────────
+// src / dst are external declarations in the shader module; host provides the
+// definitions so the linker can resolve them.
+extern "C" {
+    void* src;
+    void* dst;
+}
+// width / height are defined in the shader module (zero-initialized globals);
+// the host sets them once before the first dispatch.
+extern "C" uint32_t width;
+extern "C" uint32_t height;
+// Row dispatcher emitted by emit_trampolines into life_cs_rv.o.
+// Loops over X internally so llc can inline cs_main and vectorise with RVV.
+extern "C" void cs_dispatch_row(uint32_t y, uint32_t width);
+// ─────────────────────────────────────────────────────────────────────────────
+
 static void writePPM(const char* path, int W, int H, const uint32_t* cells) {
     std::ofstream f(path, std::ios::binary);
     f << "P6\n" << W << " " << H << "\n255\n";
@@ -52,46 +70,39 @@ int main() {
     std::cout << "OpenMP threads: " << omp_get_max_threads() << "\n";
 #endif
 
-    std::vector<uint32_t> cur(W * H), nxt(W * H);
+    std::vector<uint32_t> curBuf(W * H), nxtBuf(W * H);
 
     // Seed with ~30% alive (same seed as GPU host)
     std::mt19937 rng(42);
     for (int i = 0; i < W * H; i++)
-        cur[i] = (rng() % 10 < 3) ? 1u : 0u;
+        curBuf[i] = (rng() % 10 < 3) ? 1u : 0u;
 
     mkdir("result", 0755);
     if (SNAP_EVERY > 0)
         std::cout << "[life-cpu] Animation mode: saving frame every "
                   << SNAP_EVERY << " generations\n";
 
+    // Set push constants once (grid size doesn't change)
+    width  = (uint32_t)W;
+    height = (uint32_t)H;
+
     auto t0 = std::chrono::high_resolution_clock::now();
     int frameIdx = 0;
 
     for (int gen = 0; gen < N; gen++) {
-        #pragma omp parallel for schedule(static) collapse(2)
-        for (int y = 0; y < H; y++) {
-            for (int x = 0; x < W; x++) {
-                uint32_t alive = cur[y * W + x];
-                uint32_t neighbors = 0;
-                for (int dy = -1; dy <= 1; dy++) {
-                    for (int dx = -1; dx <= 1; dx++) {
-                        if (dx == 0 && dy == 0) continue;
-                        int nx = (x + W + dx) % W;
-                        int ny = (y + H + dy) % H;
-                        neighbors += cur[ny * W + nx];
-                    }
-                }
-                uint32_t survive = (alive && (neighbors == 2 || neighbors == 3)) ? 1u : 0u;
-                uint32_t born    = (!alive && neighbors == 3) ? 1u : 0u;
-                nxt[y * W + x] = survive + born;
-            }
-        }
-        std::swap(cur, nxt);
+        src = (void*)curBuf.data();
+        dst = (void*)nxtBuf.data();
 
-        if (SNAP_EVERY > 0 && gen % SNAP_EVERY == 0) {
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < H; y++)
+            cs_dispatch_row((uint32_t)y, (uint32_t)W);
+
+        std::swap(curBuf, nxtBuf);
+
+        if constexpr (SNAP_EVERY > 0) if (gen % SNAP_EVERY == 0) {
             char path[256];
             std::snprintf(path, sizeof(path), "result/life_cpu_%04d.ppm", frameIdx++);
-            writePPM(path, W, H, cur.data());
+            writePPM(path, W, H, curBuf.data());
         }
     }
 
@@ -107,7 +118,7 @@ int main() {
 
     // Save final state (only in non-animation mode)
     if (SNAP_EVERY == 0) {
-        writePPM("result/life_cpu.ppm", W, H, cur.data());
+        writePPM("result/life_cpu.ppm", W, H, curBuf.data());
         std::cout << "[life-cpu] Final state: result/life_cpu.ppm\n";
     }
 

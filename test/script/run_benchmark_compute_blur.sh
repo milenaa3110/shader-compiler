@@ -21,7 +21,8 @@ echo -e "${CYAN}Building CPU compute binary (RISC-V + OpenMP)…${RESET}"
 if [[ -n "$QEMU_BIN" ]]; then
     riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
         -DWIDTH=512 -DHEIGHT=512 -DNRUNS="$NRUNS" \
-        test/rv_host/rv_host_compute_blur.cpp -o "$BUILD_DIR/blur.rv" 2>/dev/null
+        test/rv_host/rv_host_compute_blur.cpp \
+        build/riscv/blur_cs_rv.o -o "$BUILD_DIR/blur.rv" 2>/dev/null
     echo -e "  blur.rv  ${GREEN}OK${RESET}"
 else
     echo -e "  ${YELLOW}SKIP: no QEMU${RESET}"

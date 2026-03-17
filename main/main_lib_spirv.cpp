@@ -62,6 +62,7 @@ static std::string tokToOpStr(int op) {
         case tok_minus:         return "-";
         case tok_multiply:      return "*";
         case tok_divide:        return "/";
+        case '%':               return "%";
         case tok_greater:       return ">";
         case tok_greater_equal: return ">=";
         case tok_less:          return "<";
@@ -81,8 +82,15 @@ static void        emitStmt(const ExprAST* node, std::string& out, int indent);
 static std::string emitExpr(const ExprAST* node) {
     if (!node) return "0.0";
 
-    if (auto* n = dynamic_cast<const NumberExprAST*>(node))
+    if (auto* n = dynamic_cast<const NumberExprAST*>(node)) {
+        if (n->isInt) {
+            // Integer literal: emit without decimal point so GLSL treats it as int
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%lld", (long long)n->Val);
+            return buf;
+        }
         return fmtNum(n->Val);
+    }
 
     if (auto* n = dynamic_cast<const BooleanExprAST*>(node))
         return n->Val ? "true" : "false";
@@ -268,16 +276,39 @@ static bool isSamplerOrImage(const std::string& t) {
 }
 
 // Generate GLSL 450 shader text from the parsed AST nodes.
-// Works for both vertex and fragment stages.
+// Works for vertex, fragment, and compute stages.
 static std::string generateGLSL(const std::vector<std::unique_ptr<ExprAST>>& nodes) {
     std::string out;
     out += "#version 450\n\n";
+
+    // Detect stage + workgroup size from the entry function
+    ShaderStage stage = ShaderStage::Fragment;
+    std::array<uint32_t,3> wgSize = {1, 1, 1};
+    for (const auto& node : nodes) {
+        if (auto* fn = dynamic_cast<const FunctionAST*>(node.get())) {
+            if (fn->Attrs.isEntry && fn->Attrs.stage.has_value()) {
+                stage = *fn->Attrs.stage;
+                if (fn->Attrs.workgroupSize.has_value())
+                    wgSize = *fn->Attrs.workgroupSize;
+                break;
+            }
+        }
+    }
+
+    // Compute stage: emit local_size layout
+    if (stage == ShaderStage::Compute) {
+        out += "layout(local_size_x = " + std::to_string(wgSize[0]) +
+               ", local_size_y = " + std::to_string(wgSize[1]) +
+               ", local_size_z = " + std::to_string(wgSize[2]) +
+               ") in;\n\n";
+    }
 
     // Collect declarations — separate samplers from scalar/vector uniforms
     std::vector<std::pair<std::string,std::string>> pcUniforms;      // → push_constant
     std::vector<std::pair<std::string,std::string>> samplerUniforms; // → descriptor set
     std::vector<std::pair<std::string,std::string>> stageIns;
     std::vector<std::pair<std::string,std::string>> stageOuts;
+    std::vector<const StorageBufferDeclAST*>         ssboDecls;      // → storage buffers
 
     for (const auto& node : nodes) {
         if (auto* n = dynamic_cast<const UniformDeclExprAST*>(node.get())) {
@@ -290,8 +321,19 @@ static std::string generateGLSL(const std::vector<std::unique_ptr<ExprAST>>& nod
         } else if (auto* n = dynamic_cast<const StageVarDeclAST*>(node.get())) {
             if (n->isInput)  stageIns.push_back({n->TypeName, n->Name});
             else             stageOuts.push_back({n->TypeName, n->Name});
+        } else if (auto* n = dynamic_cast<const StorageBufferDeclAST*>(node.get())) {
+            ssboDecls.push_back(n);
         }
     }
+
+    // Storage buffer bindings (compute shaders)
+    for (const auto* s : ssboDecls) {
+        out += "layout(std430, set = 0, binding = " + std::to_string(s->binding) + ") ";
+        out += (s->isReadOnly ? "readonly" : "writeonly");
+        out += " buffer _Buf" + std::to_string(s->binding) +
+               " { " + s->ElemType + " " + s->Name + "[]; };\n";
+    }
+    if (!ssboDecls.empty()) out += "\n";
 
     // Sampler/image uniforms → layout(set=0, binding=N) (auto-assigned)
     int bindingIdx = 0;
@@ -399,10 +441,18 @@ int main(int argc, char* argv[]) {
     }
 
     // Choose temp file extension and -S flag based on detected stage
-    bool isVert = (stage == ShaderStage::Vertex);
-    const char* tmpPath   = isVert ? "/tmp/_irgen_spirv_tmp.vert"
-                                   : "/tmp/_irgen_spirv_tmp.frag";
-    const char* stageFlag = isVert ? "vert" : "frag";
+    const char* tmpPath;
+    const char* stageFlag;
+    if (stage == ShaderStage::Vertex) {
+        tmpPath   = "/tmp/_irgen_spirv_tmp.vert";
+        stageFlag = "vert";
+    } else if (stage == ShaderStage::Compute) {
+        tmpPath   = "/tmp/_irgen_spirv_tmp.comp";
+        stageFlag = "comp";
+    } else {
+        tmpPath   = "/tmp/_irgen_spirv_tmp.frag";
+        stageFlag = "frag";
+    }
     {
         std::ofstream f(tmpPath);
         if (!f) {
