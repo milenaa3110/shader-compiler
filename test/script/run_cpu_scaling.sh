@@ -282,6 +282,8 @@ echo -e "${BOLD}└──────────────┴─────�
 rm -f "$BUILD_DIR"/_sched_mandelbrot*.rv "$BUILD_DIR"/_sched_diverge*.rv
 echo ""
 
+fi  # end RVV_ONLY guard
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. RVV VECTOR WIDTH SCALING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -400,7 +402,7 @@ echo -e "     • with    +v  →  loop is vectorised; each iteration processes 
 echo -e "     • without +v  →  scalar FP only; one pixel per loop iteration"
 echo ""
 
-LLC="${LLC:-llc-18}"
+LLC="${LLC:-$(which llc-18 2>/dev/null || which llc 2>/dev/null || echo llc-18)}"
 RISCV_TRIPLE="riscv64-unknown-linux-gnu"
 
 # Extract one function's disassembly, skipping local .L* labels within it.
@@ -500,5 +502,3 @@ else
 
     rm -f "$RVV_OBJ" "$NOVEC_OBJ" "$NOVEC_LL"
 fi
-
-fi  # end RVV_ONLY guard
