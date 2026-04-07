@@ -27,8 +27,8 @@ for arg in "$@"; do case $arg in --quick) QUICK=1 ;; --rvv-only) RVV_ONLY=1 ;; e
 
 MAX_THREADS="$NTHREADS"
 
-if [[ -z "$QEMU_BIN" ]]; then
-    echo "No QEMU found — CPU scaling requires RISC-V emulation."; exit 1
+if [[ "$RISCV_AVAIL" -eq 0 ]]; then
+    echo "No RISC-V runtime found — install qemu-user-static or run on RISC-V hardware."; exit 1
 fi
 
 # Frame/gen counts — fewer for quick mode
@@ -79,7 +79,7 @@ build_life() {
 run_rv() {
     local bin="$1" threads="$2"
     local out
-    out=$(OMP_NUM_THREADS="$threads" "$QEMU_BIN" -L "$SYSROOT" "$bin" 2>/dev/null || true)
+    out=$(OMP_NUM_THREADS="$threads" $RISCV_SIM "$bin" 2>/dev/null || true)
     echo "$out" | grep -oE '(RISC-V|life-cpu).*avg: [0-9]+\.[0-9]+' \
         | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "N/A"
 }
@@ -313,16 +313,19 @@ if riscv64-linux-gnu-g++ -std=c++20 -O2 -static \
     PROBE_OK=1
 fi
 
-# Now test QEMU vlen= with the RISC-V probe binary (not the host /bin/true)
+# VLEN probing via QEMU -cpu flag (only supported under emulation)
 QEMU_VLEN_OK=0
-if [[ "$PROBE_OK" -eq 1 && -n "$QEMU_BIN" ]]; then
+if [[ "$NATIVE_RISCV" -eq 1 ]]; then
+    echo -e "   ${CYAN}Native RISC-V hardware — VLEN is fixed by hardware.${RESET}"
+    if [[ "$PROBE_OK" -eq 1 ]]; then
+        printf "   Native run → "
+        $RISCV_SIM "$PROBE_BIN" 2>/dev/null || echo "(failed)"
+    fi
+elif [[ "$PROBE_OK" -eq 1 && -n "$QEMU_BIN" ]]; then
     if "$QEMU_BIN" -cpu "rv64,v=true,vlen=256,vext_spec=v1.0" \
            -L "$SYSROOT" "$PROBE_BIN" >/dev/null 2>&1; then
         QEMU_VLEN_OK=1
     fi
-fi
-
-if [[ "$PROBE_OK" -eq 1 && -n "$QEMU_BIN" ]]; then
     if [[ "$QEMU_VLEN_OK" -eq 1 ]]; then
         for vlen in 128 256 512; do
             printf "   QEMU vlen=%-4s → " "$vlen"
@@ -337,7 +340,7 @@ if [[ "$PROBE_OK" -eq 1 && -n "$QEMU_BIN" ]]; then
         echo -e "   supports full VLEN control. The binary itself adapts to any VLEN via vsetvli."
     fi
 else
-    echo -e "   ${YELLOW}Probe compile failed or no QEMU found.${RESET}"
+    echo -e "   ${YELLOW}Probe compile failed or no RISC-V runtime found.${RESET}"
 fi
 rm -f "$PROBE_SRC" "$PROBE_BIN"
 
@@ -345,7 +348,16 @@ rm -f "$PROBE_SRC" "$PROBE_BIN"
 echo ""
 echo -e "${BOLD}B) Timing: mandelbrot at VLEN=128/256/512 (${FRAG_FRAMES} frames, ${FRAG_W}×${FRAG_H}):${RESET}"
 
-if [[ "$QEMU_VLEN_OK" -eq 0 ]]; then
+if [[ "$NATIVE_RISCV" -eq 1 ]]; then
+    echo -e "   ${CYAN}Native RISC-V — VLEN is fixed by hardware; no per-VLEN timing sweep.${RESET}"
+    echo -e "   Run at fixed VLEN:"
+    make -j"$(nproc)" "build/riscv/mandelbrot.rv" >/dev/null 2>&1 || true
+    if [[ -f "build/riscv/mandelbrot.rv" ]]; then
+        ms=$(OMP_NUM_THREADS="$MAX_THREADS" ./build/riscv/mandelbrot.rv 2>/dev/null \
+             | grep -oE 'avg: [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "N/A")
+        echo -e "   avg: ${ms}ms/frame (${MAX_THREADS} threads)"
+    fi
+elif [[ "$QEMU_VLEN_OK" -eq 0 ]]; then
     echo -e "   ${YELLOW}Skipped — QEMU user-mode cannot override VLEN on this system.${RESET}"
     echo -e "   The binary is correct for all VLENs; wall-clock difference would be"
     echo -e "   minimal under QEMU anyway (each vector op simulated individually)."

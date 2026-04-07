@@ -18,14 +18,14 @@ make build/spirv/blur.comp.spv 2>/dev/null
 # ── Build CPU compute binary (RISC-V + OpenMP) ───────────────────────────────
 echo -e "${CYAN}Building CPU compute binary (RISC-V + OpenMP)…${RESET}"
 
-if [[ -n "$QEMU_BIN" ]]; then
-    riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
+if [[ "$RISCV_AVAIL" -eq 1 ]]; then
+    $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
         -DWIDTH=512 -DHEIGHT=512 -DNRUNS="$NRUNS" \
         test/rv_host/rv_host_compute_blur.cpp \
         build/riscv/blur_cs_rv.o -o "$BUILD_DIR/blur.rv" 2>/dev/null
     echo -e "  blur.rv  ${GREEN}OK${RESET}"
 else
-    echo -e "  ${YELLOW}SKIP: no QEMU${RESET}"
+    echo -e "  ${YELLOW}SKIP: no RISC-V runtime${RESET}"
 fi
 
 # ── GPU run ───────────────────────────────────────────────────────────────────
@@ -38,17 +38,17 @@ gpu_mpx=$(echo "$gpu_out" | grep -o 'Throughput: [0-9.]*' | grep -o '[0-9.]*' ||
 
 # ── CPU run ───────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${CYAN}Running CPU compute (RISC-V + OpenMP, ${NTHREADS} threads via QEMU)…${RESET}"
+echo -e "${CYAN}Running CPU compute (RISC-V + OpenMP, ${NTHREADS} threads)…${RESET}"
 cpu_out=""
 cpu_avg="N/A"
 cpu_mpx="N/A"
-if [[ -n "$QEMU_BIN" && -f "$BUILD_DIR/blur.rv" ]]; then
-    cpu_out=$(OMP_NUM_THREADS="$NTHREADS" "$QEMU_BIN" -L "$SYSROOT" "./$BUILD_DIR/blur.rv" 2>/dev/null || true)
+if [[ "$RISCV_AVAIL" -eq 1 && -f "$BUILD_DIR/blur.rv" ]]; then
+    cpu_out=$(OMP_NUM_THREADS="$NTHREADS" $RISCV_SIM "./$BUILD_DIR/blur.rv" 2>/dev/null || true)
     echo "$cpu_out"
     cpu_avg=$(parse_avg "$cpu_out")
     cpu_mpx=$(echo "$cpu_out" | grep -o 'Throughput: [0-9.]*' | grep -o '[0-9.]*' || echo "N/A")
 else
-    echo -e "  ${YELLOW}SKIP (no QEMU or blur.rv)${RESET}"
+    echo -e "  ${YELLOW}SKIP (no RISC-V runtime or blur.rv)${RESET}"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

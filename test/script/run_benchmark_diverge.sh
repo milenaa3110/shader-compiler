@@ -56,11 +56,11 @@ gpu_ms_for() {
 rv_ms_for() {
     local anim="$1" frames="$2" w="$3" h="$4"
     local bin="$BUILD_DIR/_bench_${anim}_${w}.rv"
-    [[ -z "$QEMU_BIN" ]] && { echo "N/A"; return; }
+    [[ "$RISCV_AVAIL" -eq 0 ]] && { echo "N/A"; return; }
 
     make "build/riscv/${anim}_rv.o" >/dev/null 2>&1 || { echo "N/A"; return; }
 
-    riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp -Ipipeline \
+    $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Ipipeline \
         -DANIM_NAME="\"${anim}\"" -DNFRAMES="$frames" \
         -DWIDTH="$w" -DHEIGHT="$h" \
         test/rv_host/rv_host_fragment.cpp \
@@ -68,7 +68,7 @@ rv_ms_for() {
         "build/riscv/${anim}_rv.o" -o "$bin" >/dev/null 2>&1 || { echo "N/A"; return; }
 
     local out
-    out=$(OMP_NUM_THREADS="$NTHREADS" "$QEMU_BIN" -L "$SYSROOT" "./$bin" 2>/dev/null || true)
+    out=$(OMP_NUM_THREADS="$NTHREADS" $RISCV_SIM "./$bin" 2>/dev/null || true)
     rm -f "$bin"
     echo "$out" | grep 'RISC-V avg:' | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "N/A"
 }

@@ -48,14 +48,14 @@ run_pair() {
     gpu_ms=$(parse_avg "$gpu_out")
 
     cpu_ms="N/A"
-    if [[ -n "$QEMU_BIN" ]]; then
-        riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
+    if [[ "$RISCV_AVAIL" -eq 1 ]]; then
+        $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
             -DGRID="$g" -DNGENERATIONS="$n" \
             test/rv_host/rv_host_compute.cpp \
             build/riscv/life_cs_rv.o -o "$BUILD_DIR/_life_sweep_${g}.rv" >/dev/null 2>&1 || true
         if [[ -f "$BUILD_DIR/_life_sweep_${g}.rv" ]]; then
-            cpu_out=$(OMP_NUM_THREADS="${NTHREADS}" "${QEMU_BIN}" \
-                -L "$SYSROOT" "./$BUILD_DIR/_life_sweep_${g}.rv" 2>/dev/null || true)
+            cpu_out=$(OMP_NUM_THREADS="${NTHREADS}" $RISCV_SIM \
+                "./$BUILD_DIR/_life_sweep_${g}.rv" 2>/dev/null || true)
             cpu_ms=$(parse_avg "$cpu_out")
             rm -f "$BUILD_DIR/_life_sweep_${g}.rv"
         fi
@@ -117,15 +117,15 @@ if [[ "$ANIMATE" -eq 1 ]]; then
     ./build/spirv/spirv_vulkan_life_host build/spirv/life.comp.spv "$ANIM_GENS" "$ANIM_GRID" "$SNAP"
 
     # CPU animation
-    if [[ -n "$QEMU_BIN" ]]; then
+    if [[ "$RISCV_AVAIL" -eq 1 ]]; then
         echo -e "${CYAN}Compiling CPU life (${ANIM_GRID}×${ANIM_GRID}, snap every ${SNAP})…${RESET}"
-        riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
+        $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
             -DGRID="${ANIM_GRID}" -DNGENERATIONS="${ANIM_GENS}" -DSNAP_EVERY="${SNAP}" \
             test/rv_host/rv_host_compute.cpp \
             build/riscv/life_cs_rv.o -o "$BUILD_DIR/life_anim.rv" 2>/dev/null
         echo -e "${CYAN}CPU animation…${RESET}"
-        OMP_NUM_THREADS="${NTHREADS}" "${QEMU_BIN}" \
-            -L "$SYSROOT" "./$BUILD_DIR/life_anim.rv"
+        OMP_NUM_THREADS="${NTHREADS}" $RISCV_SIM \
+            "./$BUILD_DIR/life_anim.rv"
         rm -f "$BUILD_DIR/life_anim.rv"
     fi
 
@@ -141,9 +141,9 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Build main RISC-V binary
-if [[ -n "$QEMU_BIN" ]]; then
+if [[ "$RISCV_AVAIL" -eq 1 ]]; then
     echo -e "${CYAN}Compiling RISC-V life host (${GRID}×${GRID}, ${GENS} gens)…${RESET}"
-    riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
+    $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
         -DGRID="${GRID}" -DNGENERATIONS="${GENS}" \
         test/rv_host/rv_host_compute.cpp \
         build/riscv/life_cs_rv.o -o "$BUILD_DIR/life.rv" 2>/dev/null && \
@@ -163,14 +163,14 @@ if [[ "$TINY" -eq 1 ]]; then
     GPU_TINY=$(parse_avg "$gpu_tiny_out")
 
     CPU_TINY="N/A"
-    if [[ -n "$QEMU_BIN" ]]; then
-        riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
+    if [[ "$RISCV_AVAIL" -eq 1 ]]; then
+        $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
             -DGRID="${TINY_GRID}" -DNGENERATIONS="${TINY_GENS}" \
             test/rv_host/rv_host_compute.cpp \
             build/riscv/life_cs_rv.o -o "$BUILD_DIR/_life_tiny.rv" >/dev/null 2>&1 || true
         if [[ -f "$BUILD_DIR/_life_tiny.rv" ]]; then
-            cpu_tiny_out=$(OMP_NUM_THREADS="${NTHREADS}" "${QEMU_BIN}" \
-                -L "$SYSROOT" "./$BUILD_DIR/_life_tiny.rv" 2>/dev/null || true)
+            cpu_tiny_out=$(OMP_NUM_THREADS="${NTHREADS}" $RISCV_SIM \
+                "./$BUILD_DIR/_life_tiny.rv" 2>/dev/null || true)
             CPU_TINY=$(parse_avg "$cpu_tiny_out")
             rm -f "$BUILD_DIR/_life_tiny.rv"
         fi
@@ -220,14 +220,14 @@ else
 fi
 
 CPU_MSPG="N/A"
-if [[ -n "$QEMU_BIN" && -f "$BUILD_DIR/life.rv" ]]; then
+if [[ "$RISCV_AVAIL" -eq 1 && -f "$BUILD_DIR/life.rv" ]]; then
     echo ""
-    echo -e "${CYAN}CPU (RISC-V+OpenMP via QEMU, ${NTHREADS} threads, ${GENS} loop iterations):${RESET}"
-    cpu_out=$(OMP_NUM_THREADS="${NTHREADS}" "${QEMU_BIN}" -L "$SYSROOT" "./$BUILD_DIR/life.rv" 2>/dev/null || true)
+    echo -e "${CYAN}CPU (RISC-V+OpenMP, ${NTHREADS} threads, ${GENS} loop iterations):${RESET}"
+    cpu_out=$(OMP_NUM_THREADS="${NTHREADS}" $RISCV_SIM "./$BUILD_DIR/life.rv" 2>/dev/null || true)
     echo "$cpu_out" | grep -v "^$"
     CPU_MSPG=$(parse_avg "$cpu_out")
 else
-    echo -e "${YELLOW}CPU: SKIP (no QEMU or life.rv build failed)${RESET}"
+    echo -e "${YELLOW}CPU: SKIP (no RISC-V runtime or life.rv build failed)${RESET}"
 fi
 
 echo ""

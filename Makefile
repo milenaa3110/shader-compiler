@@ -19,16 +19,24 @@ LLC           := llc-18
 # RISC-V toolchain
 RISCV_TRIPLE  ?= riscv64-unknown-linux-gnu
 RISCV_SYSROOT ?= /usr/riscv64-linux-gnu
-CROSS_CXX     ?= riscv64-linux-gnu-g++
+NTHREADS      := $(shell nproc)
+HOST_ARCH     := $(shell uname -m)
 
-QEMU_USER := $(shell which qemu-riscv64-static 2>/dev/null || which qemu-riscv64 2>/dev/null)
-NTHREADS  := $(shell nproc)
-
-ifneq ($(QEMU_USER),)
-    RISCV_SIM := $(QEMU_USER) -L $(RISCV_SYSROOT)
-    $(info [riscv] Using QEMU (OpenMP-capable): $(QEMU_USER))
+ifeq ($(HOST_ARCH),riscv64)
+    # Native RISC-V hardware — run binaries directly, no cross-compiler needed
+    CROSS_CXX ?= g++
+    RISCV_SIM :=
+    $(info [riscv] Native RISC-V host — running directly)
 else
-    RISCV_SIM := echo "ERROR: no RISC-V simulator found (install qemu-user-static)." &&
+    # Cross-compiling from x86_64
+    CROSS_CXX ?= riscv64-linux-gnu-g++
+    QEMU_USER := $(shell which qemu-riscv64-static 2>/dev/null || which qemu-riscv64 2>/dev/null)
+    ifneq ($(QEMU_USER),)
+        RISCV_SIM := $(QEMU_USER) -L $(RISCV_SYSROOT)
+        $(info [riscv] Using QEMU (OpenMP-capable): $(QEMU_USER))
+    else
+        RISCV_SIM := echo "ERROR: no RISC-V simulator found (install qemu-user-static)." &&
+    endif
 endif
 
 # Dirs

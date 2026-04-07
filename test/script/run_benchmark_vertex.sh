@@ -42,12 +42,12 @@ fi
 
 # ── RISC-V CPU ────────────────────────────────────────────────────────────────
 rv_ms="N/A"; rv_mp4="-"
-if [[ -z "$QEMU_BIN" ]]; then
-    echo -e "  ${YELLOW}RISC-V: SKIP (no QEMU)${RESET}"
+if [[ "$RISCV_AVAIL" -eq 0 ]]; then
+    echo -e "  ${YELLOW}RISC-V: SKIP (no QEMU and not native RISC-V)${RESET}"
 else
     make build/riscv/terrain.rv 2>/dev/null
-    echo -e "\n${CYAN}Running RISC-V (${NTHREADS} threads via QEMU)…${RESET}"
-    rv_out=$(OMP_NUM_THREADS="$NTHREADS" $QEMU_BIN -L "$SYSROOT" \
+    echo -e "\n${CYAN}Running RISC-V (${NTHREADS} threads)…${RESET}"
+    rv_out=$(OMP_NUM_THREADS="$NTHREADS" $RISCV_SIM \
         ./build/riscv/terrain.rv 2>/dev/null || true)
     rv_ms=$(parse_avg "$rv_out")
     [[ -f result/terrain_rv.mp4 ]] && rv_mp4="result/terrain_rv.mp4"

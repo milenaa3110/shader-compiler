@@ -28,9 +28,9 @@ VK_HOST="./build/spirv/spirv_vulkan_host"
 
 # ── detect simulators ─────────────────────────────────────────────────────────
 # QEMU: used for all rendering + OpenMP benchmark timing
-if [[ -n "$QEMU_BIN" ]]; then
-    SIM_RENDER="$QEMU_BIN -L $SYSROOT"
-    SIM_NAME="QEMU+OpenMP(${NTHREADS}t)"
+if [[ "$RISCV_AVAIL" -eq 1 ]]; then
+    SIM_RENDER="$RISCV_SIM"
+    SIM_NAME="$([[ "$NATIVE_RISCV" -eq 1 ]] && echo "native+OpenMP(${NTHREADS}t)" || echo "QEMU+OpenMP(${NTHREADS}t)")"
     RV_WIDTH=512
     RV_HEIGHT=512
 else
