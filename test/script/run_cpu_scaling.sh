@@ -402,7 +402,7 @@ echo -e "     • with    +v  →  loop is vectorised; each iteration processes 
 echo -e "     • without +v  →  scalar FP only; one pixel per loop iteration"
 echo ""
 
-LLC="${LLC:-$(which llc-18 2>/dev/null || which llc 2>/dev/null || echo llc-18)}"
+LLC="$(which llc-18 2>/dev/null || which llc-17 2>/dev/null || which llc 2>/dev/null || echo llc-18)"
 RISCV_TRIPLE="riscv64-unknown-linux-gnu"
 
 # Extract one function's disassembly, skipping local .L* labels within it.
@@ -447,10 +447,11 @@ else
         label=$([[ "$variant" == rvv ]] && echo "with RVV  (+v)" || echo "without RVV")
         for fn in cs_main cs_dispatch_row; do
             fn_dump=$(dump_fn "$obj" "$fn")
-            total=$(echo "$fn_dump" | grep -cE '^\s+[0-9a-f]+:' || true); total=${total:-0}
-            sfp=$(echo "$fn_dump" | grep -cE '\bfn?(add|mul|sub|div|madd|msub|max|min|sqrt|cvt|mv|class|sgn)\.s\b' \
-                  || true); sfp=${sfp:-0}
-            vfp=$(echo "$fn_dump" | grep -cE '\bvf[a-z]+\.' || true); vfp=${vfp:-0}
+            set +o pipefail
+            total=$(echo "$fn_dump" | grep -cE '^\s+[0-9a-f]+:' 2>/dev/null || echo 0)
+            sfp=$(echo "$fn_dump" | grep -cE '\bfn?(add|mul|sub|div|madd|msub|max|min|sqrt|cvt|mv|class|sgn)\.s\b' 2>/dev/null || echo 0)
+            vfp=$(echo "$fn_dump" | grep -cE '\bvf[a-z]+\.' 2>/dev/null || echo 0)
+            set -o pipefail
             printf "   │ %-24s │ %-12s │ %13s │ %14s │ %15s │\n" \
                 "$label" "$fn" "$total" "$sfp" "$vfp"
         done
@@ -460,12 +461,12 @@ else
     echo -e "${BOLD}   └──────────────────────────┴──────────────┴───────────────┴────────────────┴─────────────────┘${RESET}"
     echo ""
 
-    rvv_vfp=$(dump_fn "$RVV_OBJ"   "cs_dispatch_row" | grep -cE '\bvf[a-z]+\.' || true); rvv_vfp=${rvv_vfp:-0}
-    sc_sfp=$(dump_fn  "$NOVEC_OBJ" "cs_dispatch_row" \
-             | grep -cE '\bfn?(add|mul|sub|div|madd|msub|max|min|sqrt|cvt|mv|class|sgn)\.s\b' \
-             || true); sc_sfp=${sc_sfp:-0}
-    rvv_total=$(dump_fn "$RVV_OBJ"   "cs_dispatch_row" | grep -cE '^\s+[0-9a-f]+:' || true); rvv_total=${rvv_total:-0}
-    sc_total=$(dump_fn  "$NOVEC_OBJ" "cs_dispatch_row" | grep -cE '^\s+[0-9a-f]+:' || true); sc_total=${sc_total:-0}
+    set +o pipefail
+    rvv_vfp=$(dump_fn "$RVV_OBJ" "cs_dispatch_row" | grep -cE '\bvf[a-z]+\.' 2>/dev/null || echo 0)
+    sc_sfp=$(dump_fn "$NOVEC_OBJ" "cs_dispatch_row" | grep -cE '\bfn?(add|mul|sub|div|madd|msub|max|min|sqrt|cvt|mv|class|sgn)\.s\b' 2>/dev/null || echo 0)
+    rvv_total=$(dump_fn "$RVV_OBJ" "cs_dispatch_row" | grep -cE '^\s+[0-9a-f]+:' 2>/dev/null || echo 0)
+    sc_total=$(dump_fn "$NOVEC_OBJ" "cs_dispatch_row" | grep -cE '^\s+[0-9a-f]+:' 2>/dev/null || echo 0)
+    set -o pipefail
 
     # Sample 3 FP instructions from each variant to make the contrast concrete.
     rvv_samples=$(dump_fn "$RVV_OBJ"   "cs_dispatch_row" \

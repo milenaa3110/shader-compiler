@@ -8,12 +8,12 @@ CXXWARN:= -Wall -Wextra
 # LLVM_LDFLAGS  := $(shell llvm-config --ldflags --system-libs --libs core support 2>/dev/null)
 # LLVM_OPT      ?= opt
 # LLC           ?= llc
-# LLVM
-LLVM_CONFIG   := llvm-config-18
+# LLVM — auto-detect version (prefer 18, fall back to 17, then unversioned)
+LLVM_CONFIG   := $(shell which llvm-config-18 2>/dev/null || which llvm-config-17 2>/dev/null || which llvm-config 2>/dev/null || echo llvm-config-18)
 LLVM_CXXFLAGS := $(shell $(LLVM_CONFIG) --cxxflags)
 LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags --system-libs --libs core support)
-LLVM_OPT      := opt-18
-LLC           := llc-18
+LLVM_OPT      := $(shell which opt-18 2>/dev/null || which opt-17 2>/dev/null || which opt 2>/dev/null || echo opt-18)
+LLC           := $(shell which llc-18 2>/dev/null || which llc-17 2>/dev/null || which llc 2>/dev/null || echo llc-18)
 
 
 # RISC-V toolchain
