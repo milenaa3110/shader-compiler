@@ -408,12 +408,14 @@ RISCV_TRIPLE="riscv64-unknown-linux-gnu"
 # Extract one function's disassembly, skipping local .L* labels within it.
 dump_fn() {
     local obj="$1" fn="$2"
+    set +o pipefail
     $OBJDUMP -d "$obj" 2>/dev/null \
       | awk "
           /^[[:xdigit:]]+ <${fn}>:/ { found=1; next }
           found && /^[[:xdigit:]]+ <[^.>][^>]*>:/ { exit }
           found { print }
-      "
+      " || true
+    set -o pipefail
 }
 
 BLR_OPT_LL="build/riscv/blur_cs_rv.opt.ll"
