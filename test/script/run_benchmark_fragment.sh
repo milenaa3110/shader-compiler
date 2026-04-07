@@ -124,7 +124,7 @@ for A in "${ANIMATIONS[@]}"; do
 
     # ── RISC-V CPU + OpenMP ───────────────────────────────────────────────────
     if [[ $VK_ONLY -eq 0 ]]; then
-        if [[ -z "$SIM_RENDER" ]]; then
+        if [[ "$RISCV_AVAIL" -eq 0 ]]; then
             RV_MS[$A]="N/A"; RV_MP4[$A]="-"
             echo -e "  CPU (RISC-V) : ${YELLOW}SKIP (no RISC-V runtime — install qemu-user-static or run on RISC-V hardware)${RESET}"
         elif [[ -f "build/riscv/${A}_rv.o" ]]; then
