@@ -57,7 +57,7 @@ build_frag() {
     local tmp_rt="$BUILD_DIR/_tmp_rt_${sched}.cpp"
     sed "s/schedule(dynamic, 1)/schedule(${sched}, 1)/" \
         pipeline/pipeline_runtime.cpp > "$tmp_rt"
-    riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp -Ipipeline \
+    $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Ipipeline \
         -DANIM_NAME="\"${anim}\"" -DNFRAMES="$FRAG_FRAMES" \
         -DWIDTH="$FRAG_W" -DHEIGHT="$FRAG_H" \
         test/rv_host/rv_host_fragment.cpp \
@@ -69,7 +69,7 @@ build_frag() {
 # ── helper: build a life binary ───────────────────────────────────────────────
 build_life() {
     local grid="$1" out="$2"
-    riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp \
+    $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
         -DGRID="$grid" -DNGENERATIONS="$LIFE_GENS" \
         test/rv_host/rv_host_compute.cpp \
         build/riscv/life_cs_rv.o -o "$out" >/dev/null 2>&1
@@ -307,8 +307,8 @@ int main() {
 EOF
 
 PROBE_OK=0
-if riscv64-linux-gnu-g++ -std=c++20 -O2 -static \
-       -mabi=lp64d -march=rv64gcv \
+PROBE_ARCH_FLAGS=$([[ "$NATIVE_RISCV" -eq 0 ]] && echo "-mabi=lp64d -march=rv64gcv" || echo "")
+if $CROSS_CXX -std=c++20 -O2 -static $PROBE_ARCH_FLAGS \
        "$PROBE_SRC" -o "$PROBE_BIN" 2>/dev/null; then
     PROBE_OK=1
 fi
@@ -406,7 +406,7 @@ RISCV_TRIPLE="riscv64-unknown-linux-gnu"
 # Extract one function's disassembly, skipping local .L* labels within it.
 dump_fn() {
     local obj="$1" fn="$2"
-    riscv64-linux-gnu-objdump -d "$obj" 2>/dev/null \
+    $OBJDUMP -d "$obj" 2>/dev/null \
       | awk "
           /^[[:xdigit:]]+ <${fn}>:/ { found=1; next }
           found && /^[[:xdigit:]]+ <[^.>][^>]*>:/ { exit }

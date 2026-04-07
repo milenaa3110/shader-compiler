@@ -26,7 +26,7 @@ spv_vert_kb="N/A"; spv_frag_kb="N/A"; rv_kb="N/A"; rv_instrs="N/A"
 [[ -f build/riscv/terrain_rv.o ]] && \
     rv_kb=$(awk "BEGIN{printf \"%.1f\", $(wc -c < build/riscv/terrain_rv.o)/1024}")
 [[ -f build/riscv/terrain_rv.o ]] && \
-    rv_instrs=$(riscv64-linux-gnu-objdump -d build/riscv/terrain_rv.o 2>/dev/null \
+    rv_instrs=$($OBJDUMP -d build/riscv/terrain_rv.o 2>/dev/null \
         | grep -cE '^\s+[0-9a-f]+:' || echo "N/A")
 
 # ── Vulkan GPU ────────────────────────────────────────────────────────────────

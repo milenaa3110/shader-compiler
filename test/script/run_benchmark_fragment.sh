@@ -86,7 +86,7 @@ file_kb() { local f="$1"; [[ -f "$f" ]] && awk "BEGIN{printf \"%.1f\", $(wc -c <
 rv_instr_count() {
     local obj="$1"
     [[ -f "$obj" ]] || { echo "N/A"; return; }
-    riscv64-linux-gnu-objdump -d "$obj" 2>/dev/null \
+    $OBJDUMP -d "$obj" 2>/dev/null \
         | grep -cE '^\s+[0-9a-f]+:' || echo "N/A"
 }
 
@@ -126,10 +126,10 @@ for A in "${ANIMATIONS[@]}"; do
     if [[ $VK_ONLY -eq 0 ]]; then
         if [[ -z "$SIM_RENDER" ]]; then
             RV_MS[$A]="N/A"; RV_MP4[$A]="-"
-            echo -e "  CPU (RISC-V) : ${YELLOW}SKIP (no QEMU)${RESET}"
+            echo -e "  CPU (RISC-V) : ${YELLOW}SKIP (no RISC-V runtime — install qemu-user-static or run on RISC-V hardware)${RESET}"
         elif [[ -f "build/riscv/${A}_rv.o" ]]; then
             # Build rv binary with OpenMP
-            riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp -Ipipeline \
+            $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Ipipeline \
                 -DANIM_NAME="\"${A}\"" -DNFRAMES="${VK_FRAMES}" -DFPS=30 \
                 -DWIDTH="${RV_WIDTH}" -DHEIGHT="${RV_HEIGHT}" \
                 test/rv_host/rv_host_fragment.cpp \

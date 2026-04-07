@@ -25,11 +25,13 @@ QEMU_BIN="$(which qemu-riscv64-static 2>/dev/null || which qemu-riscv64 2>/dev/n
 if [[ "$HOST_ARCH" == "riscv64" ]]; then
     NATIVE_RISCV=1
     CROSS_CXX="g++"
+    OBJDUMP="objdump"
     RISCV_SIM=""
     RISCV_AVAIL=1
 else
     NATIVE_RISCV=0
     CROSS_CXX="riscv64-linux-gnu-g++"
+    OBJDUMP="riscv64-linux-gnu-objdump"
     if [[ -n "$QEMU_BIN" ]]; then
         RISCV_SIM="$QEMU_BIN -L $SYSROOT"
         RISCV_AVAIL=1
