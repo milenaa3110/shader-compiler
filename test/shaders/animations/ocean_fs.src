@@ -1,0 +1,195 @@
+# ocean_fs.src — Raymarched ocean with mountains and sunset sky
+# Demonstrates: terrain raymarching, layered procedural noise, specular water,
+# atmospheric scattering approximation, distance fog.
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    # ── Ray setup: camera over the ocean ──────────────────────────────────────
+    float camX = uTime * 0.3;
+    float camY = 1.8;
+    float camZ = 0.0;
+
+    float fwdX = cos(uTime * 0.05);
+    float fwdY = -0.15;
+    float fwdZ = sin(uTime * 0.05);
+    float fL = sqrt(fwdX*fwdX + fwdY*fwdY + fwdZ*fwdZ);
+    fwdX = fwdX / fL; fwdY = fwdY / fL; fwdZ = fwdZ / fL;
+
+    float rX = -fwdZ;
+    float rZ =  fwdX;
+    float rL = sqrt(rX*rX + rZ*rZ) + 0.0001;
+    rX = rX / rL;
+    rZ = rZ / rL;
+
+    float upX = -rZ * fwdY;
+    float upY =  rZ * fwdX - rX * fwdZ;
+    float upZ =  rX * fwdY;
+
+    float su = (vUV.x - 0.5) * 2.0;
+    float sv = (vUV.y - 0.5) * 2.0;
+
+    float rdX = fwdX + su * rX + sv * upX;
+    float rdY = fwdY + sv * upY;
+    float rdZ = fwdZ + su * rZ + sv * upZ;
+    float rdL = sqrt(rdX*rdX + rdY*rdY + rdZ*rdZ);
+    rdX = rdX / rdL; rdY = rdY / rdL; rdZ = rdZ / rdL;
+
+    # ── Sun direction ─────────────────────────────────────────────────────────
+    float sunA = uTime * 0.08;
+    float sunX = cos(sunA) * 0.4;
+    float sunY = 0.4 + sin(sunA) * 0.1;
+    float sunZ = sin(sunA) * 0.6;
+    float sL = sqrt(sunX*sunX + sunY*sunY + sunZ*sunZ);
+    sunX = sunX / sL; sunY = sunY / sL; sunZ = sunZ / sL;
+
+    # ── Raymarch ocean surface ────────────────────────────────────────────────
+    float t = 0.0;
+    float hitY = 0.0;
+    float hitX = 0.0;
+    float hitZ = 0.0;
+    float hit = 0.0;
+
+    for (float i = 0.0; i < 64.0; i = i + 1.0) {
+        float mx = camX + rdX * t;
+        float my = camY + rdY * t;
+        float mz = camZ + rdZ * t;
+
+        # Wave amplitude fades with distance — prevents horizon gaps
+        float fade = 1.0 / (1.0 + t * 0.04);
+
+        # Layered wave displacement (attenuated by distance)
+        float wv = sin(mx * 0.8 + uTime * 1.2) * 0.3 * fade;
+        wv = wv + sin(mz * 1.3 - uTime * 0.9) * 0.2 * fade;
+        wv = wv + sin(mx * 2.1 + mz * 1.7 + uTime * 1.8) * 0.1 * fade;
+        wv = wv + sin(mx * 4.5 - mz * 3.2 + uTime * 2.5) * 0.04 * fade;
+
+        float d = my - wv;
+
+        if (d < 0.01) {
+            hit = 1.0;
+            hitX = mx;
+            hitY = my;
+            hitZ = mz;
+            i = 99.0;
+        }
+        t = t + max(d * 0.4, 0.08);
+        if (t > 80.0) { i = 99.0; }
+    }
+
+    # If ray points downward and we didn't hit yet, force a flat ocean hit
+    if (hit < 0.5 && rdY < -0.001) {
+        float tFlat = -camY / rdY;
+        if (tFlat > 0.0) {
+            hit = 1.0;
+            t = tFlat;
+            hitX = camX + rdX * tFlat;
+            hitY = 0.0;
+            hitZ = camZ + rdZ * tFlat;
+        }
+    }
+
+    # ── Water normal via finite differences ───────────────────────────────────
+    float hitFade = 1.0 / (1.0 + t * 0.04);
+    float e = 0.02;
+    float w0 = (sin(hitX * 0.8 + uTime * 1.2) * 0.3
+              + sin(hitZ * 1.3 - uTime * 0.9) * 0.2
+              + sin(hitX * 2.1 + hitZ * 1.7 + uTime * 1.8) * 0.1
+              + sin(hitX * 4.5 - hitZ * 3.2 + uTime * 2.5) * 0.04) * hitFade;
+
+    float wx = (sin((hitX+e) * 0.8 + uTime * 1.2) * 0.3
+              + sin(hitZ * 1.3 - uTime * 0.9) * 0.2
+              + sin((hitX+e) * 2.1 + hitZ * 1.7 + uTime * 1.8) * 0.1
+              + sin((hitX+e) * 4.5 - hitZ * 3.2 + uTime * 2.5) * 0.04) * hitFade;
+
+    float wz = (sin(hitX * 0.8 + uTime * 1.2) * 0.3
+              + sin((hitZ+e) * 1.3 - uTime * 0.9) * 0.2
+              + sin(hitX * 2.1 + (hitZ+e) * 1.7 + uTime * 1.8) * 0.1
+              + sin(hitX * 4.5 - (hitZ+e) * 3.2 + uTime * 2.5) * 0.04) * hitFade;
+
+    float wnx = -(wx - w0) / e;
+    float wny = 1.0;
+    float wnz = -(wz - w0) / e;
+    float wnL = sqrt(wnx*wnx + wny*wny + wnz*wnz);
+    wnx = wnx / wnL; wny = wny / wnL; wnz = wnz / wnL;
+
+    # ── Water shading ─────────────────────────────────────────────────────────
+    float diff = clamp(wnx*sunX + wny*sunY + wnz*sunZ, 0.0, 1.0);
+
+    # Specular: reflect ray off water normal
+    float dotRN = rdX*wnx + rdY*wny + rdZ*wnz;
+    float refX = rdX - 2.0*dotRN*wnx;
+    float refY = rdY - 2.0*dotRN*wny;
+    float refZ = rdZ - 2.0*dotRN*wnz;
+
+    float specDot = clamp(refX*sunX + refY*sunY + refZ*sunZ, 0.0, 1.0);
+    float spec = pow(specDot, 48.0);
+
+    # Water base color — bright teal/blue
+    float waterR = 0.04;
+    float waterG = 0.18;
+    float waterB = 0.45;
+
+    # Fresnel approximation
+    float fresnel = pow(1.0 - abs(dotRN), 3.0) * 0.5 + 0.08;
+
+    # Brighter lighting: strong ambient + diffuse
+    float wR = waterR * (diff * 0.6 + 0.5) + spec * 1.0;
+    float wG = waterG * (diff * 0.6 + 0.5) + spec * 0.9;
+    float wB = waterB * (diff * 0.6 + 0.5) + spec * 0.6;
+
+    # ── Sky ───────────────────────────────────────────────────────────────────
+    float sunDot = clamp(rdX*sunX + rdY*sunY + rdZ*sunZ, 0.0, 1.0);
+    float sunDisc = pow(sunDot, 256.0) * 3.0;
+    float sunGlow = pow(sunDot, 8.0) * 0.4;
+
+    float skyH = clamp(rdY, 0.0, 1.0);
+    # Warm sunset near horizon, blue at zenith
+    float skyR = mix(0.65, 0.15, skyH) + sunGlow * 0.9 + sunDisc;
+    float skyG = mix(0.45, 0.20, skyH) + sunGlow * 0.45 + sunDisc * 0.7;
+    float skyB = mix(0.35, 0.55, skyH) + sunGlow * 0.15 + sunDisc * 0.4;
+
+    # ── Mountains on the horizon (distant silhouette) ─────────────────────────
+    float mtnSeed = rdX * 7.0 + rdZ * 3.0;
+    float mtnH = 0.05 + sin(mtnSeed * 0.7) * 0.03
+               + sin(mtnSeed * 1.9) * 0.015
+               + sin(mtnSeed * 4.3) * 0.008;
+    float isMtn = step(rdY, mtnH) * step(0.0, rdY);
+    float mtnShade = 0.5 + 0.5 * clamp(sunX * rdX + sunZ * rdZ, 0.0, 1.0);
+    float mtnR = 0.25 * mtnShade + 0.05;
+    float mtnG = 0.18 * mtnShade + 0.04;
+    float mtnB = 0.30 * mtnShade + 0.06;
+
+    skyR = mix(skyR, mtnR, isMtn);
+    skyG = mix(skyG, mtnG, isMtn);
+    skyB = mix(skyB, mtnB, isMtn);
+
+    # ── Compose ───────────────────────────────────────────────────────────────
+    # Sky reflection on water
+    float refSunDot = clamp(refX*sunX + refY*sunY + refZ*sunZ, 0.0, 1.0);
+    float refGlow = pow(refSunDot, 16.0) * 0.3;
+    wR = wR + fresnel * (skyR * 0.2 + refGlow * 0.6);
+    wG = wG + fresnel * (skyG * 0.2 + refGlow * 0.35);
+    wB = wB + fresnel * (skyB * 0.3 + refGlow * 0.15);
+
+    # Distance fog on water — blends toward horizon sky color
+    float fogF = clamp(t / 60.0, 0.0, 1.0);
+    fogF = fogF * fogF;
+    # Fog target is the horizon sky color (not full sky which includes zenith blue)
+    float fogR = mix(0.65, 0.15, 0.05) + sunGlow * 0.5;
+    float fogG = mix(0.45, 0.20, 0.05) + sunGlow * 0.25;
+    float fogB = mix(0.35, 0.55, 0.05) + sunGlow * 0.08;
+    wR = mix(wR, fogR, fogF);
+    wG = mix(wG, fogG, fogF);
+    wB = mix(wB, fogB, fogF);
+
+    # Final: water if hit, sky otherwise
+    float fr = mix(skyR, wR, hit);
+    float fg = mix(skyG, wG, hit);
+    float fb = mix(skyB, wB, hit);
+
+    FragColor = vec4(clamp(fr, 0.0, 1.0), clamp(fg, 0.0, 1.0), clamp(fb, 0.0, 1.0), 1.0);
+}

@@ -14,6 +14,7 @@ LLVM_CXXFLAGS := $(shell $(LLVM_CONFIG) --cxxflags)
 LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags --system-libs --libs core support)
 LLVM_OPT      := $(shell which opt-18 2>/dev/null || which opt-17 2>/dev/null || which opt 2>/dev/null || echo opt-18)
 LLC           := $(shell which llc-18 2>/dev/null || which llc-17 2>/dev/null || which llc 2>/dev/null || echo llc-18)
+LLVM_LINK     := $(shell which llvm-link-18 2>/dev/null || which llvm-link-17 2>/dev/null || which llvm-link 2>/dev/null || echo llvm-link-18)
 
 
 # RISC-V toolchain
@@ -62,6 +63,7 @@ PIPELINE_DIR   := pipeline
 TARGET_CODEGEN      := $(BUILD_DIR)/shader_codegen
 TARGET_IRGEN_RISCV  := $(RISCV_DIR)/irgen_riscv
 TARGET_IRGEN_SPIRV  := $(SPV_DIR)/irgen_spirv
+TARGET_IRGEN_SPIRV_LLVM := $(SPV_DIR)/irgen_spirv_llvm
 
 # Binaries — Vulkan hosts
 VK_HOST         := $(SPV_DIR)/spirv_vulkan_host
@@ -82,14 +84,16 @@ COMMON_SRCS := \
 CODEGEN_SRCS       := $(COMMON_SRCS) $(MAINCODEGEN_DIR)/main_codegen.cpp
 IRGEN_RISCV_SRCS   := $(COMMON_SRCS) $(MAIN_DIR)/main_lib_riscv.cpp
 IRGEN_SPIRV_SRCS   := $(COMMON_SRCS) $(MAIN_DIR)/main_lib_spirv.cpp
+IRGEN_SPIRV_LLVM_SRCS := $(COMMON_SRCS) $(MAIN_DIR)/main_lib_spirv_llvm.cpp
 
 CODEGEN_OBJS       := $(patsubst %.cpp,$(OBJDIR_LLVM)/%.o,$(notdir $(CODEGEN_SRCS)))
 IRGEN_RISCV_OBJS   := $(patsubst %.cpp,$(OBJDIR_LLVM)/irgen_riscv_%.o,$(notdir $(IRGEN_RISCV_SRCS)))
 IRGEN_SPIRV_OBJS   := $(patsubst %.cpp,$(OBJDIR_LLVM)/irgen_spirv_%.o,$(notdir $(IRGEN_SPIRV_SRCS)))
+IRGEN_SPIRV_LLVM_OBJS := $(patsubst %.cpp,$(OBJDIR_LLVM)/irgen_spirv_llvm_%.o,$(notdir $(IRGEN_SPIRV_LLVM_SRCS)))
 
 # ---- default ----
 .PHONY: all
-all: $(TARGET_CODEGEN) $(TARGET_IRGEN_RISCV) $(TARGET_IRGEN_SPIRV) $(SINCOS_PLUGIN)
+all: $(TARGET_CODEGEN) $(TARGET_IRGEN_RISCV) $(TARGET_IRGEN_SPIRV) $(TARGET_IRGEN_SPIRV_LLVM) $(SINCOS_PLUGIN)
 
 # ---- build dirs ----
 $(OBJDIR_LLVM):
@@ -144,6 +148,20 @@ $(OBJDIR_LLVM)/irgen_spirv_%.o: $(AST_DIR)/%.cpp | $(OBJDIR_LLVM)
 $(OBJDIR_LLVM)/irgen_spirv_%.o: $(HELPERS_DIR)/%.cpp | $(OBJDIR_LLVM)
 	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -MMD -MP -fPIC -c $< -o $@
 
+# IRGEN_SPIRV_LLVM objects (prefix irgen_spirv_llvm_)
+$(OBJDIR_LLVM)/irgen_spirv_llvm_%.o: $(MAIN_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -MMD -MP -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/irgen_spirv_llvm_%.o: $(LEXER_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -MMD -MP -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/irgen_spirv_llvm_%.o: $(PARSER_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(AST_DIR) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/irgen_spirv_llvm_%.o: $(CODEGEN_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/irgen_spirv_llvm_%.o: $(AST_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -MMD -MP -fPIC -c $< -o $@
+$(OBJDIR_LLVM)/irgen_spirv_llvm_%.o: $(HELPERS_DIR)/%.cpp | $(OBJDIR_LLVM)
+	$(CXX) $(CXXSTD) $(CXXWARN) $(LLVM_CXXFLAGS) -I$(AST_DIR) -I$(CODEGEN_DIR) -I$(HELPERS_DIR) -MMD -MP -fPIC -c $< -o $@
+
 # Auto-generated header dependencies
 -include $(wildcard $(OBJDIR_LLVM)/*.d)
 
@@ -156,6 +174,9 @@ $(TARGET_IRGEN_RISCV): $(OBJDIR_LLVM) $(RISCV_DIR) $(IRGEN_RISCV_OBJS)
 
 $(TARGET_IRGEN_SPIRV): $(OBJDIR_LLVM) $(SPV_DIR) $(IRGEN_SPIRV_OBJS)
 	$(CXX) $(IRGEN_SPIRV_OBJS) -o $@ $(LLVM_LDFLAGS) -lfmt
+
+$(TARGET_IRGEN_SPIRV_LLVM): $(OBJDIR_LLVM) $(SPV_DIR) $(IRGEN_SPIRV_LLVM_OBJS)
+	$(CXX) $(IRGEN_SPIRV_LLVM_OBJS) -o $@ $(LLVM_LDFLAGS) -lfmt
 
 # ── LLVM pass plugins ────────────────────────────────────────────────────────
 # sincos_opt: combines llvm.sin.f32(X)+llvm.cos.f32(X) pairs → sincosf(X,&s,&c)
@@ -187,7 +208,7 @@ $(RISCV_DIR)/pipeline_riscv.ll: $(PIPELINE_VS_SRC) $(PIPELINE_FS_SRC) $(TARGET_I
 	@mkdir -p $(RISCV_DIR)
 	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/vs_rv.ll < $(PIPELINE_VS_SRC)
 	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/fs_rv.ll < $(PIPELINE_FS_SRC)
-	llvm-link-18 $(RISCV_DIR)/vs_rv.ll $(RISCV_DIR)/fs_rv.ll -S -o $@
+	$(LLVM_LINK) $(RISCV_DIR)/vs_rv.ll $(RISCV_DIR)/fs_rv.ll -S -o $@
 
 $(RISCV_DIR)/pipeline_riscv.o: $(RISCV_DIR)/pipeline_riscv.ll
 	$(LLC) -O3 -filetype=obj -relocation-model=pic \
@@ -213,7 +234,7 @@ $(RISCV_DIR)/anim_riscv.ll: $(ANIM_VS_SRC) $(ANIM_FS_SRC) $(TARGET_IRGEN_RISCV)
 	@mkdir -p $(RISCV_DIR)
 	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/anim_vs_rv.ll < $(ANIM_VS_SRC)
 	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/anim_fs_rv.ll < $(ANIM_FS_SRC)
-	llvm-link-18 $(RISCV_DIR)/anim_vs_rv.ll $(RISCV_DIR)/anim_fs_rv.ll -S -o $@
+	$(LLVM_LINK) $(RISCV_DIR)/anim_vs_rv.ll $(RISCV_DIR)/anim_fs_rv.ll -S -o $@
 
 $(RISCV_DIR)/anim_riscv.o: $(RISCV_DIR)/anim_riscv.ll
 	$(LLC) -O3 -filetype=obj -relocation-model=pic \
@@ -283,7 +304,7 @@ $(RISCV_DIR)/$(1)_rv.ll: $(ANIM_SHADER_DIR)/$(1)_fs.src test/shaders/pipeline/sc
 	@mkdir -p $(RISCV_DIR)
 	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/$(1)_vs_rv.ll < test/shaders/pipeline/scene_vs.src
 	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/$(1)_fs_rv.ll < $(ANIM_SHADER_DIR)/$(1)_fs.src
-	llvm-link-18 $(RISCV_DIR)/$(1)_vs_rv.ll $(RISCV_DIR)/$(1)_fs_rv.ll -S -o $$@
+	$(LLVM_LINK) $(RISCV_DIR)/$(1)_vs_rv.ll $(RISCV_DIR)/$(1)_fs_rv.ll -S -o $$@
 
 $(RISCV_DIR)/$(1)_rv.o: $(RISCV_DIR)/$(1)_rv.ll $(SINCOS_PLUGIN)
 	$(LLVM_OPT) -O3 --enable-unsafe-fp-math --fp-contract=fast -S \
@@ -308,7 +329,7 @@ endef
 
 # ── Animation lists ────────────────────────────────────────────────────────
 # Procedural fragment shaders (no texture sampler) — compiled by irgen_spirv.
-ANIMATIONS_PROC := mandelbrot julia voronoi waves tunnel ripple galaxy fire reaction cellular earth scene3d diverge
+ANIMATIONS_PROC := mandelbrot julia voronoi waves tunnel ripple galaxy fire reaction cellular earth scene3d diverge city ocean
 
 # All animations including texture_test — used for RISC-V and the full list.
 ANIMATIONS := $(ANIMATIONS_PROC) texture_test
@@ -431,7 +452,7 @@ $(RISCV_DIR)/terrain_rv.ll: $(ANIM_SHADER_DIR)/terrain_vs.src $(ANIM_SHADER_DIR)
 	@mkdir -p $(RISCV_DIR)
 	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/terrain_vs_rv.ll < $(ANIM_SHADER_DIR)/terrain_vs.src
 	./$(TARGET_IRGEN_RISCV) $(RISCV_DIR)/terrain_fs_rv.ll < $(ANIM_SHADER_DIR)/terrain_fs.src
-	llvm-link-18 $(RISCV_DIR)/terrain_vs_rv.ll $(RISCV_DIR)/terrain_fs_rv.ll -S -o $@
+	$(LLVM_LINK) $(RISCV_DIR)/terrain_vs_rv.ll $(RISCV_DIR)/terrain_fs_rv.ll -S -o $@
 
 $(RISCV_DIR)/terrain_rv.o: $(RISCV_DIR)/terrain_rv.ll $(SINCOS_PLUGIN)
 	$(LLVM_OPT) -O3 --enable-unsafe-fp-math --fp-contract=fast -S \

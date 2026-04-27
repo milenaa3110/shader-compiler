@@ -1,0 +1,92 @@
+# test_terrain.src — vertex shader compiler test exercising terrain-like patterns
+# Tests: gl_VertexID arithmetic, floor/sqrt/sin/cos chains, if-branching on
+# float comparison (||), analytical derivatives, clamp/step for material
+# selection, multi-stage perspective projection, gl_Position + varying output.
+
+uniform float uTime;
+out vec4 vColor;
+
+@entry @stage(vertex)
+fn void main() {
+    # ── Grid index from gl_VertexID ───────────────────────────────────────────
+    float GRID = 8.0;
+    float vid = float(gl_VertexID);
+    float quadIdx = floor(vid / 6.0);
+    float corner  = vid - quadIdx * 6.0;
+
+    float gx = floor(quadIdx / GRID);
+    float gz = quadIdx - gx * GRID;
+
+    # Corner offsets — tests if with || (or) conditions
+    float dx = 0.0;
+    float dz = 0.0;
+    if (corner == 1.0 || corner == 2.0 || corner == 4.0) { dx = 1.0; }
+    if (corner == 2.0 || corner == 4.0 || corner == 5.0) { dz = 1.0; }
+
+    float fx = (gx + dx) / GRID * 4.0 - 2.0;
+    float fz = (gz + dz) / GRID * 4.0 - 2.0;
+
+    # ── Displacement — tests sin/cos chains and sqrt ──────────────────────────
+    float fy = sin(fx * 1.9 + uTime) * cos(fz * 2.4 + uTime * 0.8) * 0.3
+             + cos(sqrt(fx*fx + fz*fz) * 2.8 - uTime) * 0.1;
+
+    # ── Analytical gradient — tests compound expressions ──────────────────────
+    float r = sqrt(fx*fx + fz*fz) + 0.001;
+    float dydx = cos(fx * 1.9 + uTime) * 1.9 * 0.3
+               - (fx / r) * 2.8 * sin(r * 2.8 - uTime) * 0.1;
+    float dydz = -sin(fz * 2.4 + uTime * 0.8) * 2.4 * 0.3
+               - (fz / r) * 2.8 * sin(r * 2.8 - uTime) * 0.1;
+
+    # Normal from gradient — tests multi-component normalization
+    float nLen = sqrt(dydx*dydx + 1.0 + dydz*dydz);
+    float nxV = -dydx / nLen;
+    float nyV =  1.0  / nLen;
+    float nzV = -dydz / nLen;
+
+    # ── Lighting — tests clamp and dot product via scalar expansion ───────────
+    float diff = clamp(nxV*0.5 + nyV*0.8 + nzV*0.3, 0.0, 1.0);
+    float light = diff * 0.75 + 0.25;
+
+    # ── Material selection — tests step for branchless conditionals ───────────
+    float h = clamp((fy + 0.5) / 1.0, 0.0, 1.0);
+    float isLow  = step(h, 0.3);
+    float isHigh = step(0.7, h);
+    float isMid  = 1.0 - isLow - isHigh;
+
+    float cr = isLow*0.1 + isMid*(0.2 + h*0.4) + isHigh*0.9;
+    float cg = isLow*0.3 + isMid*(0.5 + h*0.1) + isHigh*0.9;
+    float cb = isLow*0.7 + isMid*0.2            + isHigh*1.0;
+
+    vColor = vec4(cr*light, cg*light, cb*light, 1.0);
+
+    # ── Projection — tests view matrix construction and gl_Position output ────
+    float camX = sin(uTime * 0.2) * 4.0;
+    float camY = 2.5;
+    float camZ = cos(uTime * 0.2) * 4.0;
+
+    float fLen = sqrt(camX*camX + camY*camY + camZ*camZ);
+    float fwdX = -camX / fLen;
+    float fwdY = -camY / fLen;
+    float fwdZ = -camZ / fLen;
+
+    float rX = -fwdZ;
+    float rZ =  fwdX;
+    float rLen = sqrt(rX*rX + rZ*rZ);
+    rX = rX / rLen;
+    rZ = rZ / rLen;
+
+    float upX = -rZ*fwdY;
+    float upY =  rZ*fwdX - rX*fwdZ;
+    float upZ =  rX*fwdY;
+
+    float dvX = fx - camX;
+    float dvY = fy - camY;
+    float dvZ = fz - camZ;
+
+    float cx = rX*dvX + rZ*dvZ;
+    float cy = upX*dvX + upY*dvY + upZ*dvZ;
+    float cz = fwdX*dvX + fwdY*dvY + fwdZ*dvZ;
+
+    float f = 1.732;
+    gl_Position = vec4(f*cx, f*cy, 1.01005*cz - 0.20101, cz);
+}

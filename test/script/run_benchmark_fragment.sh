@@ -20,7 +20,7 @@ cd "$ROOT"
 source "$(dirname "${BASH_SOURCE[0]}")/bench_common.sh"
 
 # ── config ────────────────────────────────────────────────────────────────────
-ANIMATIONS=(mandelbrot julia voronoi waves tunnel ripple galaxy fire reaction cellular earth scene3d)
+ANIMATIONS=(mandelbrot julia voronoi waves tunnel ripple galaxy fire reaction cellular earth scene3d city ocean)
 VK_FRAMES=60
 VK_WIDTH=512
 VK_HEIGHT=512

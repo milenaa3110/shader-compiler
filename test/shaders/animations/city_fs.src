@@ -1,0 +1,241 @@
+# city_fs.src — Raymarched city street with a red car
+# Demonstrates: SDF raymarching loop, box/sphere primitives,
+# procedural road markings, headlight glow, distance fog.
+
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    # ── Ray setup ─────────────────────────────────────────────────────────────
+    float px = (vUV.x - 0.5) * 2.0;
+    float py = (vUV.y - 0.5) * 2.0;
+
+    float ca = uTime * 0.15;
+    float camX = sin(ca) * 7.0;
+    float camY = 3.0;
+    float camZ = cos(ca) * 7.0;
+
+    float fLen = sqrt(camX*camX + camY*camY + camZ*camZ);
+    float fwdX = -camX / fLen;
+    float fwdY = -camY / fLen;
+    float fwdZ = -camZ / fLen;
+
+    float rX = -fwdZ;
+    float rZ =  fwdX;
+    float rLen = sqrt(rX*rX + rZ*rZ) + 0.0001;
+    rX = rX / rLen;
+    rZ = rZ / rLen;
+
+    float upX = -rZ * fwdY;
+    float upY =  rZ * fwdX - rX * fwdZ;
+    float upZ =  rX * fwdY;
+
+    float rdX = fwdX + px * rX + py * upX;
+    float rdY = fwdY + py * upY;
+    float rdZ = fwdZ + px * rZ + py * upZ;
+    float rdL = sqrt(rdX*rdX + rdY*rdY + rdZ*rdZ);
+    rdX = rdX / rdL;
+    rdY = rdY / rdL;
+    rdZ = rdZ / rdL;
+
+    # Car position — moves along X
+    float carX = sin(uTime * 0.4) * 2.0;
+    float carZ = 0.0;
+
+    # ── Raymarch ──────────────────────────────────────────────────────────────
+    float t = 0.0;
+    float hitID = 0.0;
+
+    for (float i = 0.0; i < 64.0; i = i + 1.0) {
+        float mx = camX + rdX * t;
+        float my = camY + rdY * t;
+        float mz = camZ + rdZ * t;
+
+        # Ground plane
+        float dGround = my;
+
+        # Car body: box 1.2 x 0.4 x 0.6, centered at (carX, 0.4, 0)
+        float dBody = max(max(abs(mx - carX) - 1.2, abs(my - 0.4) - 0.4), abs(mz - carZ) - 0.6);
+
+        # Car cabin: box 0.6 x 0.25 x 0.5, centered at (carX-0.15, 0.85, 0)
+        float dCabin = max(max(abs(mx - carX + 0.15) - 0.6, abs(my - 0.85) - 0.25), abs(mz - carZ) - 0.5);
+
+        # Front wheels (two spheres mirrored in Z)
+        float w1d = sqrt((mx-carX+0.7)*(mx-carX+0.7) + (my-0.2)*(my-0.2) + (abs(mz-carZ)-0.65)*(abs(mz-carZ)-0.65)) - 0.2;
+
+        # Rear wheels
+        float w2d = sqrt((mx-carX-0.7)*(mx-carX-0.7) + (my-0.2)*(my-0.2) + (abs(mz-carZ)-0.65)*(abs(mz-carZ)-0.65)) - 0.2;
+
+        float dWheels = min(w1d, w2d);
+        float dCar = min(dBody, dCabin);
+
+        # Buildings: repeating boxes along Z, on both sides of the road
+        float repZ = mz + 3.0;
+        float cellZ = repZ - floor(repZ / 6.0) * 6.0 - 3.0;
+        float bldgH = 2.0 + sin(floor(repZ / 6.0) * 3.7) * 1.2;
+        float dBldg = max(max(abs(abs(mx) - 5.5) - 1.3, abs(my - bldgH) - bldgH), abs(cellZ) - 2.2);
+
+        # Find nearest
+        float d1 = min(dGround, dCar);
+        float d2 = min(dWheels, dBldg);
+        float dScene = min(d1, d2);
+
+        # Determine hitID: 1=ground, 2=car, 3=wheel, 4=building
+        # Use strict priority: smallest distance wins
+        hitID = 1.0;
+        if (dCar < dGround) { hitID = 2.0; }
+        if (dWheels < dCar && dWheels < dGround) { hitID = 3.0; }
+        if (dBldg < dCar && dBldg < dWheels && dBldg < dGround) { hitID = 4.0; }
+
+        t = t + dScene * 0.7;
+        if (dScene < 0.004) { i = 99.0; }
+        if (t > 35.0) { i = 99.0; }
+    }
+
+    float hitAny = step(0.5, step(t, 34.0));
+
+    # ── Hit point ─────────────────────────────────────────────────────────────
+    float hx = camX + rdX * t;
+    float hy = camY + rdY * t;
+    float hz = camZ + rdZ * t;
+
+    # ── Material flags ────────────────────────────────────────────────────────
+    float isGnd = step(abs(hitID - 1.0), 0.1);
+    float isCar = step(abs(hitID - 2.0), 0.1);
+    float isWhl = step(abs(hitID - 3.0), 0.1);
+    float isBld = step(abs(hitID - 4.0), 0.1);
+
+    # ── Normals ───────────────────────────────────────────────────────────────
+    # Ground: up
+    float nx = isGnd * 0.0;
+    float ny = isGnd * 1.0;
+    float nz = isGnd * 0.0;
+
+    # Car body: box normal (dominant axis)
+    float abx = abs(hx - carX) / 1.2;
+    float aby = abs(hy - 0.4) / 0.4;
+    float abz = abs(hz - carZ) / 0.6;
+    float cNx = step(aby, abx) * step(abz, abx) * sign(hx - carX);
+    float cNy = step(abx, aby) * step(abz, aby) * sign(hy - 0.4);
+    float cNz = step(abx, abz) * step(aby, abz) * sign(hz - carZ);
+    nx = nx + isCar * cNx;
+    ny = ny + isCar * cNy;
+    nz = nz + isCar * cNz;
+
+    # Wheels: sphere normal
+    float wSel = step(hx, carX);
+    float wcX = carX + 0.7 * (2.0 * wSel - 1.0);
+    float wdx = hx - wcX;
+    float wdy = hy - 0.2;
+    float wdz = hz - carZ;
+    float wL = sqrt(wdx*wdx + wdy*wdy + wdz*wdz) + 0.001;
+    nx = nx + isWhl * wdx / wL;
+    ny = ny + isWhl * wdy / wL;
+    nz = nz + isWhl * wdz / wL;
+
+    # Buildings: box normal (dominant axis)
+    float bbx = abs(abs(hx) - 5.5) / 1.3;
+    float bby = hy / 4.0;
+    float repZ = hz + 3.0;
+    float cellZ = repZ - floor(repZ / 6.0) * 6.0 - 3.0;
+    float bbz = abs(cellZ) / 2.2;
+    float bNx = step(bby, bbx) * step(bbz, bbx) * sign(abs(hx) - 5.5) * sign(hx);
+    float bNy = step(bbx, bby) * step(bbz, bby);
+    float bNz = step(bbx, bbz) * step(bby, bbz) * sign(cellZ);
+    nx = nx + isBld * bNx;
+    ny = ny + isBld * bNy;
+    nz = nz + isBld * bNz;
+
+    float nL = sqrt(nx*nx + ny*ny + nz*nz) + 0.001;
+    nx = nx / nL;
+    ny = ny / nL;
+    nz = nz / nL;
+
+    # ── Materials ─────────────────────────────────────────────────────────────
+    # Ground: dark asphalt road in center, sidewalk on sides
+    float onRoad = step(abs(hz), 3.0);
+    float laneM = fract(hx * 0.3 + 0.5);
+    float lane = step(abs(hz), 0.08) * step(0.3, laneM) * step(laneM, 0.7);
+
+    float gR = mix(0.35, 0.22, onRoad) + lane * 0.55;
+    float gG = mix(0.33, 0.22, onRoad) + lane * 0.55;
+    float gB = mix(0.28, 0.20, onRoad) + lane * 0.45;
+
+    # Car: bright red body
+    float carR = 0.88;
+    float carG = 0.10;
+    float carB = 0.08;
+
+    # Wheels: dark rubber
+    float whlR = 0.12;
+    float whlG = 0.12;
+    float whlB = 0.12;
+
+    # Buildings: warm concrete with variation per building
+    float bldgSeed = floor((hz + 3.0) / 6.0);
+    float bVar = sin(bldgSeed * 5.1) * 0.08;
+    float bR = 0.60 + bVar;
+    float bG = 0.55 + bVar;
+    float bB = 0.50 + bVar;
+    # Window pattern on front faces
+    float winX = fract(hx * 1.5);
+    float winY = fract(hy * 2.0);
+    float isWin = step(0.15, winX) * step(winX, 0.85) * step(0.15, winY) * step(winY, 0.75);
+    float onFront = step(0.5, abs(bNz));
+    bR = mix(bR, 0.25, isWin * onFront);
+    bG = mix(bG, 0.30, isWin * onFront);
+    bB = mix(bB, 0.40, isWin * onFront);
+
+    float matR = isGnd * gR + isCar * carR + isWhl * whlR + isBld * bR;
+    float matG = isGnd * gG + isCar * carG + isWhl * whlG + isBld * bG;
+    float matB = isGnd * gB + isCar * carB + isWhl * whlB + isBld * bB;
+
+    # ── Lighting ──────────────────────────────────────────────────────────────
+    float sunX = 0.4;
+    float sunY = 0.8;
+    float sunZ = -0.4;
+    float sLen = sqrt(sunX*sunX + sunY*sunY + sunZ*sunZ);
+    float diff = clamp(nx*sunX/sLen + ny*sunY/sLen + nz*sunZ/sLen, 0.0, 1.0);
+    float light = diff * 0.65 + 0.35;
+
+    float fr = matR * light;
+    float fg = matG * light;
+    float fb = matB * light;
+
+    # ── Headlight glow ────────────────────────────────────────────────────────
+    float hlX = carX + 1.25;
+    float hlY = 0.4;
+    float dhl1 = sqrt((hx-hlX)*(hx-hlX) + (hy-hlY)*(hy-hlY) + (hz-0.35)*(hz-0.35));
+    float dhl2 = sqrt((hx-hlX)*(hx-hlX) + (hy-hlY)*(hy-hlY) + (hz+0.35)*(hz+0.35));
+    float glow = 0.12 / (dhl1 * dhl1 + 0.06) + 0.12 / (dhl2 * dhl2 + 0.06);
+    glow = glow * hitAny;
+    fr = fr + glow * 1.0;
+    fg = fg + glow * 0.9;
+    fb = fb + glow * 0.5;
+
+    # ── Tail lights (red glow at rear) ────────────────────────────────────────
+    float tlX = carX - 1.25;
+    float dtl1 = sqrt((hx-tlX)*(hx-tlX) + (hy-0.45)*(hy-0.45) + (hz-0.45)*(hz-0.45));
+    float dtl2 = sqrt((hx-tlX)*(hx-tlX) + (hy-0.45)*(hy-0.45) + (hz+0.45)*(hz+0.45));
+    float tglow = 0.06 / (dtl1 * dtl1 + 0.04) + 0.06 / (dtl2 * dtl2 + 0.04);
+    tglow = tglow * hitAny;
+    fr = fr + tglow * 1.0;
+    fg = fg + tglow * 0.05;
+    fb = fb + tglow * 0.02;
+
+    # ── Distance fog + sky ────────────────────────────────────────────────────
+    float fogF = clamp(t / 28.0, 0.0, 1.0);
+    fogF = fogF * fogF;
+    float skyHt = 0.5 + 0.4 * rdY;
+    float sR = mix(0.55, 0.20, skyHt);
+    float sG = mix(0.60, 0.30, skyHt);
+    float sB = mix(0.72, 0.60, skyHt);
+
+    fr = mix(fr * hitAny, sR, fogF) + (1.0 - hitAny) * sR;
+    fg = mix(fg * hitAny, sG, fogF) + (1.0 - hitAny) * sG;
+    fb = mix(fb * hitAny, sB, fogF) + (1.0 - hitAny) * sB;
+
+    FragColor = vec4(clamp(fr, 0.0, 1.0), clamp(fg, 0.0, 1.0), clamp(fb, 0.0, 1.0), 1.0);
+}

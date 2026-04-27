@@ -126,12 +126,23 @@ fn void main() {
     float fg = (matG*(diff*0.85 + ambG) + spec*0.28) * hitAny;
     float fb = (matB*(diff*0.85 + ambB) + spec*0.25) * hitAny;
 
-    # ── Sky gradient ──────────────────────────────────────────────────────────
-    float sky = 1.0 - hitAny;
+    # ── Distance fog ──────────────────────────────────────────────────────────
+    float fogDist = clamp(tmin / 12.0, 0.0, 1.0);
+    float fog = fogDist * fogDist;
     float sg = 0.5 + 0.5*rdY;
-    fr = fr + sky*mix(0.75, 0.10, sg);
-    fg = fg + sky*mix(0.82, 0.25, sg);
-    fb = fb + sky*mix(0.92, 0.55, sg);
+    float skyR = mix(0.75, 0.10, sg);
+    float skyG = mix(0.82, 0.25, sg);
+    float skyB = mix(0.92, 0.55, sg);
+
+    fr = mix(fr, skyR, fog * hitAny);
+    fg = mix(fg, skyG, fog * hitAny);
+    fb = mix(fb, skyB, fog * hitAny);
+
+    # ── Sky gradient (miss) ───────────────────────────────────────────────────
+    float sky = 1.0 - hitAny;
+    fr = fr + sky*skyR;
+    fg = fg + sky*skyG;
+    fb = fb + sky*skyB;
 
     FragColor = vec4(clamp(fr,0.0,1.0), clamp(fg,0.0,1.0), clamp(fb,0.0,1.0), 1.0);
 }
