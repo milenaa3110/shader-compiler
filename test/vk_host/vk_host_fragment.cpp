@@ -1,12 +1,13 @@
 // vk_host_fragment.cpp — Vulkan offscreen animation renderer using SPIR-V shaders.
 // Executes via LavaPipe (Mesa CPU Vulkan) without a display.
-// Renders 60 frames of plasma animation, writes result/anim_spirv_NNN.ppm,
-// then encodes result/anim_spirv.mp4 via ffmpeg.
+// Renders NFRAMES frames of plasma animation (default 300 → 10 s at 30 fps),
+// streams raw RGB to ffmpeg → result/<name>.mp4.
 //
 // Build: see Makefile target anim-spirv-vulkan
 // Requires: libvulkan-dev, LavaPipe ICD (libvulkan_lvp.so already present)
 
 #include <vulkan/vulkan.h>
+#include "../../error_utils_fmt.h"
 
 #include <vector>
 #include <fstream>
@@ -20,14 +21,14 @@
 
 static constexpr VkFormat COLOR_FMT = VK_FORMAT_R8G8B8A8_UNORM;
 // Runtime parameters (overridden from argv)
-static int W = 512, H = 512, NFRAMES = 60;
+static int W = 512, H = 512, NFRAMES = 300;
 static float FPS = 30.f;
 
 // ---------- helpers ----------
 
 static void check(VkResult r, const char* where) {
     if (r != VK_SUCCESS) {
-        std::cerr << "Vulkan error " << r << " at " << where << "\n";
+        logErrorFmt("Vulkan error {} at {}", (int)r, where);
         std::exit(1);
     }
 }
@@ -35,7 +36,10 @@ static void check(VkResult r, const char* where) {
 
 static std::vector<uint32_t> readSpv(const char* path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) { std::cerr << "Cannot open " << path << "\n"; std::exit(1); }
+    if (!f) {
+        logErrorFmt("Cannot open {}", path);
+        std::exit(1);
+    }
     size_t sz = f.tellg(); f.seekg(0);
     std::vector<uint32_t> data(sz / 4);
     f.read(reinterpret_cast<char*>(data.data()), sz);
@@ -84,7 +88,7 @@ int main(int argc, char** argv) {
     // ── Physical device (pick first — LavaPipe on headless) ───────────────────
     uint32_t devCount = 0;
     vkEnumeratePhysicalDevices(instance, &devCount, nullptr);
-    if (devCount == 0) { std::cerr << "No Vulkan device found.\n"; return 1; }
+    if (devCount == 0) { logError("No Vulkan device found"); return 1; }
     std::vector<VkPhysicalDevice> physDevs(devCount);
     vkEnumeratePhysicalDevices(instance, &devCount, physDevs.data());
     VkPhysicalDevice physDev = physDevs[0];
@@ -103,7 +107,7 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < qFamilyCount; ++i) {
         if (qFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { qFamilyIdx = i; break; }
     }
-    if (qFamilyIdx == UINT32_MAX) { std::cerr << "No graphics queue.\n"; return 1; }
+    if (qFamilyIdx == UINT32_MAX) { logError("No graphics queue"); return 1; }
 
     float qPriority = 1.f;
     VkDeviceQueueCreateInfo qCI{};
@@ -147,7 +151,7 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
             if ((typeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & flags) == flags)
                 return i;
-        std::cerr << "No suitable memory type.\n"; std::exit(1);
+        logError("No suitable memory type"); std::exit(1);
     };
 
     VkMemoryAllocateInfo imgAlloc{};
@@ -531,7 +535,7 @@ int main(int argc, char** argv) {
         // Pipe raw RGB frame to ffmpeg (open pipe on first frame)
         if (!ffpipe) {
             ffpipe = popen(ff_cmd, "w");
-            if (!ffpipe) { std::cerr << "Cannot open ffmpeg pipe\n"; std::exit(1); }
+            if (!ffpipe) { logError("Cannot open ffmpeg pipe"); std::exit(1); }
         }
         writeFrameRGB(ffpipe, W, H, pixels.data());
         std::cout << "[" << animName << "] frame " << frame

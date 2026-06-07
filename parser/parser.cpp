@@ -1,6 +1,7 @@
 #include "parser.h"
-#include "../error_utils.h"
-#include <memory>
+#include "../ast/ast_context.h"
+#include "../error_utils_fmt.h"
+#include "../lexer/lexer.h"
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -9,286 +10,229 @@
 #include <vector>
 #include <fmt/core.h>
 
-// Forward declarations for accessing codegen state
-extern std::unordered_set<std::string> StructTypes;
-extern std::unordered_map<std::string, std::vector<std::string>> StructDependencies;
+// Defines all built-in types usable for variables, fields, and parameters.
+// Uses the X-Macro pattern to automatically sync type checking (isTypeTok),
+// string conversion (tokToTypeName), and AST construction across the parser.
+//
+// 'Void' is omitted on purpose: it is only a valid function return type,
+// never a value-bearing declaration, and is handled separately.
+#define TYPE_TOKENS(X) \
+    X(Double, "double") X(Float, "float") X(Int, "int") X(Uint, "uint") X(Bool, "bool") \
+    X(Vec2, "vec2") X(Vec3, "vec3") X(Vec4, "vec4") \
+    X(Mat2, "mat2") X(Mat2x3, "mat2x3") X(Mat2x4, "mat2x4") \
+    X(Mat3, "mat3") X(Mat3x2, "mat3x2") X(Mat3x4, "mat3x4") \
+    X(Mat4, "mat4") X(Mat4x2, "mat4x2") X(Mat4x3, "mat4x3") \
+    X(Uvec2, "uvec2") X(Uvec3, "uvec3") X(Uvec4, "uvec4") \
+    X(Ivec2, "ivec2") X(Ivec3, "ivec3") X(Ivec4, "ivec4") \
+    X(Sampler2D, "sampler2D") X(Sampler3D, "sampler3D") X(SamplerCube, "samplerCube") \
+    X(Image2D, "image2D")
 
 class Parser {
 public:
-    // take next token from lexer
-    int next() {
-        Cur = gettok();
-        return peek();
+    Parser(ASTContext& ctx, std::string_view source) : Ctx(ctx), Lex(source) {
+        // LL(2) sliding window.
+        Cur  = Lex.next();
+        Next = Lex.next();
     }
 
-    // peek at Parser::peek() current token
-    int peek() const { return Cur; }
+    TokenKind next() {
+        Cur  = Next;
+        Next = Lex.next();
+        return Cur.kind;
+    }
 
-    std::vector<std::unique_ptr<ExprAST> > ParseProgram();
+    // Kind of the token the parser is currently looking at.
+    TokenKind peek() const { return Cur.kind; }
 
-    std::unique_ptr<ExprAST> parseStruct();
+    // Kind of the token after cur
+    TokenKind peekNext() const { return Next.kind; }
 
-    std::unique_ptr<ExprAST> parseFunction();
+    // Logs a syntax error at the current token position. 
+    // Caps error output at 'kMaxErrors' to prevent terminal spam.
+    // Returns std::nullptr_t so it can be chained directly as 'return error("...");'
+    // in AST parsing functions that return pointers.
+    std::nullptr_t error(const std::string& msg) {
+        if (errorCount_ < kMaxErrors) {
+            logErrorAt(Cur.line, Cur.col, msg);
+            ++errorCount_;
+        } else if (errorCount_ == kMaxErrors) {
+            logErrorAt(Cur.line, Cur.col,
+                       "too many parse errors; remaining errors suppressed");
+            ++errorCount_;
+        }
+        return nullptr;
+    }
 
+    // Panic-mode recovery: advance until we hit a token that's likely to
+    // begin a fresh, well-formed construct. Used after a parse failure to
+    // skip the rest of the broken statement / top-level item and resume
+    // parsing — gives the user *all* their errors in one compile.
+    void synchronize() {
+        while (peek() != TokenKind::Eof) {
+            if (peek() == TokenKind::Semicolon) { next(); return; }
+            if (peek() == TokenKind::Rbrace)    { next(); return; }
+            // Don't consume — these *start* the next construct.
+            if (peek() == TokenKind::Fn     ||
+                peek() == TokenKind::Struct ||
+                peek() == TokenKind::At) {
+                return;
+            }
+            next();
+        }
+    }
+
+    int errorCount() const { return errorCount_; }
+
+    // Stamp a freshly-built AST node with a source position and return it.
+    // Takes a raw pointer (the ASTContext owns the storage); a null pointer
+    // passes through unchanged for the "log error, return nullptr" pattern.
+    template <class T>
+    static T* at(T* n, int line, int col) {
+        if (n) { n->line = line; n->col = col; }
+        return n;
+    }
+
+    // RAII position-stamper. Construct at the start of a parse method to
+    // snapshot the current token's (line, col); call stamp(node) at every
+    // return point to stamp without rewriting `int _sl=…, _sc=…; … at(node,
+    // _sl, _sc)` boilerplate. Stays a no-op for null nodes, matching at().
+    class ScopedLoc {
+     public:
+        explicit ScopedLoc(const Parser& p) : line_(p.Cur.line), col_(p.Cur.col) {}
+        template <class T>
+        T* stamp(T* n) const { return Parser::at(n, line_, col_); }
+        int line() const { return line_; }
+        int col()  const { return col_;  }
+     private:
+        int line_;
+        int col_;
+    };
+
+    std::vector<ExprAST*> ParseProgram();
+
+    ExprAST* parseStruct();
+    ExprAST* parseFunction();
     std::optional<FunctionAttrs> parseFunctionAttrs();
-    
-    static std::optional<ShaderStage> stageFromTok(int tok);
+    static std::optional<ShaderStage> stageFromTok(TokenKind tok);
+    ExprAST* parseStatement();
+    ExprAST* parseBlockExpr();
+    ExprAST* parseIfExpr();
+    ExprAST* parseWhile();
+    ExprAST* parseFor();
+    ExprAST* parseReturn();
+    ExprAST* parseBreak();
+    ExprAST* parseStageVarDecl(bool isInput, int binding = -1);
+    ExprAST* parseContinue();
+    ExprAST* parseDiscard();
+    ExprAST* parseUniform(int binding = -1);
+    ExprAST* parseStorageBuffer(int binding = -1);
+    ExprAST* parseVarDecl();
 
-    std::unique_ptr<ExprAST> parseStatement();
+    // Parse an assignment / compound-assignment / postfix / expression
+    // statement. With `consumeSemi=true` (default, statement context) the
+    // trailing `;` is required and consumed; with `consumeSemi=false`
+    // (used by parseFor for the increment slot, which is terminated by
+    // `)`) no `;` is expected.
+    ExprAST* parseAssignmentOrExprStatement(bool consumeSemi = true);
 
-    std::unique_ptr<ExprAST> parseBlockExpr();
-
-    std::unique_ptr<ExprAST> parseIfExpr();
-
-    std::unique_ptr<ExprAST> parseWhile();
-
-    std::unique_ptr<ExprAST> parseFor();
-
-    std::unique_ptr<ExprAST> parseReturn();
-
-    std::unique_ptr<ExprAST> parseBreak();
-    std::unique_ptr<ExprAST> parseStageVarDecl(bool isInput, int binding = -1);
-    std::unique_ptr<ExprAST> parseContinue();
-    std::unique_ptr<ExprAST> parseDiscard();
-    std::unique_ptr<ExprAST> parseUniform(int binding = -1);
-    
-    std::unique_ptr<ExprAST> parseStorageBuffer(int binding = -1);
-
-    std::unique_ptr<ExprAST> parseVarDecl();
-
-    std::unique_ptr<ExprAST> parseAssignmentOrExprStatement();
-
-    std::unique_ptr<ExprAST> parseExpression();
-
-    std::unique_ptr<ExprAST> parseUnary();
-
-    std::unique_ptr<ExprAST> parsePrimary();
-
-    std::unique_ptr<ExprAST> parseNumberExpr();
-
-    std::unique_ptr<ExprAST> parseIdentifierOrCtorExpr();
-
-    std::unique_ptr<ExprAST> parsePostfixAfterIdent(std::unique_ptr<ExprAST> base);
-
-    std::unique_ptr<ExprAST> parseBinOpRHS(int exprPrecedence, std::unique_ptr<ExprAST> lhs);
+    ExprAST* parseExpression();
+    ExprAST* parseUnary();
+    ExprAST* parsePrimary();
+    ExprAST* parseNumberExpr();
+    ExprAST* parseIdentifierOrCtorExpr();
+    ExprAST* parsePostfixAfterIdent(ExprAST* base);
+    ExprAST* parseBinOpRHS(int exprPrecedence, ExprAST* lhs);
 
 private:
-    // Parser::peek()rent token the parser is looking at
-    int Cur = 0;
+    ASTContext& Ctx;  // arena that owns every node this parser builds
+    Lexer Lex;        // buffer-backed scanner
+    Token Cur;        // the token the parser is currently looking at
+    Token Next;       // one-token lookahead (token *after* Cur)
 
-    // check if token is a type token (e.g., int, float, vec3, etc.)
-    static bool isTypeTok(const int tok) {
+    // Cap on emitted diagnostics; further errors are suppressed with one
+    // "too many errors" notice so a broken file can't drown the terminal.
+    static constexpr int kMaxErrors = 20;
+    int errorCount_ = 0;
+
+    // Single source of truth for type-keyword tokens — see TYPE_TOKENS
+    // above. Adding a type is one X(...) line in TYPE_TOKENS; this switch,
+    // tokToTypeName, and parsePrimary's constructor case all expand from it.
+    static bool isTypeTok(TokenKind tok) {
         switch (tok) {
-            case tok_vec2: case tok_vec3: case tok_vec4:
-            case tok_double: case tok_float: case tok_int: case tok_uint: case tok_bool:
-            case tok_mat2: case tok_mat3: case tok_mat4:
-            case tok_mat2x3: case tok_mat2x4: case tok_mat3x2:
-            case tok_mat3x4: case tok_mat4x2: case tok_mat4x3:
-            case tok_uvec2: case tok_uvec3: case tok_uvec4:
-            case tok_ivec2: case tok_ivec3: case tok_ivec4:
-            case tok_sampler2D: case tok_sampler3D: case tok_samplerCube:
-            case tok_image2D:
+#define X(Tok, _Name) case TokenKind::Tok:
+            TYPE_TOKENS(X)
+#undef X
                 return true;
             default: return false;
         }
     }
 
-    // get precedence of binary operators
-    static int precedence(const int tok) {
+    // get precedence of binary operators (higher binds tighter).
+    // Bitwise levels follow C ordering: | < ^ < & < equality, and the
+    // shifts sit between additive and relational.
+    static int precedence(TokenKind tok) {
         switch (tok) {
-            case tok_or:
+            case TokenKind::Or:
                 return 5;
-            case tok_and:
+            case TokenKind::And:
                 return 6;
-            case tok_less:
-            case tok_less_equal:
-            case tok_greater:
-            case tok_greater_equal:
-            case tok_equal:
-            case tok_not_equal:
+            case TokenKind::BitwiseOr:
+                return 7;
+            case TokenKind::BitwiseXor:
+                return 8;
+            case TokenKind::BitwiseAnd:
+                return 9;
+            case TokenKind::Less:
+            case TokenKind::LessEqual:
+            case TokenKind::Greater:
+            case TokenKind::GreaterEqual:
+            case TokenKind::Equal:
+            case TokenKind::NotEqual:
                 return 10;
-            case tok_plus:
-            case tok_minus:
-            case '+':
-            case '-':
+            case TokenKind::ShiftLeft:
+            case TokenKind::ShiftRight:
+                return 15;
+            case TokenKind::Plus:
+            case TokenKind::Minus:
                 return 20;
-            case tok_multiply:
-            case tok_divide:
-            case '*':
-            case '/':
-            case '%':
+            case TokenKind::Multiply:
+            case TokenKind::Divide:
+            case TokenKind::Percent:
                 return 40;
             default:
                 return -1;
         }
     }
 
-    // map token to type name string
-    static std::string_view tokToTypeName(const int tok) {
+    // Map a type-keyword token to its spelling. Drives both name-emission
+    // for declared variables and the parsePrimary constructor switch.
+    // Void is the one type-keyword not in TYPE_TOKENS (it's not a value
+    // type), so it gets its own case.
+    static std::string_view tokToTypeName(TokenKind tok) {
         switch (tok) {
-            case tok_vec2: return "vec2";
-            case tok_vec3: return "vec3";
-            case tok_vec4: return "vec4";
-            case tok_double: return "double";
-            case tok_float: return "float";
-            case tok_int: return "int";
-            case tok_uint: return "uint";
-            case tok_bool: return "bool";
-            case tok_mat2: return "mat2";
-            case tok_mat3: return "mat3";
-            case tok_mat4: return "mat4";
-            case tok_mat2x3: return "mat2x3";
-            case tok_mat2x4: return "mat2x4";
-            case tok_mat3x2: return "mat3x2";
-            case tok_mat3x4: return "mat3x4";
-            case tok_mat4x2: return "mat4x2";
-            case tok_mat4x3: return "mat4x3";
-            case tok_uvec2: return "uvec2";
-            case tok_uvec3: return "uvec3";
-            case tok_uvec4: return "uvec4";
-            case tok_ivec2: return "ivec2";
-            case tok_ivec3: return "ivec3";
-            case tok_ivec4: return "ivec4";
-            case tok_sampler2D:   return "sampler2D";
-            case tok_sampler3D:   return "sampler3D";
-            case tok_samplerCube: return "samplerCube";
-            case tok_image2D:     return "image2D";
-            case tok_void: return "void";
+#define X(Tok, Name) case TokenKind::Tok: return Name;
+            TYPE_TOKENS(X)
+#undef X
+            case TokenKind::Void: return "void";
             default: return "";
         }
     }
 
-    // map token to its name string
-    static std::string getTokName(const int tok) {
-        switch (tok) {
-            case tok_eof: return "EOF";
-            case tok_identifier: return "IDENTIFIER";
-            case tok_number: return "NUMBER";
-            case tok_if: return "IF";
-            case tok_else: return "ELSE";
-            case tok_while: return "WHILE";
-            case tok_for: return "FOR";
-            case tok_break: return "BREAK";
-            case tok_vec2: return "VEC2";
-            case tok_vec3: return "VEC3";
-            case tok_vec4: return "VEC4";
-            case tok_double: return "DOUBLE";
-            case tok_float: return "FLOAT";
-            case tok_int: return "INT";
-            case tok_uint: return "UINT";
-            case tok_bool: return "BOOL";
-            case tok_true: return "TRUE";
-            case tok_false: return "FALSE";
-            case tok_mat2: return "MAT2";
-            case tok_mat3: return "MAT3";
-            case tok_mat4: return "MAT4";
-            case tok_mat2x3: return "MAT2X3";
-            case tok_mat2x4: return "MAT2X4";
-            case tok_mat3x2: return "MAT3X2";
-            case tok_mat3x4: return "MAT3X4";
-            case tok_mat4x2: return "MAT4X2";
-            case tok_mat4x3: return "MAT4X3";
-            case tok_plus: return "PLUS";
-            case tok_assign: return "ASSIGN";
-            case tok_lparen: return "LPAREN";
-            case tok_rparen: return "RPAREN";
-            case tok_comma: return "COMMA";
-            case tok_semicolon: return "SEMICOLON";
-            case tok_lbrace: return "LBRACE";
-            case tok_rbrace: return "RBRACE";
-            case tok_dot: return "DOT";
-            case tok_minus: return "MINUS";
-            case tok_multiply: return "MULTIPLY";
-            case tok_divide: return "DIVIDE";
-            case tok_greater: return "GREATER";
-            case tok_greater_equal: return "GREATER_EQUAL";
-            case tok_less: return "LESS";
-            case tok_less_equal: return "LESS_EQUAL";
-            case tok_equal: return "EQUAL";
-            case tok_not_equal: return "NOT_EQUAL";
-            case tok_lbracket: return "LBRACKET";
-            case tok_rbracket: return "RBRACKET";
-            case tok_return: return "RETURN";
-            case tok_fn: return "FN";
-            case tok_and: return "AND";
-            case tok_or: return "OR";
-            case tok_struct: return "STRUCT";
-            case tok_uniform: return "UNIFORM";
-            case tok_void: return "VOID";
-            case tok_invalid_number: return "INVALID_NUMBER";
-            default:
-                if (tok >= 0 && tok <= 127) {
-                    return std::string(1, static_cast<char>(tok));
-                }
-                return "UNKNOWN(" + std::to_string(tok) + ")";
-        }
+    // Human-readable name for a token, for diagnostics.
+    static std::string getTokName(TokenKind tok) {
+        return tokenKindName(tok);
     }
 
-    // check if a name is a user-defined struct type
-    bool isUserTypeName(const std::string &name) const {
-        return StructTypes.find(name) != StructTypes.end();
-    }
-
-    // check for recursive struct definitions using DFS cycle detection
-    bool hasRecursiveStructs(const std::string &structName, 
-                            const std::vector<std::pair<std::string, std::string>>& fields) {
-        // extract user-defined type dependencies from fields
-        std::vector<std::string> dependencies;
-        for (const auto& [fieldType, fieldName] : fields) {
-            if (isUserTypeName(fieldType)) {
-                dependencies.push_back(fieldType);
-            }
-        }
-
-        // if no dependencies, no recursion possible
-        if (dependencies.empty()) {
-            return false;
-        }
-
-        // store dependencies for this struct
-        StructDependencies[structName] = dependencies;
-
-        // perform DFS cycle detection
-        std::unordered_set<std::string> visited;
-        std::unordered_set<std::string> recStack;
-        
-        return hasCycleDFS(structName, visited, recStack);
-    }
-
-    // DFS helper to detect cycles in struct dependency graph
-    bool hasCycleDFS(const std::string& structName,
-                    std::unordered_set<std::string>& visited,
-                    std::unordered_set<std::string>& recStack) const {
-        // mark current node as visited and add to recursion stack
-        visited.insert(structName);
-        recStack.insert(structName);
-
-        // check all dependencies
-        auto it = StructDependencies.find(structName);
-        if (it != StructDependencies.end()) {
-            for (const auto& dependency : it->second) {
-                // if dependency not visited, recurse
-                if (visited.find(dependency) == visited.end()) {
-                    if (hasCycleDFS(dependency, visited, recStack)) {
-                        return true;
-                    }
-                }
-                // if dependency is in recursion stack, we found a cycle
-                else if (recStack.find(dependency) != recStack.end()) {
-                    return true;
-                }
-            }
-        }
-
-        // remove from recursion stack before returning
-        recStack.erase(structName);
-        return false;
-    }
+    // ── Type validation moved to SemanticAnalyzer ─────────────────────────
+    // The parser no longer owns `isUserTypeName` / struct-cycle detection.
+    // It accepts any `Identifier` where a type is expected; SemanticAnalyzer
+    // walks the AST after parsing and reports unknown types / recursive
+    // struct definitions against the *complete* program.
 
     // parse index expression inside brackets: '[' expression ']' - helper function
-    std::unique_ptr<ExprAST> parseBracketIndex() {
-        if (Parser::peek() != tok_lbracket) {
-            logError("Expected '[' for index expression");
+    ExprAST* parseBracketIndex() {
+        if (peek() != TokenKind::Lbracket) {
+            error("Expected '[' for index expression");
             return nullptr;
         }
         next();
@@ -296,184 +240,216 @@ private:
         auto idx = parseExpression();
         if (!idx) return nullptr;
 
-        if (Parser::peek() != tok_rbracket) {
-            logError("Expected ']' after index expression");
+        if (peek() != TokenKind::Rbracket) {
+            error("Expected ']' after index expression");
             return nullptr;
         }
 
         next();
         return idx;
     }
+
+    // Parse a positive integer literal in `[1, 65536]`. The parser is
+    // positioned at the size token; consumes it and returns the value, or
+    // -1 with an error already emitted. Shared by parseVarDecl and
+    // parseUniform's array suffixes.
+    int parseArraySize() {
+        if (peek() != TokenKind::Number) {
+            error("Expected array size");
+            return -1;
+        }
+        if (Cur.num < 1.0 || Cur.num > 65536.0) {
+            error(fmt::format("Array size must be between 1 and 65536, got {}",
+                              (long long)Cur.num));
+            return -1;
+        }
+        int sz = static_cast<int>(Cur.num);
+        next();
+        return sz;
+    }
 };
 
-// Parse program
-std::vector<std::unique_ptr<ExprAST> > Parser::ParseProgram() {
-    std::vector<std::unique_ptr<ExprAST> > program;
+// Parse program.
+//
+// Contextual-keyword convention (intentional split):
+//   * Annotation-style attributes — `@entry`, `@stage`, `@compute`,
+//     `@vertex`, `@fragment` — are real lexer tokens because they form a
+//     closed, parser-relevant set.
+//   * Descriptor-set qualifiers — `layout`, `binding`, `std430`,
+//     `workgroup_size` — are matched as identifier *text*. The set is
+//     open-ended (any future qualifier slots in without a lexer change)
+//     and ignoring an unknown qualifier is benign.
+// Don't unify the two without first auditing every `Cur.text == "..."`
+// site below.
+std::vector<ExprAST*> Parser::ParseProgram() {
+    std::vector<ExprAST*> program;
     std::unordered_map<ShaderStage, std::string> entryByStage;
-    while (peek() != tok_eof) {
-        std::unique_ptr<ExprAST> stmt = nullptr;
-    if (peek() == tok_at) {
-        auto attrsOpt = parseFunctionAttrs();
-        if (!attrsOpt) {
-            next(); // skip invalid attributes
-            continue;
-        }
+    while (peek() != TokenKind::Eof) {
+        // Swallow stray `}` left over from synchronize() inside a broken
+        // function body — without this, the recovery cascade emits a
+        // spurious "Unknown token '}'" between every real diagnostic.
+        if (peek() == TokenKind::Rbrace) { next(); continue; }
 
-        if (peek() != tok_fn) {
-            logError("Attributes are only allowed before a function ('fn')");
-            while (peek() != tok_fn && peek() != tok_eof) next();
-            continue;
-        }
+        ExprAST* stmt = nullptr;
+        // Snapshot the source position of this top-level construct's first
+        // token; stamped onto whatever node the dispatch below produces.
+        ScopedLoc loc(*this);
 
-        auto fn = parseFunction();
-        if (auto *F = dynamic_cast<FunctionAST*>(fn.get())) {
-            F->Attrs = *attrsOpt;
-        } else {
-            logError("Internal error: expected FunctionAST after parsing function");
-        }
-
-        stmt = std::move(fn);
-        if (auto *F = dynamic_cast<FunctionAST*>(stmt.get())) {
-            if (F->Attrs.isEntry) {
-            ShaderStage st = *F->Attrs.stage;
-            if (entryByStage.count(st)) {
-                logError(fmt::format("Multiple entry points for stage. Already: {}, new: {}",
-                                    entryByStage[st], F->Proto->Name));
-                } else {
-                    entryByStage[st] = F->Proto->Name;
+        if (peek() == TokenKind::At) {
+            auto attrsOpt = parseFunctionAttrs();
+            if (!attrsOpt) {
+                next(); // skip invalid attributes
+                continue;
+            }
+            if (peek() != TokenKind::Fn) {
+                error("Attributes are only allowed before a function ('fn')");
+                while (peek() != TokenKind::Fn && peek() != TokenKind::Eof) next();
+                continue;
+            }
+            auto* fn = parseFunction();
+            if (auto *F = llvm::dyn_cast_or_null<FunctionAST>(fn)) {
+                F->Attrs = *attrsOpt;
+            } else {
+                error("Internal error: expected FunctionAST after parsing function");
+            }
+            stmt = fn;
+            if (auto *F = llvm::dyn_cast_or_null<FunctionAST>(stmt)) {
+                if (F->Attrs.isEntry) {
+                    ShaderStage st = *F->Attrs.stage;
+                    if (entryByStage.count(st)) {
+                        error(fmt::format(
+                            "Multiple entry points for stage. Already: {}, new: {}",
+                            entryByStage[st], F->Proto->Name));
+                    } else {
+                        entryByStage[st] = F->Proto->Name;
+                    }
                 }
             }
-        }
-    }
-    else if (peek() == tok_fn) {
-        stmt = parseFunction();
-    } else if (peek() == tok_in) {
+        } else if (peek() == TokenKind::Fn) {
+            stmt = parseFunction();
+        } else if (peek() == TokenKind::In) {
             stmt = parseStageVarDecl(true);
-        } else if (peek() == tok_out) {
+        } else if (peek() == TokenKind::Out) {
             stmt = parseStageVarDecl(false);
-        } else if (peek() == tok_identifier && IdentifierStr == "layout") {
+        } else if (peek() == TokenKind::Identifier && Cur.text == "layout") {
             // layout(binding=N, ...) uniform/in/out ...
             int binding = -1;
             next(); // 'layout'
-            if (peek() == tok_lparen) {
+            if (peek() == TokenKind::Lparen) {
                 next(); // '('
-                while (peek() != tok_rparen && peek() != tok_eof) {
-                    if (peek() == tok_identifier && IdentifierStr == "binding") {
+                while (peek() != TokenKind::Rparen && peek() != TokenKind::Eof) {
+                    if (peek() == TokenKind::Identifier && Cur.text == "binding") {
                         next();
-                        if (peek() == tok_assign) { next(); if (peek() == tok_number) { binding = (int)NumVal; next(); } }
-                    } else if (peek() == tok_identifier) {
+                        if (peek() == TokenKind::Assign) { next(); if (peek() == TokenKind::Number) { binding = (int)Cur.num; next(); } }
+                    } else if (peek() == TokenKind::Identifier) {
                         next(); // skip unknown key
-                        if (peek() == tok_assign) { next(); if (peek() == tok_number) next(); }
-                    } else if (peek() == tok_comma) { next(); }
+                        if (peek() == TokenKind::Assign) { next(); if (peek() == TokenKind::Number) next(); }
+                    } else if (peek() == TokenKind::Comma) { next(); }
                     else { next(); }
                 }
-                if (peek() == tok_rparen) next();
+                if (peek() == TokenKind::Rparen) next();
             }
-            if (peek() == tok_uniform)      stmt = parseUniform(binding);
-            else if (peek() == tok_in)      stmt = parseStageVarDecl(true, binding);
-            else if (peek() == tok_out)     stmt = parseStageVarDecl(false, binding);
-            else if (peek() == tok_readonly || peek() == tok_writeonly || peek() == tok_buffer)
-                                            stmt = parseStorageBuffer(binding);
+            if (peek() == TokenKind::Uniform)      stmt = parseUniform(binding);
+            else if (peek() == TokenKind::In)      stmt = parseStageVarDecl(true, binding);
+            else if (peek() == TokenKind::Out)     stmt = parseStageVarDecl(false, binding);
+            else if (peek() == TokenKind::Readonly || peek() == TokenKind::Writeonly || peek() == TokenKind::Buffer)
+                                                   stmt = parseStorageBuffer(binding);
             else {
-                logError("Expected 'uniform', 'in', 'out', or 'buffer' after layout(...)");
-                while (peek() != tok_semicolon && peek() != tok_eof) next();
-                if (peek() == tok_semicolon) next();
+                error("Expected 'uniform', 'in', 'out', or 'buffer' after layout(...)");
+                while (peek() != TokenKind::Semicolon && peek() != TokenKind::Eof) next();
+                if (peek() == TokenKind::Semicolon) next();
             }
-        } else if (peek() == tok_uniform) {
+        } else if (peek() == TokenKind::Uniform) {
             stmt = parseUniform();
-        } else if (peek() == tok_struct) {
+        } else if (peek() == TokenKind::Struct) {
             stmt = parseStruct();
         } else {
             stmt = parseStatement();
         }
         if (stmt) {
-            program.push_back(std::move(stmt));
+            program.push_back(loc.stamp(std::move(stmt)));
         } else {
-            logError(fmt::format("Unexpected token at top level: {}", getTokName(peek())));
-            next();
+            // Failed statement: report and skip ahead to a stable boundary
+            // (`;`, `}`, top-level `fn`/`struct`/`@`). Without this, a single
+            // parse error cascades into dozens of follow-on diagnostics.
+            if (errorCount_ == 0) {
+                error(fmt::format("Unexpected token at top level: {}",
+                                  getTokName(peek())));
+            }
+            synchronize();
+            if (errorCount_ >= kMaxErrors) break;
         }
     }
     return program;
 }
 
 // Struct declaration
-std::unique_ptr<ExprAST> Parser::parseStruct() {
+ExprAST* Parser::parseStruct() {
     next(); // 'struct'
-    if (peek() != tok_identifier) {
-        logError("Expected struct name after 'struct'");
+    if (peek() != TokenKind::Identifier) {
+        error("Expected struct name after 'struct'");
         return nullptr;
     }
-    std::string structName = IdentifierStr;
+    std::string structName(Cur.text);
     next(); // struct name
 
-    if (peek() != tok_lbrace) {
-        logError("Expected '{' after struct name");
+    if (peek() != TokenKind::Lbrace) {
+        error("Expected '{' after struct name");
         return nullptr;
     }
     next(); // '{'
     std::vector<std::pair<std::string, std::string> > fields;
     std::unordered_set<std::string> seenFieldNames;
-    while (peek() != tok_rbrace) {
-        if (peek() != tok_identifier && !isTypeTok(peek())) {
-            logError("Expected field type in struct");
+    while (peek() != TokenKind::Rbrace) {
+        if (peek() != TokenKind::Identifier && !isTypeTok(peek())) {
+            error("Expected field type in struct");
             return nullptr;
         }
         std::string fieldType;
         if (isTypeTok(peek())) {
             fieldType = std::string(tokToTypeName(peek()));
         } else {
-            // check if it's a user-defined struct type
-            if (!isUserTypeName(IdentifierStr)) {
-                logError(fmt::format("Unknown type '{}' in struct field", IdentifierStr));
-                return nullptr;
-            }
-            fieldType = IdentifierStr;
+            // Identifier — assumed to be a user struct name; SemanticAnalyzer
+            // will report it if no such struct exists in the program.
+            fieldType = std::string(Cur.text);
         }
         next(); // type
-        if (peek() != tok_identifier) {
-            logError("Expected field name in struct");
+        if (peek() != TokenKind::Identifier) {
+            error("Expected field name in struct");
             return nullptr;
         }
-        std::string fieldName = IdentifierStr;
+        std::string fieldName(Cur.text);
         if (!seenFieldNames.insert(fieldName).second) {
-            logError(fmt::format("Duplicate field name '{}' in struct", fieldName));
+            error(fmt::format("Duplicate field name '{}' in struct", fieldName));
             return nullptr;
         }
         next(); // field name
-        if (peek() != tok_semicolon) {
-            logError("Expected ';' after struct field");
+        if (peek() != TokenKind::Semicolon) {
+            error("Expected ';' after struct field");
             return nullptr;
         }
         next(); // ';'
         fields.emplace_back(fieldType, fieldName);
     }
-    if (peek() != tok_rbrace) {
-        logError("Expected '}' after struct body");
+    if (peek() != TokenKind::Rbrace) {
+        error("Expected '}' after struct body");
         return nullptr;
     }
     next(); // '}'
-    if (peek() != tok_semicolon) {
-        logError("Expected ';' after struct declaration");
+    if (peek() != TokenKind::Semicolon) {
+        error("Expected ';' after struct declaration");
         return nullptr;
     }
     next(); // ';'
 
-    // add to struct types before cycle check (needed for dependency lookup)
-    StructTypes.insert(structName);
-
-    // check for recursive struct definitions (both direct and indirect)
-    if (hasRecursiveStructs(structName, fields)) {
-        logError(fmt::format("Struct '{}' contains recursive definition", structName));
-        StructTypes.erase(structName);
-        StructDependencies.erase(structName);
-        return nullptr;
-    }
-    
-    return std::make_unique<StructDeclExprAST>(structName, std::move(fields));
+    // Struct registration + recursive-definition checking happen in the
+    // semantic pass, against the whole program — so forward references
+    // and out-of-order declarations both Just Work.
+    return Ctx.create<StructDeclExprAST>(structName, std::move(fields));
 }
 
 // Uniform declaration
-std::unique_ptr<ExprAST> Parser::parseUniform(int /*binding*/) {
+ExprAST* Parser::parseUniform(int /*binding*/) {
     next(); // 'uniform'
     std::string type;
 
@@ -482,74 +458,66 @@ std::unique_ptr<ExprAST> Parser::parseUniform(int /*binding*/) {
         type = std::string(tokToTypeName(peek()));
         next(); // type
     }
-    // user-defined struct type
-    else if (peek() == tok_identifier && isUserTypeName(IdentifierStr)) {
-        type = IdentifierStr;
+    // Identifier — assumed to be a user struct name; SemanticAnalyzer validates.
+    else if (peek() == TokenKind::Identifier) {
+        type = std::string(Cur.text);
         next(); // type
     } else {
-        logError("Expected type after 'uniform'");
+        error("Expected type after 'uniform'");
         return nullptr;
     }
 
-    if (peek() != tok_identifier) {
-        logError("Expected uniform name");
+    if (peek() != TokenKind::Identifier) {
+        error("Expected uniform name");
         return nullptr;
     }
-    std::string name = IdentifierStr;
+    std::string name(Cur.text);
     next(); // name
 
     // Check for array syntax
     bool isArray = false;
     int arraySize = 0;
 
-    if (peek() == tok_lbracket) {
+    if (peek() == TokenKind::Lbracket) {
         next(); // '['
         isArray = true;
 
-        if (peek() != tok_number) {
-            logError("Expected array size");
-            return nullptr;
-        }
-        if (NumVal < 1.0 || NumVal > 65536.0) {
-            logError(fmt::format("Array size must be between 1 and 65536, got {}", (int)NumVal));
-            return nullptr;
-        }
-        arraySize = static_cast<int>(NumVal);
-        next(); // number
+        arraySize = parseArraySize();
+        if (arraySize < 0) return nullptr;
 
-        if (peek() != tok_rbracket) {
-            logError("Expected ']' after array size");
+        if (peek() != TokenKind::Rbracket) {
+            error("Expected ']' after array size");
             return nullptr;
         }
         next(); // ']'
     }
 
-    if (peek() != tok_semicolon) {
-        logError("Expected ';' after uniform declaration");
+    if (peek() != TokenKind::Semicolon) {
+        error("Expected ';' after uniform declaration");
         return nullptr;
     }
     next(); // ';'
 
     if (isArray) {
-        return std::make_unique<UniformArrayDeclExprAST>(type, name, arraySize);
+        return Ctx.create<UniformArrayDeclExprAST>(type, name, arraySize);
     }
-    return std::make_unique<UniformDeclExprAST>(type, name);
+    return Ctx.create<UniformDeclExprAST>(type, name);
 }
 
 // Storage buffer declaration (compute shaders)
 // Syntax: layout(std430, binding=N) readonly buffer ElemType name[];
-std::unique_ptr<ExprAST> Parser::parseStorageBuffer(int binding) {
+ExprAST* Parser::parseStorageBuffer(int binding) {
     bool isReadOnly = true;
-    if (peek() == tok_readonly) {
+    if (peek() == TokenKind::Readonly) {
         isReadOnly = true;
         next(); // 'readonly'
-    } else if (peek() == tok_writeonly) {
+    } else if (peek() == TokenKind::Writeonly) {
         isReadOnly = false;
         next(); // 'writeonly'
     }
 
-    if (peek() != tok_buffer) {
-        logError("Expected 'buffer' in storage buffer declaration");
+    if (peek() != TokenKind::Buffer) {
+        error("Expected 'buffer' in storage buffer declaration");
         return nullptr;
     }
     next(); // 'buffer'
@@ -559,120 +527,130 @@ std::unique_ptr<ExprAST> Parser::parseStorageBuffer(int binding) {
     if (isTypeTok(peek())) {
         elemType = std::string(tokToTypeName(peek()));
         next();
-    } else if (peek() == tok_identifier) {
-        elemType = IdentifierStr;
+    } else if (peek() == TokenKind::Identifier) {
+        elemType = std::string(Cur.text);
         next();
     } else {
-        logError("Expected element type in buffer declaration");
+        error("Expected element type in buffer declaration");
         return nullptr;
     }
 
     // Variable name
-    if (peek() != tok_identifier) {
-        logError("Expected buffer variable name");
+    if (peek() != TokenKind::Identifier) {
+        error("Expected buffer variable name");
         return nullptr;
     }
-    std::string name = IdentifierStr;
+    std::string name(Cur.text);
     next(); // name
 
     // Consume unsized [] array suffix
-    if (peek() == tok_lbracket) {
+    if (peek() == TokenKind::Lbracket) {
         next(); // '['
-        if (peek() == tok_rbracket) next(); // ']'
+        if (peek() != TokenKind::Rbracket) {
+            error("Expected ']' in storage buffer array suffix");
+            return nullptr;
+        }
+        next(); // ']'
     }
 
-    // Consume ';'
-    if (peek() == tok_semicolon) next();
+    // Strict `;` — mirrors parseUniform; panic-mode recovery handles
+    // missing terminators uniformly via synchronize().
+    if (peek() != TokenKind::Semicolon) {
+        error("Expected ';' after storage buffer declaration");
+        return nullptr;
+    }
+    next();
 
-    return std::make_unique<StorageBufferDeclAST>(elemType, name, isReadOnly, binding);
+    return Ctx.create<StorageBufferDeclAST>(elemType, name, isReadOnly, binding);
 }
 
 
 // Function definition
-std::unique_ptr<ExprAST> Parser::parseFunction() {
-    if (peek() != tok_fn) {
-        logError("Expected 'fn' at function start");
+ExprAST* Parser::parseFunction() {
+    if (peek() != TokenKind::Fn) {
+        error("Expected 'fn' at function start");
         return nullptr;
     }
     next(); // 'fn'
     std::string ret;
-    if (isTypeTok(peek()) || peek() == tok_void) {
+    if (isTypeTok(peek()) || peek() == TokenKind::Void) {
         ret = std::string(tokToTypeName(peek()));
         next(); // built-in/void
-    } else if (peek() == tok_identifier && isUserTypeName(IdentifierStr)) {
-        // e.g. Hit, Ray, Light...
-        ret = IdentifierStr;
-        next(); // user-defined type
+    } else if (peek() == TokenKind::Identifier) {
+        // e.g. Hit, Ray, Light...  Validated post-parse by SemanticAnalyzer.
+        ret = std::string(Cur.text);
+        next();
     } else {
-        logError("Function must start with return type");
+        error("Function must start with return type");
         return nullptr;
     }
-    if (peek() != tok_identifier) {
-        logError("Expected function name");
+    if (peek() != TokenKind::Identifier) {
+        error("Expected function name");
         return nullptr;
     }
-    std::string name = IdentifierStr;
+    std::string name(Cur.text);
     next(); // function name
-    if (peek() != tok_lparen) {
-        logError("Expected '(' after function name");
+    if (peek() != TokenKind::Lparen) {
+        error("Expected '(' after function name");
         return nullptr;
     }
     next(); // '('
     std::vector<std::pair<std::string, std::string>> params;
-    if (peek() != tok_rparen) {
+    if (peek() != TokenKind::Rparen) {
         while (true) {
             std::string pty;
 
             // === Optional qualifier: in, out, inout ===
-            if (peek() == tok_in || peek() == tok_out || peek() == tok_inout)
+            if (peek() == TokenKind::In || peek() == TokenKind::Out || peek() == TokenKind::Inout)
                 next(); // consume (semantics reserved for future inout pointer passing)
 
             // === PARAM TYPE: built-in or user-defined struct ===
             if (isTypeTok(peek())) {
                 pty = std::string(tokToTypeName(peek()));
                 next();          // e.g. vec3
-            } else if (peek() == tok_identifier && isUserTypeName(IdentifierStr)) {
-                pty = IdentifierStr;
-                next(); // user-defined type
+            } else if (peek() == TokenKind::Identifier) {
+                // User struct name (e.g. Hit, Light). Sema validates.
+                pty = std::string(Cur.text);
+                next();
             } else {
-                logError("Expected param type");
+                error("Expected param type");
                 return nullptr;
             }
 
-            if (peek() != tok_identifier) {
-                logError("Expected param name");
+            if (peek() != TokenKind::Identifier) {
+                error("Expected param name");
                 return nullptr;
             }
-            std::string pname = IdentifierStr;
+            std::string pname(Cur.text);
             next(); // param name
 
             params.emplace_back(pty, pname);
 
-            if (peek() == tok_rparen) break;
-            if (peek() != tok_comma) {
-                logError("Expected ',' in parameter list");
+            if (peek() == TokenKind::Rparen) break;
+            if (peek() != TokenKind::Comma) {
+                error("Expected ',' in parameter list");
                 return nullptr;
             }
             next(); // ','
         }
     }
     next(); // ')'
-    if (peek() != tok_lbrace) {
-        logError("Expected '{' to start function body");
+    if (peek() != TokenKind::Lbrace) {
+        error("Expected '{' to start function body");
         return nullptr;
     }
     auto body = parseBlockExpr();
     if (!body) return nullptr;
-    
-    auto proto = std::make_unique<PrototypeAST>(name, std::move(params), ret);
-    return std::make_unique<FunctionAST>(std::move(proto), std::move(body));
+
+    auto proto = Ctx.create<PrototypeAST>(name, std::move(params), ret);
+    return Ctx.create<FunctionAST>(std::move(proto), std::move(body));
 }
 
-std::optional<ShaderStage> Parser::stageFromTok(int tok) {
+std::optional<ShaderStage> Parser::stageFromTok(TokenKind tok) {
     switch (tok) {
-        case tok_vertex:   return ShaderStage::Vertex;
-        case tok_fragment: return ShaderStage::Fragment;
-        case tok_compute:  return ShaderStage::Compute;
+        case TokenKind::Vertex:   return ShaderStage::Vertex;
+        case TokenKind::Fragment: return ShaderStage::Fragment;
+        case TokenKind::Compute:  return ShaderStage::Compute;
         default: return std::nullopt;
     }
 }
@@ -680,68 +658,84 @@ std::optional<ShaderStage> Parser::stageFromTok(int tok) {
 std::optional<FunctionAttrs> Parser::parseFunctionAttrs() {
     FunctionAttrs attrs;
 
-    while (peek() == tok_at) {
+    while (peek() == TokenKind::At) {
         next(); // '@'
 
-        if (peek() == tok_entry) {
+        if (peek() == TokenKind::Entry) {
             next(); // 'entry'
             if (attrs.isEntry) {
-                logError("Duplicate @entry");
+                error("Duplicate @entry");
                 return std::nullopt;
             }
             attrs.isEntry = true;
             continue;
         }
 
-        if (peek() == tok_stage) {
+        if (peek() == TokenKind::Stage) {
             next(); // 'stage'
 
-            if (peek() != tok_lparen) {
-                logError("Expected '(' after @stage");
+            if (peek() != TokenKind::Lparen) {
+                error("Expected '(' after @stage");
                 return std::nullopt;
             }
             next(); // '('
 
             auto st = stageFromTok(peek());
             if (!st.has_value()) {
-                logError("Expected stage name: vertex|fragment|compute");
+                error("Expected stage name: vertex|fragment|compute");
                 return std::nullopt;
             }
             if (attrs.stage.has_value()) {
-                logError("Duplicate @stage");
+                error("Duplicate @stage");
                 return std::nullopt;
             }
             attrs.stage = *st;
             next(); // consume vertex/fragment/compute
 
-            if (peek() != tok_rparen) {
-                logError("Expected ')' after @stage(...)");
+            if (peek() != TokenKind::Rparen) {
+                error("Expected ')' after @stage(...)");
                 return std::nullopt;
             }
             next(); // ')'
             continue;
         }
 
-        if (peek() == tok_identifier && IdentifierStr == "workgroup_size") {
+        if (peek() == TokenKind::Identifier && Cur.text == "workgroup_size") {
             next(); // 'workgroup_size'
-            if (peek() != tok_lparen) { logError("Expected '(' after @workgroup_size"); return std::nullopt; }
+            if (peek() != TokenKind::Lparen) { error("Expected '(' after @workgroup_size"); return std::nullopt; }
             next(); // '('
+            // Range-check each dimension before narrowing — Cur.num is a
+            // double, so a silent `(uint32_t)Cur.num` would wrap on values
+            // outside [0, 2^32). Match the array-size pattern; a workgroup
+            // dimension of 0 is also nonsensical so the lower bound is 1.
+            // Callers always gate on peek() == Number, so the lambda can
+            // assume Cur is a Number.
+            auto parseDim = [&](uint32_t& out, const char* role) -> bool {
+                if (Cur.num < 1.0 || Cur.num > 4294967295.0) {
+                    error(fmt::format("@workgroup_size {} must be in [1, 2^32), got {}",
+                                      role, (long long)Cur.num));
+                    return false;
+                }
+                out = static_cast<uint32_t>(Cur.num);
+                next();
+                return true;
+            };
             uint32_t x = 1, y = 1, z = 1;
-            if (peek() == tok_number) { x = (uint32_t)NumVal; next(); }
-            if (peek() == tok_comma)  { next(); if (peek() == tok_number) { y = (uint32_t)NumVal; next(); } }
-            if (peek() == tok_comma)  { next(); if (peek() == tok_number) { z = (uint32_t)NumVal; next(); } }
-            if (peek() != tok_rparen) { logError("Expected ')' after @workgroup_size(...)"); return std::nullopt; }
+            if (peek() == TokenKind::Number && !parseDim(x, "x")) return std::nullopt;
+            if (peek() == TokenKind::Comma)  { next(); if (peek() == TokenKind::Number && !parseDim(y, "y")) return std::nullopt; }
+            if (peek() == TokenKind::Comma)  { next(); if (peek() == TokenKind::Number && !parseDim(z, "z")) return std::nullopt; }
+            if (peek() != TokenKind::Rparen) { error("Expected ')' after @workgroup_size(...)"); return std::nullopt; }
             next(); // ')'
             attrs.workgroupSize = std::array<uint32_t,3>{x, y, z};
             continue;
         }
 
-        logError(fmt::format("Unknown attribute after '@': {}", getTokName(peek())));
+        error(fmt::format("Unknown attribute after '@': {}", getTokName(peek())));
         return std::nullopt;
     }
 
     if (attrs.isEntry && !attrs.stage.has_value()) {
-        logError("@entry requires @stage(...)");
+        error("@entry requires @stage(...)");
         return std::nullopt;
     }
 
@@ -749,312 +743,311 @@ std::optional<FunctionAttrs> Parser::parseFunctionAttrs() {
 }
 
 // Parse statement
-std::unique_ptr<ExprAST> Parser::parseStatement() {
+ExprAST* Parser::parseStatement() {
+    // parseStatement is a pure dispatcher: the parser is positioned at the
+    // statement's first token on entry, so a single ScopedLoc here +
+    // loc.stamp() on every return stamps every statement node — the
+    // sub-parsers need no stamping of their own.
+    ScopedLoc loc(*this);
     switch (peek()) {
-        case tok_struct:
-            return parseStruct();
-        case tok_uniform:
-            return parseUniform();
-        case tok_return:
-            return parseReturn();
-        case tok_while:
-            return parseWhile();
-        case tok_for:
-            return parseFor();
-        case tok_break:
-            return parseBreak();
-        case tok_continue:
-            return parseContinue();
-        case tok_discard:
-            return parseDiscard();
-        case tok_const:
-            next(); // consume 'const'
-            return parseVarDecl();
-        case tok_if:
-            return parseIfExpr();
-        case tok_lbrace:
-            return parseBlockExpr();
-        case tok_increment:
-        case tok_decrement: {
+        case TokenKind::Struct:    return loc.stamp(parseStruct());
+        case TokenKind::Uniform:   return loc.stamp(parseUniform());
+        case TokenKind::Return:    return loc.stamp(parseReturn());
+        case TokenKind::While:     return loc.stamp(parseWhile());
+        case TokenKind::For:       return loc.stamp(parseFor());
+        case TokenKind::Break:     return loc.stamp(parseBreak());
+        case TokenKind::Continue:  return loc.stamp(parseContinue());
+        case TokenKind::Discard:   return loc.stamp(parseDiscard());
+        case TokenKind::If:        return loc.stamp(parseIfExpr());
+        case TokenKind::Lbrace:    return loc.stamp(parseBlockExpr());
+        case TokenKind::Const:
+            // Don't consume here — parseVarDecl skips an optional `const`
+            // so its own ScopedLoc captures at the `const` token, keeping
+            // the top node *and* synthetic children at the same position.
+            return loc.stamp(parseVarDecl());
+        case TokenKind::Increment:
+        case TokenKind::Decrement: {
             // prefix ++/-- as a standalone statement (e.g. "++x;")
             auto expr = parseExpression();
             if (!expr) return nullptr;
-            if (peek() == tok_semicolon) next();
-            return expr;
+            if (peek() == TokenKind::Semicolon) next();
+            return loc.stamp(std::move(expr));
         }
-        case tok_identifier:
-            // could be var decl for user-defined type
-            if (isUserTypeName(IdentifierStr)) {
-                return parseVarDecl();
+        case TokenKind::Identifier:
+            // `Foo bar` (two identifiers) is always a declaration; anything
+            // else (`a = …`, `a.b`, `a()`, `a[i]`, `a + b`, `a++;`, …) is
+            // an assignment or expression statement. The one-token
+            // lookahead picks the path; SemanticAnalyzer validates that
+            // `Foo` actually names a struct.
+            if (peekNext() == TokenKind::Identifier) {
+                return loc.stamp(parseVarDecl());
             }
-            // otherwise, treat as assignment or expression statement
-            return parseAssignmentOrExprStatement();
+            return loc.stamp(parseAssignmentOrExprStatement());
         default:
             if (isTypeTok(peek())) {
-                return parseVarDecl();
+                return loc.stamp(parseVarDecl());
             }
-            logError(fmt::format("Unknown token at start of statement {}", getTokName(peek())));
+            error(fmt::format("Unknown token at start of statement {}", getTokName(peek())));
             return nullptr;
     }
 }
 
 // Block expression
-std::unique_ptr<ExprAST> Parser::parseBlockExpr() {
+ExprAST* Parser::parseBlockExpr() {
+    ScopedLoc loc(*this);  // the '{'
     next(); // '{'
-    std::vector<std::unique_ptr<ExprAST> > statements;
-    while (peek() != tok_rbrace && peek() != tok_eof) {
+    std::vector<ExprAST*> statements;
+    while (peek() != TokenKind::Rbrace && peek() != TokenKind::Eof) {
         auto stmt = parseStatement();
         if (!stmt) return nullptr;
         statements.push_back(std::move(stmt));
     }
-    if (peek() != tok_rbrace) {
-        logError("Expected '}' at end of block");
+    if (peek() != TokenKind::Rbrace) {
+        error("Expected '}' at end of block");
         return nullptr;
     }
     next(); // '}'
-    return std::make_unique<BlockExprAST>(std::move(statements));
+    return loc.stamp(Ctx.create<BlockExprAST>(std::move(statements)));
 }
 
 // parse if expression
 // example: if (cond) { ... } else { ... }
-std::unique_ptr<ExprAST> Parser::parseIfExpr() {
+ExprAST* Parser::parseIfExpr() {
     next(); // 'if'
-    if (peek() != tok_lparen) {
-        logError("Expected '(' after 'if'");
+    if (peek() != TokenKind::Lparen) {
+        error("Expected '(' after 'if'");
         return nullptr;
     }
     next(); // '('
     auto cond = parseExpression();
     if (!cond) return nullptr;
-    if (Parser::peek() != tok_rparen) {
-        logError("Expected ')' in if condition");
+    if (peek() != TokenKind::Rparen) {
+        error("Expected ')' in if condition");
         return nullptr;
     }
     next(); // ')'
     // then block or statement
-    std::unique_ptr<ExprAST> thenExpr;
-    if (peek() == tok_lbrace) {
+    ExprAST* thenExpr = nullptr;
+    if (peek() == TokenKind::Lbrace) {
         thenExpr = parseBlockExpr();
     } else {
         thenExpr = parseStatement();
     }
     if (!thenExpr) return nullptr;
-    std::unique_ptr<ExprAST> elseExpr;
-    if (peek() == tok_else) {
+    ExprAST* elseExpr = nullptr;
+    if (peek() == TokenKind::Else) {
         next(); // 'else'
-        if (peek() == tok_lbrace) {
+        if (peek() == TokenKind::Lbrace) {
             elseExpr = parseBlockExpr();
         } else {
             elseExpr = parseStatement();
         }
         if (!elseExpr) return nullptr;
     }
-    return std::make_unique<IfExprAST>(std::move(cond), std::move(thenExpr), std::move(elseExpr));
+    return Ctx.create<IfExprAST>(std::move(cond), std::move(thenExpr), std::move(elseExpr));
 }
 
 // parse while loop
 // example: while (cond) { ... }
-std::unique_ptr<ExprAST> Parser::parseWhile() {
+ExprAST* Parser::parseWhile() {
     next(); // 'while'
-    if (peek() != tok_lparen) {
-        logError("Expected '(' after 'while'");
+    if (peek() != TokenKind::Lparen) {
+        error("Expected '(' after 'while'");
         return nullptr;
     }
     next(); // '('
     auto cond = parseExpression();
     if (!cond) return nullptr;
-    if (peek() != tok_rparen) {
-        logError("Expected ')' in while condition");
+    if (peek() != TokenKind::Rparen) {
+        error("Expected ')' in while condition");
         return nullptr;
     }
     next(); // ')'
-    std::unique_ptr<ExprAST> body;
-    if (peek() == tok_lbrace) {
+    ExprAST* body = nullptr;
+    if (peek() == TokenKind::Lbrace) {
         body = parseBlockExpr();
     } else {
         body = parseStatement();
     }
     if (!body) return nullptr;
-    return std::make_unique<WhileExprAST>(std::move(cond), std::move(body));
+    return Ctx.create<WhileExprAST>(std::move(cond), std::move(body));
 }
 
 // For loop
-std::unique_ptr<ExprAST> Parser::parseFor() {
+ExprAST* Parser::parseFor() {
     next(); // 'for'
-    if (peek() != tok_lparen) {
-        logError("Expected '(' after 'for'");
+    if (peek() != TokenKind::Lparen) {
+        error("Expected '(' after 'for'");
         return nullptr;
     }
     next(); // '('
     // Initialization
-    std::unique_ptr<ExprAST> init;
-    if (peek() != tok_semicolon) {
+    ExprAST* init = nullptr;
+    if (peek() != TokenKind::Semicolon) {
         init = parseStatement();
     } else {
         next(); // ';'
     }
     // Condition
-    std::unique_ptr<ExprAST> cond;
-    if (peek() != tok_semicolon) {
+    ExprAST* cond = nullptr;
+    if (peek() != TokenKind::Semicolon) {
         cond = parseExpression();
         if (!cond) return nullptr;
     }
-    if (peek() != tok_semicolon) {
-        logError("Expected ';' after for condition");
+    if (peek() != TokenKind::Semicolon) {
+        error("Expected ';' after for condition");
         return nullptr;
     }
     next(); // ';'
-    // Increment
-    std::unique_ptr<ExprAST> inc;
-    if (peek() != tok_rparen) {
-        if (peek() == tok_identifier) {
-            std::string name = IdentifierStr;
-            next(); // identifier
-            if (peek() == tok_assign) {
-                // i = i + 1;
-                next(); // '='
-                auto rhs = parseExpression();
-                if (!rhs) return nullptr;
-                inc = std::make_unique<AssignmentExprAST>("", name, std::move(rhs));
-            } else {
-                // example : i++ or i--
-                auto lhs = std::make_unique<VariableExprAST>(name);
-                inc = parseBinOpRHS(0, std::move(lhs));
-            }
+    // Increment. The for-header terminator is `)`, not `;`, so we ask
+    // parseAssignmentOrExprStatement not to consume a `;`. It already
+    // handles `i = i + 1`, `i += 1`, `i++`, `i--`, function calls, and
+    // bare expressions — no duplicate dispatch needed here.
+    ExprAST* inc = nullptr;
+    if (peek() != TokenKind::Rparen) {
+        if (peek() == TokenKind::Identifier) {
+            inc = parseAssignmentOrExprStatement(/*consumeSemi=*/false);
         } else {
             inc = parseExpression();
         }
+        if (!inc) return nullptr;
     }
-    if (peek() != tok_rparen) {
-        logError("Expected ')' after for increment");
+    if (peek() != TokenKind::Rparen) {
+        error("Expected ')' after for increment");
         return nullptr;
     }
     next(); // ')'
-    std::unique_ptr<ExprAST> body;
-    if (peek() == tok_lbrace) {
+    ExprAST* body = nullptr;
+    if (peek() == TokenKind::Lbrace) {
         body = parseBlockExpr();
     } else {
         body = parseStatement();
     }
     if (!body) return nullptr;
-    return std::make_unique<ForExprAST>(std::move(init), std::move(cond), std::move(inc), std::move(body));
+    return Ctx.create<ForExprAST>(std::move(init), std::move(cond), std::move(inc), std::move(body));
 }
 
 // parse return statement
 // example: return expr;
-std::unique_ptr<ExprAST> Parser::parseReturn() {
+ExprAST* Parser::parseReturn() {
     next(); // 'return'
     // for void return
-    if (peek() == tok_semicolon) {
+    if (peek() == TokenKind::Semicolon) {
         next(); // ';'
-        return std::make_unique<ReturnStmtAST>(nullptr);
+        return Ctx.create<ReturnStmtAST>(nullptr);
     }
     auto expr_ast = parseExpression();
     if (!expr_ast) return nullptr;
-    if (peek() != tok_semicolon) {
-        logError("Expected ';' after return expression");
+    if (peek() != TokenKind::Semicolon) {
+        error("Expected ';' after return expression");
         return nullptr;
     }
     next(); // ';'
-    return std::make_unique<ReturnStmtAST>(std::move(expr_ast));
+    return Ctx.create<ReturnStmtAST>(std::move(expr_ast));
 }
 
 // Break statement
 // Stage variable declaration: in/out type name;
-std::unique_ptr<ExprAST> Parser::parseStageVarDecl(bool isInput, int binding) {
+ExprAST* Parser::parseStageVarDecl(bool isInput, int binding) {
     next(); // consume 'in' or 'out'
     std::string type;
     if (isTypeTok(peek())) {
         type = std::string(tokToTypeName(peek()));
         next();
-    } else if (peek() == tok_identifier && isUserTypeName(IdentifierStr)) {
-        type = IdentifierStr;
+    } else if (peek() == TokenKind::Identifier) {
+        // User struct name. Validated post-parse.
+        type = std::string(Cur.text);
         next();
     } else {
-        logError("Expected type in in/out declaration");
+        error("Expected type in in/out declaration");
         return nullptr;
     }
-    if (peek() != tok_identifier) { logError("Expected name in in/out declaration"); return nullptr; }
-    std::string name = IdentifierStr;
+    if (peek() != TokenKind::Identifier) { error("Expected name in in/out declaration"); return nullptr; }
+    std::string name(Cur.text);
     next();
-    if (peek() != tok_semicolon) { logError("Expected ';' after in/out declaration"); return nullptr; }
+    if (peek() != TokenKind::Semicolon) { error("Expected ';' after in/out declaration"); return nullptr; }
     next();
-    return std::make_unique<StageVarDeclAST>(isInput, type, name, binding);
+    return Ctx.create<StageVarDeclAST>(isInput, type, name, binding);
 }
 
 // Continue statement
-std::unique_ptr<ExprAST> Parser::parseContinue() {
+ExprAST* Parser::parseContinue() {
     next(); // 'continue'
-    if (peek() != tok_semicolon) { logError("Expected ';' after continue"); return nullptr; }
+    if (peek() != TokenKind::Semicolon) { error("Expected ';' after continue"); return nullptr; }
     next();
-    return std::make_unique<ContinueStmtAST>();
+    return Ctx.create<ContinueStmtAST>();
 }
 
 // Discard statement
-std::unique_ptr<ExprAST> Parser::parseDiscard() {
+ExprAST* Parser::parseDiscard() {
     next(); // 'discard'
-    if (peek() != tok_semicolon) { logError("Expected ';' after discard"); return nullptr; }
+    if (peek() != TokenKind::Semicolon) { error("Expected ';' after discard"); return nullptr; }
     next();
-    return std::make_unique<DiscardStmtAST>();
+    return Ctx.create<DiscardStmtAST>();
 }
 
-std::unique_ptr<ExprAST> Parser::parseBreak() {
-    if (peek() != tok_break) {
-        logError("Expected 'break' keyword");
+ExprAST* Parser::parseBreak() {
+    if (peek() != TokenKind::Break) {
+        error("Expected 'break' keyword");
         return nullptr;
     }
     next(); // 'break'
-    if (peek() != tok_semicolon) {
-        logError("Expected ';' after break");
+    if (peek() != TokenKind::Semicolon) {
+        error("Expected ';' after break");
         return nullptr;
     }
     next(); // ';'
-    return std::make_unique<BreakStmtAST>();
+    return Ctx.create<BreakStmtAST>();
 }
 
 // Variable declaration
-std::unique_ptr<ExprAST> Parser::parseVarDecl() {
+ExprAST* Parser::parseVarDecl() {
+    // Position of the declaration's first token — used to stamp the synthetic
+    // default-value / array-initializer nodes built below. The returned
+    // top-level node is stamped by parseStatement's dispatcher. Capture
+    // BEFORE consuming an optional `const` so all nodes built here share
+    // the same source position.
+    ScopedLoc loc(*this);
+
+    // Optional `const` qualifier. Currently parsed but not stored on the
+    // AST (codegen treats every declaration uniformly); kept for forward
+    // compat with a future const-correctness pass.
+    if (peek() == TokenKind::Const) next();
+
     // Parse type (builtin or user-defined struct)
     std::string type;
     if (isTypeTok(peek())) {
         type = std::string(tokToTypeName(peek()));
         next();
-    } else if (peek() == tok_identifier && isUserTypeName(IdentifierStr)) {
-        type = IdentifierStr;
+    } else if (peek() == TokenKind::Identifier) {
+        // User struct name. Validated post-parse.
+        type = std::string(Cur.text);
         next();
     } else {
-        logError("Expected type at start of variable declaration");
+        error("Expected type at start of variable declaration");
         return nullptr;
     }
 
     // Variable name
-    if (peek() != tok_identifier) {
-        logError("Expected variable name after type");
+    if (peek() != TokenKind::Identifier) {
+        error("Expected variable name after type");
         return nullptr;
     }
-    std::string name = IdentifierStr;
+    std::string name(Cur.text);
     next(); // consume name
 
     // Optional local array: [size]
     bool isArray   = false;
     int  arraySize = 0;
 
-    if (peek() == tok_lbracket) {
+    if (peek() == TokenKind::Lbracket) {
         next(); // '['
 
-        if (peek() != tok_number) {
-            logError("Expected array size inside []");
-            return nullptr;
-        }
-        if (NumVal < 1.0 || NumVal > 65536.0) {
-            logError(fmt::format("Array size must be between 1 and 65536, got {}", (int)NumVal));
-            return nullptr;
-        }
-        arraySize = static_cast<int>(NumVal);
-        next(); // number
+        arraySize = parseArraySize();
+        if (arraySize < 0) return nullptr;
 
-        if (peek() != tok_rbracket) {
-            logError("Expected ']' in array declaration");
+        if (peek() != TokenKind::Rbracket) {
+            error("Expected ']' in array declaration");
             return nullptr;
         }
         next(); // ']'
@@ -1063,357 +1056,357 @@ std::unique_ptr<ExprAST> Parser::parseVarDecl() {
     }
 
     // No initializer: "type name;" or "type name[size];"
-    if (peek() == tok_semicolon) {
+    if (peek() == TokenKind::Semicolon) {
         next(); // ';'
 
         if (isArray) {
             // local array without initialization
-            return std::make_unique<ArrayDeclExprAST>(type, name, arraySize, nullptr);
+            return Ctx.create<ArrayDeclExprAST>(type, name, arraySize, nullptr);
         }
 
         // scalars/vectors/matrices get default value
-        std::unique_ptr<ExprAST> defaultValue;
+        ExprAST* defaultValue = nullptr;
 
         if (type == "bool") {
-            defaultValue = std::make_unique<BooleanExprAST>(false);
+            defaultValue = loc.stamp(Ctx.create<BooleanExprAST>(false));
         } else if (type == "int" || type == "uint") {
-            defaultValue = std::make_unique<NumberExprAST>(0.0);
+            defaultValue = loc.stamp(Ctx.create<NumberExprAST>(0.0));
         } else if (type == "float" || type == "double") {
-            defaultValue = std::make_unique<NumberExprAST>(0.0);
+            defaultValue = loc.stamp(Ctx.create<NumberExprAST>(0.0));
         } else if (type == "vec2" || type == "vec3" || type == "vec4") {
-            std::vector<std::unique_ptr<ExprAST>> args;
-            args.push_back(std::make_unique<NumberExprAST>(0.0));
-            defaultValue = std::make_unique<CallExprAST>(type, std::move(args));
-        } else if (type == "mat2" || type == "mat3" || type == "mat4" ||
-                   type == "mat2x2" || type == "mat3x3" || type == "mat4x4" ||
+            std::vector<ExprAST*> args;
+            args.push_back(loc.stamp(Ctx.create<NumberExprAST>(0.0)));
+            defaultValue = loc.stamp(Ctx.create<CallExprAST>(type, std::move(args)));
+        } else if (type == "mat2"   || type == "mat3"   || type == "mat4"   ||
                    type == "mat2x3" || type == "mat2x4" ||
                    type == "mat3x2" || type == "mat3x4" ||
                    type == "mat4x2" || type == "mat4x3") {
+            // tokToTypeName never produces "matNxN" — Mat2 → "mat2", not
+            // "mat2x2" — so listing the square forms here would be dead.
             // empty constructor for matrices
-            std::vector<std::unique_ptr<ExprAST>> args;
-            defaultValue = std::make_unique<CallExprAST>(type, std::move(args));
-        } else if (isUserTypeName(type)) {
-            // user-defined struct type: use empty constructor
-            std::vector<std::unique_ptr<ExprAST>> args;
-            defaultValue = std::make_unique<CallExprAST>(type, std::move(args));
+            std::vector<ExprAST*> args;
+            defaultValue = loc.stamp(Ctx.create<CallExprAST>(type, std::move(args)));
         } else {
-            logError("Unknown type in variable declaration");
-            return nullptr;
+            // Assumed user-defined struct: emit empty constructor call.
+            // SemanticAnalyzer reports if the type name does not resolve.
+            std::vector<ExprAST*> args;
+            defaultValue = loc.stamp(Ctx.create<CallExprAST>(type, std::move(args)));
         }
 
-        return std::make_unique<AssignmentExprAST>(type, name, std::move(defaultValue));
+        return loc.stamp(Ctx.create<AssignmentExprAST>(type, name, std::move(defaultValue)));
     }
 
     // With initialization: '='
-    if (peek() == tok_assign) {
+    if (peek() == TokenKind::Assign) {
         next(); // '='
 
         // array with initializer: type name[size] = { ... };
         if (isArray) {
-            if (peek() != tok_lbrace) {
-                logError("Expected '{' for array initializer");
+            if (peek() != TokenKind::Lbrace) {
+                error("Expected '{' for array initializer");
                 return nullptr;
             }
             next(); // '{'
 
-            std::vector<std::unique_ptr<ExprAST>> elements;
-            if (peek() != tok_rbrace) {
+            std::vector<ExprAST*> elements;
+            if (peek() != TokenKind::Rbrace) {
                 while (true) {
                     auto elem = parseExpression();
                     if (!elem) return nullptr;
                     elements.push_back(std::move(elem));
 
-                    if (peek() == tok_rbrace) break;
-                    if (peek() != tok_comma) {
-                        logError("Expected ',' or '}' in array initializer");
+                    if (peek() == TokenKind::Rbrace) break;
+                    if (peek() != TokenKind::Comma) {
+                        error("Expected ',' or '}' in array initializer");
                         return nullptr;
                     }
                     next(); // ','
                 }
             }
 
-            if (peek() != tok_rbrace) {
-                logError("Expected '}' at end of array initializer");
+            if (peek() != TokenKind::Rbrace) {
+                error("Expected '}' at end of array initializer");
                 return nullptr;
             }
             next(); // '}'
 
             if (static_cast<int>(elements.size()) != arraySize) {
-                logError("Array initializer size mismatch");
+                error("Array initializer size mismatch");
                 return nullptr;
             }
 
-            if (peek() != tok_semicolon) {
-                logError("Expected ';' after array declaration");
+            if (peek() != TokenKind::Semicolon) {
+                error("Expected ';' after array declaration");
                 return nullptr;
             }
             next(); // ';'
 
-            auto init = std::make_unique<ArrayInitExprAST>(std::move(elements));
-            return std::make_unique<ArrayDeclExprAST>(type, name, arraySize, std::move(init));
+            auto init = loc.stamp(Ctx.create<ArrayInitExprAST>(std::move(elements)));
+            return loc.stamp(Ctx.create<ArrayDeclExprAST>(type, name, arraySize, std::move(init)));
         }
 
         // 5b) regular variable: type name = expr;
         auto value = parseExpression();
         if (!value) return nullptr;
 
-        if (peek() != tok_semicolon) {
-            logError("Expected ';' at end of declaration");
+        if (peek() != TokenKind::Semicolon) {
+            error("Expected ';' at end of declaration");
             return nullptr;
         }
         next(); // ';'
 
-        return std::make_unique<AssignmentExprAST>(type, name, std::move(value));
+        return Ctx.create<AssignmentExprAST>(type, name, std::move(value));
     }
 
-    logError("Expected '=' or ';' after variable name in declaration");
+    error("Expected '=' or ';' after variable name in declaration");
     return nullptr;
 }
 
-std::unique_ptr<ExprAST> Parser::parseAssignmentOrExprStatement() {
-    if (peek() != tok_identifier) {
-        logError("Expected identifier at start of statement");
+ExprAST* Parser::parseAssignmentOrExprStatement(bool consumeSemi) {
+    if (peek() != TokenKind::Identifier) {
+        error("Expected identifier at start of statement");
         return nullptr;
     }
     // parse left-hand side using primary expression
     auto lhs = parsePrimary();
     if (!lhs) return nullptr;
-    // Compound assignment: a += rhs, a -= rhs, a *= rhs, a /= rhs
-    if (peek() == tok_plus_assign || peek() == tok_minus_assign ||
-        peek() == tok_mul_assign  || peek() == tok_div_assign) {
-        int op = peek();
+    // Compound assignment: a += rhs, a -= rhs, a *= rhs, a /= rhs, a %= rhs
+    if (peek() == TokenKind::PlusAssign || peek() == TokenKind::MinusAssign ||
+        peek() == TokenKind::MulAssign  || peek() == TokenKind::DivAssign  ||
+        peek() == TokenKind::ModAssign) {
+        TokenKind op = peek();
         next();
         auto rhs = parseExpression();
         if (!rhs) return nullptr;
-        if (peek() != tok_semicolon) { logError("Expected ';' after compound assignment"); return nullptr; }
-        next();
-        int binOp;
+        if (consumeSemi) {
+            if (peek() != TokenKind::Semicolon) { error("Expected ';' after compound assignment"); return nullptr; }
+            next();
+        }
+        TokenKind binOp;
         switch (op) {
-            case tok_plus_assign:  binOp = tok_plus;     break;
-            case tok_minus_assign: binOp = tok_minus;    break;
-            case tok_mul_assign:   binOp = tok_multiply; break;
-            default:               binOp = tok_divide;   break;
+            case TokenKind::PlusAssign:  binOp = TokenKind::Plus;     break;
+            case TokenKind::MinusAssign: binOp = TokenKind::Minus;    break;
+            case TokenKind::MulAssign:   binOp = TokenKind::Multiply; break;
+            case TokenKind::DivAssign:   binOp = TokenKind::Divide;   break;
+            default:                     binOp = TokenKind::Percent;  break;  // ModAssign
         }
-        if (auto* var = dynamic_cast<VariableExprAST*>(lhs.get())) {
-            auto lhsCopy = std::make_unique<VariableExprAST>(var->Name);
-            auto binExpr = std::make_unique<BinaryExprAST>(binOp, std::move(lhsCopy), std::move(rhs));
-            return std::make_unique<AssignmentExprAST>("", var->Name, std::move(binExpr));
+        if (auto* var = llvm::dyn_cast<VariableExprAST>(lhs)) {
+            // Desugar `a += b` → `a = a + b`; the synthetic nodes inherit the
+            // lvalue's source position.
+            int ll = lhs->line, lc = lhs->col;
+            auto* lhsCopy = at(Ctx.create<VariableExprAST>(var->Name), ll, lc);
+            auto* binExpr = at(Ctx.create<BinaryExprAST>(binOp, lhsCopy, rhs), ll, lc);
+            return at(Ctx.create<AssignmentExprAST>("", var->Name, binExpr), ll, lc);
         }
-        logError("Compound assignment only supported for simple variables");
+        error("Compound assignment only supported for simple variables");
         return nullptr;
     }
 
     // assignment statement - example : a = 5;
     // ReSharper disable once CppDFAConstantConditions
-    if (peek() == tok_assign) {
+    if (peek() == TokenKind::Assign) {
         next(); // '='
         auto rhs = parseExpression();
         if (!rhs) return nullptr;
 
-        if (peek() != tok_semicolon) {
-            logError("Expected ';' after assignment");
-            return nullptr;
+        if (consumeSemi) {
+            if (peek() != TokenKind::Semicolon) {
+                error("Expected ';' after assignment");
+                return nullptr;
+            }
+            next(); // ';'
         }
-        next(); // ';'
 
-        // matrix assignment: a[i] = col_vec  or  a[i][j] = scalar
-        if (auto *maccRaw = dynamic_cast<MatrixAccessExprAST*>(lhs.get())) {
-            std::unique_ptr<MatrixAccessExprAST> macc(maccRaw);
-            lhs.release();
-            return std::make_unique<MatrixAssignmentExprAST>(
-                std::move(macc->Object),
-                std::move(macc->Index),
-                std::move(macc->Index2),
-                std::move(rhs));
+        // matrix assignment: a[i] = col_vec  or  a[i][j] = scalar.
+        // Since lhs is a raw pointer into the arena now, llvm::dyn_cast
+        // is enough — the rewrap-into-the-new-node is just pointer copies.
+        if (auto* macc = llvm::dyn_cast<MatrixAccessExprAST>(lhs)) {
+            return Ctx.create<MatrixAssignmentExprAST>(
+                macc->Object, macc->Index, macc->Index2, rhs);
         }
 
         // member assignment: v.xyz = ..., obj.field = ...
-        if (auto *memRaw = dynamic_cast<MemberAccessExprAST*>(lhs.get())) {
-            std::unique_ptr<MemberAccessExprAST> mem(memRaw);
-            lhs.release();
-            auto obj    = std::move(mem->Object);
-            std::string member = mem->Member;
-            return std::make_unique<MemberAssignmentExprAST>(
-                std::move(obj), member, std::move(rhs));
+        if (auto* mem = llvm::dyn_cast<MemberAccessExprAST>(lhs)) {
+            return Ctx.create<MemberAssignmentExprAST>(
+                mem->Object, mem->Member, rhs);
         }
 
         // simple variable: a = ...
-        if (auto *var = dynamic_cast<VariableExprAST*>(lhs.get())) {
-            return std::make_unique<AssignmentExprAST>("", var->Name, std::move(rhs));
+        if (auto* var = llvm::dyn_cast<VariableExprAST>(lhs)) {
+            return Ctx.create<AssignmentExprAST>("", var->Name, rhs);
         }
 
-        logError("Unsupported lvalue in assignment");
+        error("Unsupported lvalue in assignment");
         return nullptr;
     }
     // expression statement - example : a + 1;
-    auto expr = parseBinOpRHS(0, std::move(lhs));
+    auto* expr = parseBinOpRHS(0, lhs);
     if (!expr) return nullptr;
-    if (peek() != tok_semicolon) {
-        logError("Expected ';' after expression");
-        return nullptr;
+    if (consumeSemi) {
+        if (peek() != TokenKind::Semicolon) {
+            error("Expected ';' after expression");
+            return nullptr;
+        }
+        next(); // ';'
     }
-    next(); // ';'
     return expr;
 }
 
 // parse expression, including optional ternary
-std::unique_ptr<ExprAST> Parser::parseExpression() {
+ExprAST* Parser::parseExpression() {
+    ScopedLoc loc(*this);
     auto lhs = parseUnary();
     if (!lhs) return nullptr;
     auto expr = parseBinOpRHS(0, std::move(lhs));
     if (!expr) return nullptr;
 
-    // Ternary: expr ? thenExpr : elseExpr
-    if (peek() == tok_question) {
+    // Ternary: expr ? thenExpr : elseExpr. Right-associative because the
+    // `then` branch recurses through parseExpression — `a ? b : c ? d : e`
+    // parses as `a ? b : (c ? d : e)`, matching C/GLSL.
+    if (peek() == TokenKind::Question) {
         next(); // '?'
         auto thenExpr = parseExpression();
         if (!thenExpr) return nullptr;
-        if (peek() != tok_colon) { logError("Expected ':' in ternary operator"); return nullptr; }
+        if (peek() != TokenKind::Colon) { error("Expected ':' in ternary operator"); return nullptr; }
         next(); // ':'
         auto elseExpr = parseExpression();
         if (!elseExpr) return nullptr;
-        return std::make_unique<TernaryExprAST>(std::move(expr), std::move(thenExpr), std::move(elseExpr));
+        return loc.stamp(Ctx.create<TernaryExprAST>(
+            std::move(expr), std::move(thenExpr), std::move(elseExpr)));
     }
-    return expr;
+    return expr;  // already stamped by parseUnary / parseBinOpRHS
 }
 
 // for unary operators
 // example : -x, ++x, --x
-std::unique_ptr<ExprAST> Parser::parseUnary() {
+ExprAST* Parser::parseUnary() {
+    ScopedLoc loc(*this);
     // prefix ++ / --
-    if (peek() == tok_increment || peek() == tok_decrement) {
-        bool isInc = (peek() == tok_increment);
+    if (peek() == TokenKind::Increment || peek() == TokenKind::Decrement) {
+        bool isInc = (peek() == TokenKind::Increment);
         next();
         auto operand = parseUnary();
         if (!operand) return nullptr;
-        if (auto* var = dynamic_cast<VariableExprAST*>(operand.get())) {
-            auto one     = std::make_unique<NumberExprAST>(1.0);
-            auto varCopy = std::make_unique<VariableExprAST>(var->Name);
-            int binOp    = isInc ? tok_plus : tok_minus;
-            auto binExpr = std::make_unique<BinaryExprAST>(binOp, std::move(varCopy), std::move(one));
-            return std::make_unique<AssignmentExprAST>("", var->Name, std::move(binExpr));
+        // Prefix ++/-- correctly returns the *new* value via the desugar
+        // `x = x ± 1`. Postfix ++/-- gets its own dedicated AST node — see
+        // parsePostfixAfterIdent — so it can return the *old* value.
+        if (auto* var = llvm::dyn_cast<VariableExprAST>(operand)) {
+            auto one     = loc.stamp(Ctx.create<NumberExprAST>(1.0));
+            auto varCopy = loc.stamp(Ctx.create<VariableExprAST>(var->Name));
+            TokenKind binOp = isInc ? TokenKind::Plus : TokenKind::Minus;
+            auto binExpr = loc.stamp(Ctx.create<BinaryExprAST>(
+                binOp, std::move(varCopy), std::move(one)));
+            return loc.stamp(Ctx.create<AssignmentExprAST>(
+                "", var->Name, std::move(binExpr)));
         }
-        logError("Prefix ++/-- only supported on simple variables");
+        error("Prefix ++/-- only supported on simple variables");
         return nullptr;
     }
 
-    if (peek() == tok_minus || peek() == '-' ||
-        peek() == tok_plus  || peek() == '+' ||
-        peek() == tok_not   || peek() == '!') {
-        int Op = peek();
+    if (peek() == TokenKind::Minus || peek() == TokenKind::Plus ||
+        peek() == TokenKind::Not   || peek() == TokenKind::BitwiseNot) {
+        TokenKind Op = peek();
         next();
         auto operand = parseUnary();
         if (!operand) return nullptr;
-        return std::make_unique<UnaryExprAST>(Op, std::move(operand));
+        return loc.stamp(Ctx.create<UnaryExprAST>(Op, std::move(operand)));
     }
-    return parsePrimary();
+    return parsePrimary();  // parsePrimary stamps its own result
 }
 
 // parse primary expressions
 // example: identifier, number, (expression), constructor call, member access, swizzle,
-std::unique_ptr<ExprAST> Parser::parsePrimary() {
-    std::unique_ptr<ExprAST> expr;
+ExprAST* Parser::parsePrimary() {
+    ScopedLoc loc(*this);
+    ExprAST* expr = nullptr;
     switch (peek()) {
-        case tok_identifier:
-        case tok_vec2:
-        case tok_vec3:
-        case tok_vec4:
-        case tok_double:
-        case tok_float:
-        case tok_int:
-        case tok_uint:
-        case tok_bool:
-        case tok_mat2:
-        case tok_mat3:
-        case tok_mat4:
-        case tok_mat2x3:
-        case tok_mat2x4:
-        case tok_mat3x2:
-        case tok_mat3x4:
-        case tok_mat4x2:
-        case tok_mat4x3:
-        case tok_uvec2: case tok_uvec3: case tok_uvec4:
-        case tok_ivec2: case tok_ivec3: case tok_ivec4:
-        case tok_sampler2D: case tok_sampler3D: case tok_samplerCube:
-        case tok_image2D:
+        // Identifier and every built-in type-keyword dispatch to the same
+        // path — TYPE_TOKENS(X) keeps the list in sync with isTypeTok and
+        // tokToTypeName so adding a new type only edits the macro.
+        case TokenKind::Identifier:
+#define X(Tok, _Name) case TokenKind::Tok:
+        TYPE_TOKENS(X)
+#undef X
             expr = parseIdentifierOrCtorExpr();
             break;
-        case tok_number:
+        case TokenKind::Number:
             expr = parseNumberExpr();
             break;
-        case tok_lparen: {
+        case TokenKind::Lparen: {
             next(); // '('
             expr = parseExpression();
             if (!expr) return nullptr;
-            if (peek() != tok_rparen) {
-                logError("Expected ')'");
+            if (peek() != TokenKind::Rparen) {
+                error("Expected ')'");
                 return nullptr;
             }
             next(); // ')'
             break;
         }
-        case tok_true:
+        case TokenKind::True:
             next(); // 'true'
-            expr = std::make_unique<BooleanExprAST>(true);
+            expr = Ctx.create<BooleanExprAST>(true);
             break;
-        case tok_false:
+        case TokenKind::False:
             next(); // 'false'
-            expr = std::make_unique<BooleanExprAST>(false);
+            expr = Ctx.create<BooleanExprAST>(false);
             break;
         default:
-            logError("Unknown token when expecting an expression");
+            error("Unknown token when expecting an expression");
             return nullptr;
     }
     if (!expr) return nullptr;
-    // Handle postfix operators (like member access/swizzle)
+    // Stamp the primary at its first token, then let parsePostfixAfterIdent
+    // stamp any member-access / index nodes it layers on top.
+    expr = loc.stamp(std::move(expr));
     expr = parsePostfixAfterIdent(std::move(expr));
     return expr;
 }
 
 // number literal
 // example: 42, 3.14
-std::unique_ptr<ExprAST> Parser::parseNumberExpr() {
-    auto result = std::make_unique<NumberExprAST>(NumVal, IsIntLiteral);
+ExprAST* Parser::parseNumberExpr() {
+    auto result = Ctx.create<NumberExprAST>(Cur.num, Cur.isInt);
     next();
     return result;
 }
 
 // identifier or constructor call
 // example: myVar, vec3(1.0, 0.0, 0.0)
-std::unique_ptr<ExprAST> Parser::parseIdentifierOrCtorExpr() {
+ExprAST* Parser::parseIdentifierOrCtorExpr() {
     std::string name;
     if (isTypeTok(peek())) {
         // Constructor type call e.g., vec3(1.0, 0.0, 0.0)
         name = std::string(tokToTypeName(peek()));
         next(); // type token
-        if (peek() != tok_lparen) {
-            logError("Type name in expression must be followed by '(' (constructor)");
+        if (peek() != TokenKind::Lparen) {
+            error("Type name in expression must be followed by '(' (constructor)");
             return nullptr;
         }
     }
     // Function call, variable, or user-defined type constructor
-    else if (peek() == tok_identifier) {
-        name = IdentifierStr;
+    else if (peek() == TokenKind::Identifier) {
+        name = std::string(Cur.text);
         next(); // identifier
         // simple variable if not followed by '('
-        if (peek() != tok_lparen) {
-            return std::make_unique<VariableExprAST>(name);
+        if (peek() != TokenKind::Lparen) {
+            return Ctx.create<VariableExprAST>(name);
         }
     } else {
-        logError("Expected identifier or type constructor");
+        error("Expected identifier or type constructor");
         return nullptr;
     }
     // function or constructor call
     next(); // '('
-    std::vector<std::unique_ptr<ExprAST> > args;
-    if (peek() != tok_rparen) {
+    std::vector<ExprAST*> args;
+    if (peek() != TokenKind::Rparen) {
         while (true) {
             auto arg = parseExpression();
             if (!arg) return nullptr;
             args.push_back(std::move(arg));
-            if (peek() == tok_rparen) break;
-            if (peek() != tok_comma) {
-                logError("Expected ',' in argument list");
+            if (peek() == TokenKind::Rparen) break;
+            if (peek() != TokenKind::Comma) {
+                error("Expected ',' in argument list");
                 return nullptr;
             }
             next(); // ','
@@ -1421,56 +1414,63 @@ std::unique_ptr<ExprAST> Parser::parseIdentifierOrCtorExpr() {
     }
     next(); // ')'
     // CallExprAST - function call or user-defined type constructor
-    return std::make_unique<CallExprAST>(name, std::move(args));
+    return Ctx.create<CallExprAST>(name, std::move(args));
 }
 
-std::unique_ptr<ExprAST> Parser::parsePostfixAfterIdent(std::unique_ptr<ExprAST> base) {
+ExprAST* Parser::parsePostfixAfterIdent(ExprAST* base) {
     while (true) {
         // member access or swizzle - someVec.x or someVec.xyz
-        if (peek() == tok_dot) {
+        // Postfix nodes inherit the source position of their `base` operand
+        // (e.g. `a.b` is located at `a`). Capture before the std::move.
+        if (peek() == TokenKind::Dot) {
             next();
-            if (peek() != tok_identifier) {
-                logError("Expected member/swizzle name after '.'");
+            if (peek() != TokenKind::Identifier) {
+                error("Expected member/swizzle name after '.'");
                 return nullptr;
             }
             // check if single component or swizzle
-            std::string member = IdentifierStr;
+            std::string member(Cur.text);
             next();
-            base = std::make_unique<MemberAccessExprAST>(std::move(base), member);
+            int bl = base->line, bc = base->col;
+            base = at(Ctx.create<MemberAccessExprAST>(std::move(base), member), bl, bc);
             continue;
         }
         // matrix access - someMat[i] or someMat[i][j]
-        if (peek() == tok_lbracket) {
+        if (peek() == TokenKind::Lbracket) {
+            int bl = base->line, bc = base->col;
             auto idx1 = parseBracketIndex();
             if (!idx1) return nullptr;
 
-            if (peek() == tok_lbracket) {
+            if (peek() == TokenKind::Lbracket) {
                 auto idx2 = parseBracketIndex();
                 if (!idx2) return nullptr;
-                base = std::make_unique<MatrixAccessExprAST>(
+                base = at(Ctx.create<MatrixAccessExprAST>(
                     std::move(base),
                     std::move(idx1),
                     std::move(idx2)
-                );
+                ), bl, bc);
             } else {
-                base = std::make_unique<MatrixAccessExprAST>(
+                base = at(Ctx.create<MatrixAccessExprAST>(
                     std::move(base),
                     std::move(idx1)
-                );
+                ), bl, bc);
             }
             continue;
         }
-        // postfix ++ / --
-        if (peek() == tok_increment || peek() == tok_decrement) {
-            bool isInc = (peek() == tok_increment);
+        // postfix ++ / -- — wraps in a dedicated PostfixIncrExprAST so
+        // codegen can return the *old* value. Desugaring into `x = x ± 1`
+        // (as prefix does) would silently give prefix semantics, breaking
+        // `a[i++]`.
+        if (peek() == TokenKind::Increment || peek() == TokenKind::Decrement) {
+            bool isDec = (peek() == TokenKind::Decrement);
             next();
-            if (auto* var = dynamic_cast<VariableExprAST*>(base.get())) {
-                auto one     = std::make_unique<NumberExprAST>(1.0);
-                auto varCopy = std::make_unique<VariableExprAST>(var->Name);
-                int binOp    = isInc ? tok_plus : tok_minus;
-                auto binExpr = std::make_unique<BinaryExprAST>(binOp, std::move(varCopy), std::move(one));
-                base = std::make_unique<AssignmentExprAST>("", var->Name, std::move(binExpr));
+            if (!llvm::isa<VariableExprAST>(base)) {
+                error("Postfix ++/-- only supported on simple variables");
+                return nullptr;
             }
+            int bl = base->line, bc = base->col;
+            base = at(Ctx.create<PostfixIncrExprAST>(std::move(base), isDec),
+                      bl, bc);
             continue;
         }
         break;
@@ -1480,35 +1480,31 @@ std::unique_ptr<ExprAST> Parser::parsePostfixAfterIdent(std::unique_ptr<ExprAST>
 
 // binary operators - right-hand side
 // exprPrecedence - minimal precedence for this level, lhs - already parsed left-hand side
-std::unique_ptr<ExprAST> Parser::parseBinOpRHS(int exprPrecedence, std::unique_ptr<ExprAST> lhs) {
+ExprAST* Parser::parseBinOpRHS(int exprPrecedence, ExprAST* lhs) {
     while (true) {
         // get precedence of current
         int tokPrecedence = precedence(peek());
         // if this operator is lower precedence than what we are allowed, return lhs
         if (tokPrecedence < exprPrecedence) return lhs;
         // this is a binary operator
-        int op = peek();
+        TokenKind op = peek();
         next(); // operator
         // parse unary expression after the binary operator
-        auto rhs = parseUnary();
+        auto* rhs = parseUnary();
         if (!rhs) return nullptr;
         int nextPrecedence = precedence(peek());
         if (tokPrecedence < nextPrecedence) {
-            rhs = parseBinOpRHS(tokPrecedence + 1, std::move(rhs));
+            rhs = parseBinOpRHS(tokPrecedence + 1, rhs);
             if (!rhs) return nullptr;
         }
-        lhs = std::make_unique<BinaryExprAST>(op, std::move(lhs), std::move(rhs));
+        // The composite BinaryExprAST is located at its left operand's start.
+        int cl = lhs->line, cc = lhs->col;
+        lhs = at(Ctx.create<BinaryExprAST>(op, lhs, rhs), cl, cc);
     }
 }
 
-static Parser GParser;
-
-int getNextToken() { return GParser.next(); }
-std::vector<std::unique_ptr<ExprAST> > ParseProgram() { return GParser.ParseProgram(); }
-std::unique_ptr<ExprAST> ParsePrimary() { return GParser.parsePrimary(); }
-std::unique_ptr<ExprAST> ParseUnary() { return GParser.parseUnary(); }
-std::unique_ptr<ExprAST> ParseExpression() { return GParser.parseExpression(); }
-std::unique_ptr<ExprAST> ParseStatement() { return GParser.parseStatement(); }
-std::unique_ptr<ExprAST> ParseFunction() { return GParser.parseFunction(); }
-std::unique_ptr<ExprAST> ParseStructDecl() { return GParser.parseStruct(); }
-std::unique_ptr<ExprAST> ParseUniformDecl() { return GParser.parseUniform(); }
+// Entry point
+std::vector<ExprAST*> ParseProgram(ASTContext& ctx, std::string_view source) {
+    Parser parser(ctx, source);
+    return parser.ParseProgram();
+}

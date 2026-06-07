@@ -100,23 +100,50 @@ static void emitPipelineTrampolines() {
                                ConstantInt::get(i32Ty, varyingFloats),
                                "vs_varying_floats");
 
-            auto* invokeTy = FunctionType::get(voidTy, {i32Ty, i32Ty, ptrTy}, false);
+            // vs_main signature is (vid, iid, [attr0, attr1, ...,] _out).
+            // Anything between iid and _out is a per-vertex input attribute.
+            FunctionType* vsFT = vsFunc->getFunctionType();
+            unsigned numVSParams = vsFT->getNumParams();
+
+            unsigned inputFloats = 0;
+            for (unsigned i = 2; i + 1 < numVSParams; ++i)
+                inputFloats += typeFloatCount(vsFT->getParamType(i));
+
+            new GlobalVariable(*TheModule, i32Ty, true,
+                               GlobalValue::ExternalLinkage,
+                               ConstantInt::get(i32Ty, inputFloats),
+                               "vs_input_floats");
+
+            // Uniform trampoline signature: (vid, iid, flat_in, flat_out).
+            // flat_in is unused (and may be NULL) when vs_input_floats == 0.
+            auto* invokeTy = FunctionType::get(voidTy,
+                                               {i32Ty, i32Ty, ptrTy, ptrTy}, false);
             auto* invoke   = Function::Create(invokeTy, Function::ExternalLinkage,
                                               "vs_invoke", TheModule.get());
             auto args = invoke->arg_begin();
-            Value* vid  = &*args++; vid->setName("vid");
-            Value* iid  = &*args++; iid->setName("iid");
-            Value* flat = &*args;   flat->setName("flat_out");
+            Value* vid     = &*args++; vid->setName("vid");
+            Value* iid     = &*args++; iid->setName("iid");
+            Value* flatIn  = &*args++; flatIn->setName("flat_in");
+            Value* flatOut = &*args;   flatOut->setName("flat_out");
 
             auto* BB = BasicBlock::Create(*Context, "entry", invoke);
             Builder->SetInsertPoint(BB);
 
             Value* outStruct = Builder->CreateAlloca(outTy, nullptr, "vs_out");
-            Builder->CreateCall(vsFunc, {vid, iid, outStruct});
+
+            std::vector<Value*> callArgs = {vid, iid};
+            unsigned inOff = 0;
+            for (unsigned i = 2; i + 1 < numVSParams; ++i) {
+                Type* paramTy = vsFT->getParamType(i);
+                callArgs.push_back(loadFieldFromFlat(paramTy, flatIn, inOff, f32Ty));
+                inOff += typeFloatCount(paramTy);
+            }
+            callArgs.push_back(outStruct);
+            Builder->CreateCall(vsFunc, callArgs);
 
             unsigned off = 0;
             for (unsigned i = 0; i < outTy->getNumElements(); ++i)
-                off = flattenField(outStruct, outTy->getElementType(i), i, outTy, flat, off, f32Ty);
+                off = flattenField(outStruct, outTy->getElementType(i), i, outTy, flatOut, off, f32Ty);
             Builder->CreateRetVoid();
         }
     }

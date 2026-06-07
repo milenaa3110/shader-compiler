@@ -19,6 +19,20 @@ SYSROOT="/usr/riscv64-linux-gnu"
 BUILD_DIR="build"
 HOST_ARCH="$(uname -m)"
 
+# ── Build helpers (CMake) ────────────────────────────────────────────────────
+# build_target NAME [NAME...]   — build one or more CMake targets
+# build_all                      — build everything (configure if needed)
+build_target() {
+    [[ -d "$BUILD_DIR" ]] || cmake -S . -B "$BUILD_DIR" >/dev/null
+    cmake --build "$BUILD_DIR" -j"$NTHREADS" --target "$@" 2>&1 \
+        | grep -E "^(g\+\+|riscv|error)" || true
+}
+build_all() {
+    [[ -d "$BUILD_DIR" ]] || cmake -S . -B "$BUILD_DIR" >/dev/null
+    cmake --build "$BUILD_DIR" -j"$NTHREADS" 2>&1 \
+        | grep -E "^(g\+\+|riscv|error)" || true
+}
+
 # ── RISC-V execution: native hardware or QEMU emulation ──────────────────────
 QEMU_BIN="$(which qemu-riscv64-static 2>/dev/null || which qemu-riscv64 2>/dev/null || true)"
 

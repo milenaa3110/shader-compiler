@@ -12,8 +12,8 @@ mkdir -p result "$BUILD_DIR"
 
 # ── Build GPU compute host ────────────────────────────────────────────────────
 echo -e "${CYAN}Building Vulkan compute host…${RESET}"
-make build/spirv/spirv_vulkan_compute_host 2>/dev/null | grep -E "^g\+\+|error" || true
-make build/spirv/blur.comp.spv 2>/dev/null
+build_target spirv_vulkan_compute_host 2>/dev/null | grep -E "^g\+\+|error" || true
+build_target blur.comp.spv 2>/dev/null
 
 # ── Build CPU compute binary (RISC-V + OpenMP) ───────────────────────────────
 echo -e "${CYAN}Building CPU compute binary (RISC-V + OpenMP)…${RESET}"

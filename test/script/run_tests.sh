@@ -40,7 +40,8 @@ verbose() { [ "$VERBOSE" -eq 1 ] && echo -e "$*" || true; }
 # ── build ─────────────────────────────────────────────────────────────────────
 if [ "$NO_BUILD" -eq 0 ]; then
     log "${CYAN}Building...${RESET}"
-    if ! make -C "$ROOT" all -j"$(nproc)" 2>&1 | \
+    [ -d "$ROOT/build" ] || cmake -S "$ROOT" -B "$ROOT/build" >/dev/null
+    if ! cmake --build "$ROOT/build" -j"$(nproc)" 2>&1 | \
             { [ "$VERBOSE" -eq 1 ] && cat || tail -5; }; then
         log "${RED}Build failed. Aborting tests.${RESET}"
         exit 1

@@ -56,14 +56,14 @@ mkdir -p result "$BUILD_DIR"
 
 # ── build check ───────────────────────────────────────────────────────────────
 echo -e "${CYAN}Building tools…${RESET}"
-make -j"$(nproc)" build/riscv/irgen_riscv build/spirv/spirv_vulkan_host 2>/dev/null | grep -E "^g\+\+|^riscv|error" || true
+build_target irgen_riscv spirv_vulkan_host 2>/dev/null | grep -E "^g\+\+|^riscv|error" || true
 
 # ── compile SPIR-V shaders ────────────────────────────────────────────────────
 if [[ $RV_ONLY -eq 0 ]]; then
     echo -e "${CYAN}Compiling Vulkan SPIR-V shaders…${RESET}"
-    make build/spirv/quad.vert.spv 2>/dev/null
+    build_target quad.vert.spv 2>/dev/null
     for A in "${ANIMATIONS[@]}"; do
-        make "build/spirv/${A}.frag.spv" 2>/dev/null && \
+        build_target "${A}.frag.spv" 2>/dev/null && \
             echo -e "  ${A}.frag.spv  ${GREEN}OK${RESET}" || \
             echo -e "  ${A}.frag.spv  ${YELLOW}SKIP${RESET}"
     done
@@ -73,7 +73,7 @@ fi
 if [[ $VK_ONLY -eq 0 ]]; then
     echo -e "${CYAN}Compiling RISC-V shaders (irgen_riscv + llc-18)…${RESET}"
     for A in "${ANIMATIONS[@]}"; do
-        make "build/riscv/${A}_rv.o" 2>/dev/null && \
+        build_target "${A}_rv.o" 2>/dev/null && \
             echo -e "  build/riscv/${A}_rv.o  ${GREEN}OK${RESET}" || \
             echo -e "  build/riscv/${A}_rv.o  ${YELLOW}SKIP${RESET}"
     done

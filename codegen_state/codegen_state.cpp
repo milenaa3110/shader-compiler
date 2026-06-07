@@ -5,7 +5,7 @@
 #include "codegen_state.h"
 #include "../helpers/utils.h"
 #include <vector>
-#include "../error_utils.h"
+#include "../error_utils_fmt.h"
 #include <fmt/core.h>
 #include <unordered_set>
 namespace llvm {
@@ -17,8 +17,10 @@ std::unique_ptr<llvm::Module> TheModule;
 std::unique_ptr<llvm::IRBuilder<>> Builder;
 std::map<std::string, llvm::AllocaInst*> NamedValues;
 std::unordered_map<std::string, StructInfo> NamedStructTypes;
-std::unordered_set<std::string> StructTypes;
-std::unordered_map<std::string, std::vector<std::string>> StructDependencies;
+// `StructTypes` / `StructDependencies` used to live here as globals
+// shared with the parser. After the parser→sema split, struct-name
+// collection and cycle detection are owned by SemanticAnalyzer
+// (see sema/sema.{h,cpp}); codegen needs neither.
 std::vector<llvm::BasicBlock*> BreakStack;
 std::vector<llvm::BasicBlock*> ContinueStack;
 std::map<std::string, llvm::GlobalVariable*> UniformArrays;
@@ -467,19 +469,43 @@ Value* codegenBuiltin(IRBuilder<>& B,
         return Constant::getNullValue(Type::getInt32Ty(B.getContext()));
     }
     // === texture(sampler, uv) ===
+    //
+    // Lowered as: alloca <4 x float> → call void __tex2d_sample(ptr,u,v,outptr)
+    //             → load <4 x float>.
+    //
+    // Avoids returning <4 x float> by value, which has incompatible ABIs
+    // between LLVM (with `+v`) and host C++. SPIR-V emitter recognises the
+    // call and emits OpImageSampleImplicitLod + OpStore into the alloca.
     if (name=="texture") {
         if(args.size()<2){logError("texture expects at least 2 args");return nullptr;}
         auto* vec4Ty=FixedVectorType::get(Type::getFloatTy(B.getContext()),4);
-        auto* ptrTy=PointerType::getUnqual(B.getContext()); auto* f32Ty=Type::getFloatTy(B.getContext());
+        auto* ptrTy=PointerType::getUnqual(B.getContext());
+        auto* f32Ty=Type::getFloatTy(B.getContext());
+        auto* voidTy=Type::getVoidTy(B.getContext());
+
+        // Hoist the alloca to the entry block.
+        BasicBlock* entryBB = &B.GetInsertBlock()->getParent()->getEntryBlock();
+        IRBuilder<> tmpB(entryBB, entryBB->getFirstInsertionPt());
+        AllocaInst* outAlloca = tmpB.CreateAlloca(vec4Ty, nullptr, "tex.out");
+
         Value* uv=args[1];
         if(uv->getType()->isVectorTy()&&cast<FixedVectorType>(uv->getType())->getNumElements()==3){
             Function* fn=M->getFunction("__texcube_sample");
-            if(!fn){auto* FT=FunctionType::get(vec4Ty,{ptrTy,f32Ty,f32Ty,f32Ty},false);fn=Function::Create(FT,Function::ExternalLinkage,"__texcube_sample",M);}
-            return B.CreateCall(fn,{args[0],B.CreateExtractElement(uv,(uint64_t)0),B.CreateExtractElement(uv,(uint64_t)1),B.CreateExtractElement(uv,(uint64_t)2)},"tex");
+            if(!fn){auto* FT=FunctionType::get(voidTy,{ptrTy,f32Ty,f32Ty,f32Ty,ptrTy},false);fn=Function::Create(FT,Function::ExternalLinkage,"__texcube_sample",M);}
+            B.CreateCall(fn,{args[0],
+                              B.CreateExtractElement(uv,(uint64_t)0),
+                              B.CreateExtractElement(uv,(uint64_t)1),
+                              B.CreateExtractElement(uv,(uint64_t)2),
+                              outAlloca});
+            return B.CreateLoad(vec4Ty, outAlloca, "tex");
         }
         Function* fn=M->getFunction("__tex2d_sample");
-        if(!fn){auto* FT=FunctionType::get(vec4Ty,{ptrTy,f32Ty,f32Ty},false);fn=Function::Create(FT,Function::ExternalLinkage,"__tex2d_sample",M);}
-        return B.CreateCall(fn,{args[0],B.CreateExtractElement(uv,(uint64_t)0),B.CreateExtractElement(uv,(uint64_t)1)},"tex");
+        if(!fn){auto* FT=FunctionType::get(voidTy,{ptrTy,f32Ty,f32Ty,ptrTy},false);fn=Function::Create(FT,Function::ExternalLinkage,"__tex2d_sample",M);}
+        B.CreateCall(fn,{args[0],
+                          B.CreateExtractElement(uv,(uint64_t)0),
+                          B.CreateExtractElement(uv,(uint64_t)1),
+                          outAlloca});
+        return B.CreateLoad(vec4Ty, outAlloca, "tex");
     }
     // === textureLod(sampler, uv, lod) ===
     if (name=="textureLod") {

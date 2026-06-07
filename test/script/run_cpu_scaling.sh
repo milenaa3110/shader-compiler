@@ -47,8 +47,8 @@ mkdir -p result "$BUILD_DIR"
 if [[ "$RVV_ONLY" -eq 0 ]]; then
 
 echo -e "${CYAN}Building objects and binaries…${RESET}"
-make -j"$(nproc)" build/riscv/irgen_riscv >/dev/null 2>&1 || true
-make build/riscv/mandelbrot_rv.o build/riscv/diverge_rv.o >/dev/null 2>&1 || true
+build_target irgen_riscv >/dev/null 2>&1 || true
+build_target mandelbrot_rv.o diverge_rv.o >/dev/null 2>&1 || true
 
 # ── helper: build a fragment-shader bench binary ──────────────────────────────
 build_frag() {
@@ -353,7 +353,7 @@ echo -e "${BOLD}B) Timing: mandelbrot at VLEN=128/256/512 (${FRAG_FRAMES} frames
 if [[ "$NATIVE_RISCV" -eq 1 ]]; then
     echo -e "   ${CYAN}Native RISC-V — VLEN is fixed by hardware; no per-VLEN timing sweep.${RESET}"
     echo -e "   Run at fixed VLEN:"
-    make -j"$(nproc)" "build/riscv/mandelbrot.rv" >/dev/null 2>&1 || true
+    build_target mandelbrot.rv >/dev/null 2>&1 || true
     if [[ -f "build/riscv/mandelbrot.rv" ]]; then
         ms=$(OMP_NUM_THREADS="$MAX_THREADS" ./build/riscv/mandelbrot.rv 2>/dev/null \
              | grep -oE 'avg: [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "N/A")
@@ -364,7 +364,7 @@ elif [[ "$QEMU_VLEN_OK" -eq 0 ]]; then
     echo -e "   The binary is correct for all VLENs; wall-clock difference would be"
     echo -e "   minimal under QEMU anyway (each vector op simulated individually)."
 else
-    make -j"$(nproc)" "build/riscv/mandelbrot.rv" >/dev/null 2>&1 || true
+    build_target mandelbrot.rv >/dev/null 2>&1 || true
     if [[ ! -f "build/riscv/mandelbrot.rv" ]]; then
         echo -e "   ${YELLOW}build/riscv/mandelbrot.rv not found — run make first.${RESET}"
     else
@@ -420,7 +420,7 @@ dump_fn() {
 
 BLR_OPT_LL="build/riscv/blur_cs_rv.opt.ll"
 if [[ ! -f "$BLR_OPT_LL" ]]; then
-    make "build/riscv/blur_cs_rv.o" >/dev/null 2>&1 || true
+    build_target blur_cs_rv.o >/dev/null 2>&1 || true
 fi
 
 if [[ ! -f "$BLR_OPT_LL" ]]; then

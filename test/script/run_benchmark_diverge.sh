@@ -40,15 +40,15 @@ RV_W=256; RV_H=256
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 echo -e "${CYAN}Building…${RESET}"
-make -j"$(nproc)" build/spirv/spirv_vulkan_host build/riscv/irgen_riscv 2>/dev/null | grep -E "^g\+\+|error" || true
-make build/spirv/quad.vert.spv build/spirv/diverge.frag.spv build/spirv/mandelbrot.frag.spv 2>/dev/null
+build_target spirv_vulkan_host irgen_riscv 2>/dev/null | grep -E "^g\+\+|error" || true
+build_target quad.vert.spv diverge.frag.spv mandelbrot.frag.spv 2>/dev/null
 mkdir -p result "$BUILD_DIR"
 
 # ── helper: GPU ms/frame for a given .spv ─────────────────────────────────────
 gpu_ms_for() {
     local spv="$1" name="$2" frames="$3" w="${4:-512}" h="${5:-512}"
     local out
-    out=$(./build/spirv/spirv_vulkan_host build/spirv/quad.vert.spv "$spv" "$name" "$frames" "$w" "$h" --bench 2>/dev/null || true)
+    out=$(./build/spirv/spirv_vulkan_host build/spirv/quad.vert.spv "build/spirv/$spv" "$name" "$frames" "$w" "$h" --bench 2>/dev/null || true)
     echo "$out" | grep 'Vulkan avg:' | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "N/A"
 }
 
@@ -58,7 +58,7 @@ rv_ms_for() {
     local bin="$BUILD_DIR/_bench_${anim}_${w}.rv"
     [[ "$RISCV_AVAIL" -eq 0 ]] && { echo "N/A"; return; }
 
-    make "build/riscv/${anim}_rv.o" >/dev/null 2>&1 || { echo "N/A"; return; }
+    build_target "${anim}_rv.o" >/dev/null 2>&1 || { echo "N/A"; return; }
 
     $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Ipipeline \
         -DANIM_NAME="\"${anim}\"" -DNFRAMES="$frames" \
@@ -95,8 +95,8 @@ echo -e "  Ideal efficiency: diverge ≈ 50%% of mandelbrot time (only half pixe
 echo ""
 
 echo -e "${CYAN}Running GPU…${RESET}"
-GPU_MANDEL=$(gpu_ms_for build/spirv/mandelbrot.frag.spv mandelbrot "$VK_FRAMES")
-GPU_DIVERGE=$(gpu_ms_for build/spirv/diverge.frag.spv   diverge    "$VK_FRAMES")
+GPU_MANDEL=$(gpu_ms_for mandelbrot.frag.spv mandelbrot "$VK_FRAMES")
+GPU_DIVERGE=$(gpu_ms_for diverge.frag.spv   diverge    "$VK_FRAMES")
 
 echo -e "${CYAN}Running CPU (RISC-V + OpenMP)…${RESET}"
 CPU_MANDEL=$(rv_ms_for mandelbrot "$RV_FRAMES" "$RV_W" "$RV_H")
@@ -132,10 +132,10 @@ echo ""
 
 OVERHEAD_FRAMES=$([[ $QUICK -eq 1 ]] && echo 50 || echo 200)
 echo -e "${CYAN}Running GPU at 1×1 (${OVERHEAD_FRAMES} frames)…${RESET}"
-OVERHEAD_MS=$(gpu_ms_for build/spirv/mandelbrot.frag.spv overhead_1x1 "$OVERHEAD_FRAMES" 1 1)
+OVERHEAD_MS=$(gpu_ms_for mandelbrot.frag.spv overhead_1x1 "$OVERHEAD_FRAMES" 1 1)
 
 echo -e "${CYAN}Running GPU at 512×512 (${VK_FRAMES} frames, reference)…${RESET}"
-FULL_MS=$(gpu_ms_for build/spirv/mandelbrot.frag.spv overhead_512 "$VK_FRAMES" 512 512)
+FULL_MS=$(gpu_ms_for mandelbrot.frag.spv overhead_512 "$VK_FRAMES" 512 512)
 
 echo ""
 echo -e "${BOLD}┌──────────────────────┬──────────────┬─────────────────────────────────┐${RESET}"
@@ -169,14 +169,14 @@ echo ""
 
 BOUNDARY_FRAMES=$([[ $QUICK -eq 1 ]] && echo 20 || echo 40)
 echo -e "${CYAN}Running GPU diverge at 64, 256, 512…${RESET}"
-DIV_64=$(gpu_ms_for  build/spirv/diverge.frag.spv  div64  "$BOUNDARY_FRAMES" 64  64)
-DIV_256=$(gpu_ms_for build/spirv/diverge.frag.spv  div256 "$BOUNDARY_FRAMES" 256 256)
-DIV_512=$(gpu_ms_for build/spirv/diverge.frag.spv  div512 "$BOUNDARY_FRAMES" 512 512)
+DIV_64=$(gpu_ms_for  diverge.frag.spv  div64  "$BOUNDARY_FRAMES" 64  64)
+DIV_256=$(gpu_ms_for diverge.frag.spv  div256 "$BOUNDARY_FRAMES" 256 256)
+DIV_512=$(gpu_ms_for diverge.frag.spv  div512 "$BOUNDARY_FRAMES" 512 512)
 
 echo -e "${CYAN}Running GPU mandelbrot at 64, 256, 512 (uniform baseline)…${RESET}"
-MAN_64=$(gpu_ms_for  build/spirv/mandelbrot.frag.spv man64  "$BOUNDARY_FRAMES" 64  64)
-MAN_256=$(gpu_ms_for build/spirv/mandelbrot.frag.spv man256 "$BOUNDARY_FRAMES" 256 256)
-MAN_512=$(gpu_ms_for build/spirv/mandelbrot.frag.spv man512 "$BOUNDARY_FRAMES" 512 512)
+MAN_64=$(gpu_ms_for  mandelbrot.frag.spv man64  "$BOUNDARY_FRAMES" 64  64)
+MAN_256=$(gpu_ms_for mandelbrot.frag.spv man256 "$BOUNDARY_FRAMES" 256 256)
+MAN_512=$(gpu_ms_for mandelbrot.frag.spv man512 "$BOUNDARY_FRAMES" 512 512)
 
 echo ""
 echo -e "${BOLD}┌────────┬────────────────────┬────────────────────┬────────────┬──────────────────────┐${RESET}"

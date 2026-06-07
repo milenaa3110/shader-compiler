@@ -1,0 +1,24 @@
+# .clang-format — project style guide for clangd / clang-format -i.
+#
+# Matches the dominant style in parser/parser.cpp, codegen_state/*,
+# ast/ast.cpp, helpers/*, main/* (4-space, braces on same line, pointer
+# attached to type). A handful of newer files (lexer/lexer.{h,cpp},
+# ast/ast.h, sema/sema.{h,cpp}, test/lexer_test.cpp) currently use 2-space;
+# they'll get normalised the first time anyone runs `clang-format -i` on
+# them. No automatic global reformat — keep the diff for code review.
+
+BasedOnStyle: Google
+IndentWidth: 4
+ContinuationIndentWidth: 4
+AccessModifierOffset: -3
+ColumnLimit: 100
+PointerAlignment: Left
+DerivePointerAlignment: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+BreakBeforeBraces: Attach
+AlignAfterOpenBracket: Align
+SortIncludes: Never  # we order includes by intent, not alphabetically
+Cpp11BracedListStyle: false

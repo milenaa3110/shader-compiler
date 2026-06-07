@@ -173,12 +173,16 @@ fn void main() {
     float whlG = 0.12;
     float whlB = 0.12;
 
-    # Buildings: warm concrete with variation per building
+    # Buildings: warm concrete with per-channel hue variation per building
     float bldgSeed = floor((hz + 3.0) / 6.0);
-    float bVar = sin(bldgSeed * 5.1) * 0.08;
-    float bR = 0.60 + bVar;
-    float bG = 0.55 + bVar;
-    float bB = 0.50 + bVar;
+    float bSeedX = floor(hx / 5.5);
+    float bMix = bldgSeed * 5.1 + bSeedX * 2.7;
+    float bVarR = sin(bMix) * 0.1 + sin(bMix * 1.7) * 0.05;
+    float bVarG = sin(bMix + 1.3) * 0.08;
+    float bVarB = sin(bMix + 2.6) * 0.1;
+    float bR = 0.55 + bVarR;
+    float bG = 0.50 + bVarG;
+    float bB = 0.46 + bVarB;
     # Window pattern on front faces
     float winX = fract(hx * 1.5);
     float winY = fract(hy * 2.0);
@@ -187,6 +191,16 @@ fn void main() {
     bR = mix(bR, 0.25, isWin * onFront);
     bG = mix(bG, 0.30, isWin * onFront);
     bB = mix(bB, 0.40, isWin * onFront);
+
+    # Vertical dirt streaks — accumulate near base, broken by windows
+    float bldgHmat = 2.0 + sin(bldgSeed * 3.7) * 1.2;
+    float streakSeed = hx * 7.0 + hz * 4.3;
+    float streak = sin(streakSeed) * 0.5 + 0.5;
+    streak = streak * streak;
+    float streakMask = (1.0 - clamp(hy / (bldgHmat * 1.2), 0.0, 1.0)) * 0.35 * (1.0 - isWin * onFront);
+    bR = bR * (1.0 - streakMask * streak);
+    bG = bG * (1.0 - streakMask * streak);
+    bB = bB * (1.0 - streakMask * streak * 0.9);
 
     float matR = isGnd * gR + isCar * carR + isWhl * whlR + isBld * bR;
     float matG = isGnd * gG + isCar * carG + isWhl * whlG + isBld * bG;
@@ -197,12 +211,22 @@ fn void main() {
     float sunY = 0.8;
     float sunZ = -0.4;
     float sLen = sqrt(sunX*sunX + sunY*sunY + sunZ*sunZ);
-    float diff = clamp(nx*sunX/sLen + ny*sunY/sLen + nz*sunZ/sLen, 0.0, 1.0);
-    float light = diff * 0.65 + 0.35;
+    float snX = sunX / sLen;
+    float snY = sunY / sLen;
+    float snZ = sunZ / sLen;
+    float diff = clamp(nx*snX + ny*snY + nz*snZ, 0.0, 1.0);
 
-    float fr = matR * light;
-    float fg = matG * light;
-    float fb = matB * light;
+    # Rim light — grazing edges on buildings, tinted by sun direction
+    float ndotv = clamp(-(nx*rdX + ny*rdY + nz*rdZ), 0.0, 1.0);
+    float sunFacing = clamp(-(rdX*snX + rdY*snY + rdZ*snZ), 0.0, 1.0);
+    float rim = pow(1.0 - ndotv, 3.0) * sunFacing * isBld;
+
+    # Stronger contrast: shadow-side darker
+    float light = diff * 0.8 + 0.2;
+
+    float fr = matR * light + rim * 0.35;
+    float fg = matG * light + rim * 0.28;
+    float fb = matB * light + rim * 0.18;
 
     # ── Headlight glow ────────────────────────────────────────────────────────
     float hlX = carX + 1.25;

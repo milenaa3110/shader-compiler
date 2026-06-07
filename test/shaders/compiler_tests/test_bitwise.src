@@ -1,0 +1,27 @@
+# test_bitwise.src - bitwise operators on integers
+# Exercises & | ^ ~ << >> plus operator precedence.
+
+out vec4 FragColor;
+
+fn int bitwise_ops(int a, int b) {
+    int and_ = a & b;
+    int or_  = a | b;
+    int xor_ = a ^ b;
+    int shl_ = a << 2;
+    int shr_ = b >> 1;
+    int not_ = ~a;
+
+    # precedence: | binds looser than ^ binds looser than &;
+    # shifts bind looser than +
+    int p1 = a & b | a ^ b;     # ((a & b) | (a ^ b))
+    int p2 = a + b << 1;        # ((a + b) << 1)
+    int p3 = a & b + b;         # (a & (b + b))
+
+    return and_ + or_ + xor_ + shl_ + shr_ + not_ + p1 + p2 + p3;
+}
+
+@entry @stage(fragment)
+fn void main() {
+    int packed = bitwise_ops(240, 15);
+    FragColor = vec4(float(packed), 0.0, 0.0, 1.0);
+}

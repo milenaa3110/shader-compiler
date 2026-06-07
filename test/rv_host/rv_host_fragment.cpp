@@ -11,6 +11,7 @@
 
 #include "../../pipeline/pipeline_runtime.h"
 #include "../../pipeline/pipeline_abi.h"
+#include "../../error_utils.h"
 
 #include <vector>
 #include <iostream>
@@ -29,7 +30,7 @@ extern "C" float uTime;
 #define ANIM_NAME "anim"
 #endif
 #ifndef NFRAMES
-#define NFRAMES 60
+#define NFRAMES 300
 #endif
 #ifndef WIDTH
 #define WIDTH 256
@@ -48,7 +49,8 @@ int main() {
     constexpr int W = WIDTH, H = HEIGHT;
     mkdir("result", 0755);
     std::vector<unsigned char> img(W * H * 3);
-    PipelineDesc desc{W, H, /*vert_count=*/VERT_COUNT};
+    PipelineDesc desc{W, H, /*vert_count=*/VERT_COUNT,
+                       /*vbuf=*/nullptr, /*indices=*/nullptr, /*index_count=*/0};
     double total_ms = 0.0;
 
     // ffmpeg pipe opened lazily on the first frame — if the process is killed
@@ -72,7 +74,7 @@ int main() {
 
         if (!ffpipe) {
             ffpipe = popen(ff_cmd, "w");
-            if (!ffpipe) { std::cerr << "Cannot open ffmpeg pipe\n"; return 1; }
+            if (!ffpipe) { logError("Cannot open ffmpeg pipe"); return 1; }
         }
         std::fwrite(img.data(), 1, W * H * 3, ffpipe);
         std::cout << "[" ANIM_NAME "] frame " << frame

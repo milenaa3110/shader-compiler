@@ -9,11 +9,11 @@ mkdir -p result build/spirv build
 
 # ── build shaders ─────────────────────────────────────────────────────────────
 echo -e "${CYAN}Compiling terrain shaders…${RESET}"
-make build/spirv/terrain.vert.spv build/spirv/terrain.frag.spv 2>/dev/null && \
+build_target terrain.vert.spv terrain.frag.spv 2>/dev/null && \
     echo -e "  terrain.vert.spv + terrain.frag.spv  ${GREEN}OK${RESET}" || \
     echo -e "  SPIR-V compile  ${YELLOW}SKIP${RESET}"
 
-make build/riscv/terrain_rv.o 2>/dev/null && \
+build_target terrain_rv.o 2>/dev/null && \
     echo -e "  terrain_rv.o  ${GREEN}OK${RESET}" || \
     echo -e "  RISC-V compile  ${YELLOW}SKIP${RESET}"
 
@@ -45,7 +45,7 @@ rv_ms="N/A"; rv_mp4="-"
 if [[ "$RISCV_AVAIL" -eq 0 ]]; then
     echo -e "  ${YELLOW}RISC-V: SKIP (no QEMU and not native RISC-V)${RESET}"
 else
-    make build/riscv/terrain.rv 2>/dev/null
+    build_target terrain.rv 2>/dev/null
     echo -e "\n${CYAN}Running RISC-V (${NTHREADS} threads)…${RESET}"
     rv_out=$(OMP_NUM_THREADS="$NTHREADS" $RISCV_SIM \
         ./build/riscv/terrain.rv 2>/dev/null || true)

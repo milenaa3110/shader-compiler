@@ -2,17 +2,15 @@
 #define PARSER_H
 
 #include "../ast/ast.h"
-#include <memory>
+#include "../ast/ast_context.h"
 
-extern int CurTok;
-int getNextToken();
+#include <string_view>
+#include <vector>
 
-std::unique_ptr<ExprAST> ParseExpression();
-std::unique_ptr<ExprAST> ParsePrimary();
-std::unique_ptr<ExprAST> ParseUnary();
-std::unique_ptr<ExprAST> ParseStatement();
-std::unique_ptr<ExprAST> parseFunction();
-std::unique_ptr<ExprAST> parseReturn();
-std::vector<std::unique_ptr<ExprAST>> ParseProgram();
+// Parses a complete shader from an in-memory source buffer
+// All AST nodes are allocated within 'ctx'. The 'ctx' object must outlive the returned vector and any subsequent use of the nodes.
+// The 'source' buffer must outlive the returned AST, as node identifiers may reference it directly via string_view (zero-allocation parsing).
+// Failed nodes are reported via logErrorAt and omitted from the result
+std::vector<ExprAST*> ParseProgram(ASTContext& ctx, std::string_view source);
 
-#endif // PARSER_H
+#endif  // PARSER_H

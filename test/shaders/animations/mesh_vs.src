@@ -1,0 +1,45 @@
+# mesh_vs.src — Vertex shader for an indexed triangle mesh.
+# Reads per-vertex position, normal, and UV; orbits the model around Y;
+# performs perspective projection. Same source compiles for GPU (Vulkan host
+# uses a negative-height viewport for Vulkan's Y-down NDC) and CPU.
+
+in vec3 aPos;
+in vec3 aNormal;
+in vec2 aUV;
+
+uniform float uTime;
+out vec3 vNormalWorld;
+out vec2 vUV;
+
+@entry @stage(vertex)
+fn void main() {
+    float c = cos(uTime * 0.5);
+    float s = sin(uTime * 0.5);
+
+    float wx =  aPos.x * c + aPos.z * s;
+    float wy =  aPos.y;
+    float wz = -aPos.x * s + aPos.z * c;
+
+    float nx =  aNormal.x * c + aNormal.z * s;
+    float ny =  aNormal.y;
+    float nz = -aNormal.x * s + aNormal.z * c;
+
+    vNormalWorld = vec3(nx, ny, nz);
+    vUV = aUV;
+
+    float camDist = 3.0;
+    float ex = wx;
+    float ey = wy;
+    float ez = wz - camDist;
+
+    float fovScale = 1.5;
+    float zNear = 0.1;
+    float zFar  = 50.0;
+
+    float px = ex * fovScale;
+    float py = ey * fovScale;
+    float az = -(zFar * ez + zFar * zNear) / (zFar - zNear);
+    float aw = -ez;
+
+    gl_Position = vec4(px, py, az, aw);
+}

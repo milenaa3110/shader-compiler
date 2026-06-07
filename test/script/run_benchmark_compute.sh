@@ -34,7 +34,7 @@ for arg in "$@"; do
 done
 
 echo -e "${CYAN}Building…${RESET}"
-make -j"$(nproc)" build/spirv/spirv_vulkan_life_host build/spirv/life.comp.spv 2>/dev/null | \
+build_target spirv_vulkan_life_host life.comp.spv 2>/dev/null | \
     grep -E "^g\+\+|error" || true
 
 mkdir -p result "$BUILD_DIR"

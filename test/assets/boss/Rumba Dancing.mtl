@@ -1,0 +1,53 @@
+# MTL file - created by a modified js OBJExporter
+
+newmtl Clothes_MAT
+Tr 0.0000
+Tf 1.0000 1.0000 1.0000
+illum 1
+Pr 0.39235638216435875
+Pds 1
+Pl 1
+Ka 1 1 1
+Kd 1 1 1
+Ke 0 0 0
+map_Kd Clothes_MAT.png
+norm normalMap1.png
+
+newmtl Cigar_Mat
+Tr 0.0000
+Tf 1.0000 1.0000 1.0000
+illum 1
+Pr 0.6491767891405844
+Pds 1
+Pl 1
+Ka 1 1 1
+Kd 1 1 1
+Ke 0 0 0
+map_Kd Clothes_MAT.png
+norm normalMap1.png
+
+newmtl Skin_MAT
+Tr 0.0000
+Tf 1.0000 1.0000 1.0000
+illum 1
+Pr 0.6278957913036771
+Pds 1
+Pl 1
+Ka 1 1 1
+Kd 1 1 1
+Ke 0 0 0
+map_Kd Clothes_MAT.png
+norm normalMap1.png
+
+newmtl Eyes_MAT
+Tr 0.0000
+Tf 1.0000 1.0000 1.0000
+illum 1
+Pr 0.031257757402531006
+Pds 1
+Pl 1
+Ka 1 1 1
+Kd 1 1 1
+Ke 0 0 0
+map_Kd Clothes_MAT.png
+norm normalMap1.png

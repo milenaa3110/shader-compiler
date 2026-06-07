@@ -1,0 +1,76 @@
+# mesh_fs.src — Indexed-mesh fragment shader.
+# Combines a sampled albedo texture with Lambert + Blinn-Phong + fresnel rim.
+# Both backends share this source: GPU samples via the hardware TMU; CPU
+# samples via the software bilinear sampler in pipeline_runtime.cpp.
+
+uniform sampler2D tex;
+# uTime is unused here but declared so the FS's push-constant block layout
+# matches the VS's: uTime at offset 0, uKd (vec4) at offset 16 under std140.
+# The host pushes both values in one 32-byte range covering both stages.
+uniform float uTime;
+# Per-draw material colour (Kd). Materials without a diffuse-map bind a 1x1
+# white texture and rely on uKd for their colour; textured materials sample
+# the texture and modulate by uKd. uKd.w is unused — vec4 chosen over vec3
+# to avoid std140 alignment surprises in the GPU push-constant block.
+uniform vec4 uKd;
+in vec3 vNormalWorld;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    # Re-normalise the interpolated normal.
+    float nLen = sqrt(vNormalWorld.x * vNormalWorld.x +
+                      vNormalWorld.y * vNormalWorld.y +
+                      vNormalWorld.z * vNormalWorld.z) + 0.0001;
+    float nx = vNormalWorld.x / nLen;
+    float ny = vNormalWorld.y / nLen;
+    float nz = vNormalWorld.z / nLen;
+
+    # ── Light + view directions ──────────────────────────────────────────────
+    float sunX = 0.40;
+    float sunY = 0.80;
+    float sunZ = 0.45;
+    float sLen = sqrt(sunX*sunX + sunY*sunY + sunZ*sunZ);
+    sunX = sunX / sLen;
+    sunY = sunY / sLen;
+    sunZ = sunZ / sLen;
+
+    float vx = 0.0;
+    float vy = 0.0;
+    float vz = 1.0;
+
+    # ── Albedo from texture ──────────────────────────────────────────────────
+    vec4 albedo = texture(tex, vUV);
+
+    # ── Lambert + Blinn-Phong + fresnel ──────────────────────────────────────
+    float diff = clamp(nx*sunX + ny*sunY + nz*sunZ, 0.0, 1.0);
+
+    float hx = sunX + vx;
+    float hy = sunY + vy;
+    float hz = sunZ + vz;
+    float hLen = sqrt(hx*hx + hy*hy + hz*hz) + 0.0001;
+    hx = hx / hLen;
+    hy = hy / hLen;
+    hz = hz / hLen;
+    float NdotH = clamp(nx*hx + ny*hy + nz*hz, 0.0, 1.0);
+    float spec = pow(NdotH, 48.0) * 0.6;
+
+    float NdotV = clamp(nx*vx + ny*vy + nz*vz, 0.0, 1.0);
+    float rim = pow(1.0 - NdotV, 3.0) * 0.35;
+
+    float ambient = 0.20;
+    float lambert = diff * 0.85 + ambient;
+
+    # Tint spec + rim by uKd. Without this, additive grayscale highlights
+    # wash mid-saturation materials (the bunny's tan default) toward white,
+    # and they amplify any small interpolated-normal difference between the
+    # CPU rasterizer and the GPU into a visible CPU-vs-GPU colour divergence
+    # because pow(NdotH, 48) is precision-sensitive. With the tint, every
+    # pixel's R:G:B ratio is set by uKd, so both backends agree on hue.
+    float hi = spec + rim;
+    FragColor = vec4(albedo.x * uKd.x * lambert + uKd.x * hi,
+                     albedo.y * uKd.y * lambert + uKd.y * hi,
+                     albedo.z * uKd.z * lambert + uKd.z * hi,
+                     1.0);
+}

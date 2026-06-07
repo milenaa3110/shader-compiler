@@ -5,7 +5,7 @@
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Verifier.h>
 #include "../codegen_state/codegen_state.h"
-#include "../error_utils.h"
+#include "../error_utils_fmt.h"
 #include "../helpers/utils.h"
 #include "../helpers/assignment_helpers.h"
 #include "../helpers/call_helpers.h"
@@ -19,22 +19,22 @@ std::vector<StageVar> StageOutputVars;
 static bool allPathsReturn(const ExprAST* body) {
     if (!body) return false;
 
-    if (auto* block = dynamic_cast<const BlockExprAST*>(body)) {
+    if (auto* block = llvm::dyn_cast<BlockExprAST>(body)) {
         if (block->Statements.empty()) return false;
         // Only the last statement can guarantee function termination
-        return allPathsReturn(block->Statements.back().get());
+        return allPathsReturn(block->Statements.back());
     }
 
-    if (dynamic_cast<const ReturnStmtAST*>(body)) {
+    if (llvm::isa<ReturnStmtAST>(body)) {
         return true;
     }
 
-    if (auto* ifExpr = dynamic_cast<const IfExprAST*>(body)) {
+    if (auto* ifExpr = llvm::dyn_cast<IfExprAST>(body)) {
         // Must have else, and both branches must return
         if (!ifExpr->ThenExpr) return false;
         if (!ifExpr->ElseExpr) return false;
-        return allPathsReturn(ifExpr->ThenExpr.get()) &&
-               allPathsReturn(ifExpr->ElseExpr.get());
+        return allPathsReturn(ifExpr->ThenExpr) &&
+               allPathsReturn(ifExpr->ElseExpr);
     }
 
     return false;
@@ -55,6 +55,7 @@ static Value* toBool(Value* v) {
         return Builder->CreateFCmpUNE(v, zero, "tobool");
     }
 
+    // toBool is a free helper with no AST node in scope — left unlocated.
     logError("Cannot convert to bool");
     return nullptr;
 }
@@ -79,7 +80,7 @@ Value* VariableExprAST::codegen() {
             return Builder->CreateLoad(G->getValueType(), G, Name);
         }
     }
-    logError(fmt::format("Unknown variable or uniform: {}", Name));
+    logErrorAt(line, col,fmt::format("Unknown variable or uniform: {}", Name));
     return nullptr;
 }
 
@@ -87,26 +88,26 @@ Value* VariableExprAST::codegen() {
 Value* UnaryExprAST::codegen() {
     Value* v = Operand->codegen();
     if (!v) {
-        logError("Unary codegen: operand is null");
+        logErrorAt(line, col,"Unary codegen: operand is null");
         return nullptr;
     }
 
-    if (Op == tok_minus || Op == '-') {
+    if (Op == TokenKind::Minus) {
         if (v->getType()->isFPOrFPVectorTy()) {
             return Builder->CreateFNeg(v, "neg");
         }
         if (v->getType()->isIntOrIntVectorTy()) {
             if (v->getType()->isIntegerTy(1)) {
-                logError("Negation not supported for boolean type");
+                logErrorAt(line, col,"Negation not supported for boolean type");
                 return nullptr;
             }
             return Builder->CreateNeg(v, "neg");
         }
-        logError(fmt::format("Negation not supported for type: {}", v->getType()->getStructName()));
+        logErrorAt(line, col,fmt::format("Negation not supported for type: {}", v->getType()->getStructName()));
         return nullptr;
     }
 
-    if (Op == tok_not || Op == '!') {
+    if (Op == TokenKind::Not) {
         if (v->getType()->isIntegerTy(1)) {
             return Builder->CreateNot(v, "not");
         }
@@ -114,11 +115,34 @@ Value* UnaryExprAST::codegen() {
             auto *one = ConstantInt::get(v->getType(), 1);
             return Builder->CreateXor(v, one, "not");
         }
-        logError("Logical NOT (!) requires boolean type");
+        logErrorAt(line, col,"Logical NOT (!) requires boolean type");
         return nullptr;
     }
-    
-    logError("Unknown unary operator: " + std::string(1, Op));
+
+    // bitwise complement — integer scalars/vectors only
+    if (Op == TokenKind::BitwiseNot) {
+        // Fold an integral float *constant* (number literals codegen as
+        // float) to i32 so `~5` works; non-constant floats stay and error.
+        if (auto* cf = dyn_cast<ConstantFP>(v)) {
+            const APFloat& apf = cf->getValueAPF();
+            double d = cf->getType()->isDoubleTy()
+                         ? apf.convertToDouble()
+                         : (double)apf.convertToFloat();
+            v = ConstantInt::get(Type::getInt32Ty(*Context), (int64_t)d);
+        }
+        if (v->getType()->isIntegerTy(1)) {
+            logErrorAt(line, col,"Bitwise NOT (~) requires an integer type, not bool");
+            return nullptr;
+        }
+        if (v->getType()->isIntOrIntVectorTy()) {
+            return Builder->CreateNot(v, "bnot");
+        }
+        logErrorAt(line, col,"Bitwise NOT (~) requires an integer type");
+        return nullptr;
+    }
+
+    logErrorAt(line, col,
+               std::string("Unknown unary operator: ") + tokenKindName(Op));
     return nullptr;
 }
 
@@ -128,72 +152,116 @@ Value* BinaryExprAST::codegen() {
     Value* R = RHS->codegen();
     if (!L || !R) return nullptr;
 
+    // Bitwise operators need integer operands, but number literals always
+    // codegen as float (`NumberExprAST`). Fold an integral float *constant*
+    // to an i32 constant here, before the generic, float-promoting
+    // `makeTypesMatch` below would otherwise drag the whole expression into
+    // floating point. A non-constant float operand is left alone — it will
+    // fail the integer check in the bitwise branch with a clear error.
+    const bool isBitwise =
+        (Op == TokenKind::BitwiseAnd || Op == TokenKind::BitwiseOr ||
+         Op == TokenKind::BitwiseXor || Op == TokenKind::ShiftLeft ||
+         Op == TokenKind::ShiftRight);
+    if (isBitwise) {
+        auto foldConstFP = [](Value* v) -> Value* {
+            auto* cf = dyn_cast<ConstantFP>(v);
+            if (!cf) return v;
+            const APFloat& apf = cf->getValueAPF();
+            double d = cf->getType()->isDoubleTy()
+                         ? apf.convertToDouble()
+                         : (double)apf.convertToFloat();
+            return ConstantInt::get(Type::getInt32Ty(*Context), (int64_t)d);
+        };
+        L = foldConstFP(L);
+        R = foldConstFP(R);
+    }
+
     if (!makeTypesMatch(L, R)) {
-        logError("Type mismatch in binary op");
+        logErrorAt(line, col,"Type mismatch in binary op");
         return nullptr;
     }
 
     Type* opType = L->getType();
 
     // arithmetic operators
-    if (Op == tok_plus || Op == '+') {
+    if (Op == TokenKind::Plus) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFAdd(L, R, "addtmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateAdd(L, R, "addtmp");
     }
-    
-    if (Op == tok_minus || Op == '-') {
+
+    if (Op == TokenKind::Minus) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFSub(L, R, "subtmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateSub(L, R, "subtmp");
     }
-    
-    if (Op == tok_multiply || Op == '*') {
+
+    if (Op == TokenKind::Multiply) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFMul(L, R, "multmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateMul(L, R, "multmp");
     }
-    
-    if (Op == tok_divide || Op == '/') {
+
+    if (Op == TokenKind::Divide) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFDiv(L, R, "divtmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateSDiv(L, R, "divtmp");
     }
 
-    if (Op == '%') {
+    if (Op == TokenKind::Percent) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFRem(L, R, "remtmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateURem(L, R, "remtmp");
     }
 
+    // bitwise operators — integer scalars/vectors only. `>>` is an arithmetic
+    // (sign-propagating) shift: the language has no separate uint type at the
+    // LLVM level, so `int` semantics are assumed.
+    if (Op == TokenKind::BitwiseAnd || Op == TokenKind::BitwiseOr ||
+        Op == TokenKind::BitwiseXor || Op == TokenKind::ShiftLeft ||
+        Op == TokenKind::ShiftRight) {
+        if (!opType->isIntOrIntVectorTy()) {
+            logErrorAt(line, col,"Bitwise operators require integer operands");
+            return nullptr;
+        }
+        switch (Op) {
+            case TokenKind::BitwiseAnd: return Builder->CreateAnd(L, R, "andtmp");
+            case TokenKind::BitwiseOr:  return Builder->CreateOr (L, R, "ortmp");
+            case TokenKind::BitwiseXor: return Builder->CreateXor(L, R, "xortmp");
+            case TokenKind::ShiftLeft:  return Builder->CreateShl(L, R, "shltmp");
+            case TokenKind::ShiftRight: return Builder->CreateAShr(L, R, "shrtmp");
+            default: break;
+        }
+    }
+
     // comparison operators
-    if (Op == tok_less || Op == '<') {
+    if (Op == TokenKind::Less) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFCmpOLT(L, R, "cmptmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateICmpSLT(L, R, "cmptmp");
     }
-    
-    if (Op == tok_less_equal) {
+
+    if (Op == TokenKind::LessEqual) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFCmpOLE(L, R, "cmptmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateICmpSLE(L, R, "cmptmp");
     }
-    
-    if (Op == tok_greater || Op == '>') {
+
+    if (Op == TokenKind::Greater) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFCmpOGT(L, R, "cmptmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateICmpSGT(L, R, "cmptmp");
     }
-    
-    if (Op == tok_greater_equal) {
+
+    if (Op == TokenKind::GreaterEqual) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFCmpOGE(L, R, "cmptmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateICmpSGE(L, R, "cmptmp");
     }
-    
-    if (Op == tok_equal) {
+
+    if (Op == TokenKind::Equal) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFCmpOEQ(L, R, "cmptmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateICmpEQ(L, R, "cmptmp");
     }
-    
-    if (Op == tok_not_equal) {
+
+    if (Op == TokenKind::NotEqual) {
         if (opType->isFPOrFPVectorTy()) return Builder->CreateFCmpONE(L, R, "cmptmp");
         if (opType->isIntOrIntVectorTy()) return Builder->CreateICmpNE(L, R, "cmptmp");
     }
 
     // logical operators
-    if (Op == tok_and || Op == tok_or) {
+    if (Op == TokenKind::And || Op == TokenKind::Or) {
         Function* F = Builder->GetInsertBlock()->getParent();
 
         Value* L = LHS->codegen();
@@ -210,7 +278,7 @@ Value* BinaryExprAST::codegen() {
         BasicBlock* RHSBB   = BasicBlock::Create(*Context, "logical.rhs", F);
         BasicBlock* MergeBB = BasicBlock::Create(*Context, "logical.merge", F);
 
-        if (Op == tok_and) {
+        if (Op == TokenKind::And) {
             Builder->CreateCondBr(Lbool, RHSBB, MergeBB);
         } else {
             Builder->CreateCondBr(Lbool, MergeBB, RHSBB);
@@ -229,7 +297,7 @@ Value* BinaryExprAST::codegen() {
             Builder->SetInsertPoint(MergeBB);
             PHINode* PN = Builder->CreatePHI(Type::getInt1Ty(*Context), 2, "logic.result");
 
-            Value* shortVal = (Op == tok_and)
+            Value* shortVal = (Op == TokenKind::And)
                 ? ConstantInt::getFalse(*Context)
                 : ConstantInt::getTrue(*Context);
 
@@ -240,14 +308,15 @@ Value* BinaryExprAST::codegen() {
 
 
         Builder->SetInsertPoint(MergeBB);
-        return (Op == tok_and)
+        return (Op == TokenKind::And)
             ? ConstantInt::getFalse(*Context)
             : ConstantInt::getTrue(*Context);
 
     }
 
 
-    logError("Unsupported binary operator: " + std::string(1, Op));
+    logErrorAt(line, col,
+               std::string("Unsupported binary operator: ") + tokenKindName(Op));
     return nullptr;
 }
 
@@ -315,12 +384,12 @@ Value *MemberAccessExprAST::codegen() {
     } else if (auto *GV = dyn_cast<GlobalVariable>(obj)) {
       pointedTy = GV->getValueType();
     } else {
-      logError("Cannot determine pointed-to type for member access");
+      logErrorAt(line, col,"Cannot determine pointed-to type for member access");
       return nullptr;
     }
 
     if (!pointedTy) {
-      logError("Cannot determine pointed-to type for member access");
+      logErrorAt(line, col,"Cannot determine pointed-to type for member access");
       return nullptr;
     }
 
@@ -338,22 +407,22 @@ Value *MemberAccessExprAST::codegen() {
     return extractVectorComponents(obj, cast<FixedVectorType>(objTy), Member);
   }
 
-  logError(fmt::format("Member access only supported on structs and vectors, got type with ID {}", objTy->getTypeID()));
+  logErrorAt(line, col,fmt::format("Member access only supported on structs and vectors, got type with ID {}", objTy->getTypeID()));
   return nullptr;
 }
 
 // Member assignment - struct field or vector swizzle
 llvm::Value* MemberAssignmentExprAST::codegen() {
     // MATRIX column: mat[col].xy = ...
-    if (auto* matAccess = dynamic_cast<MatrixAccessExprAST*>(Object.get())) {
-        MatrixColumnAssigner assigner(matAccess, Member, Init.get());
+    if (auto* matAccess = llvm::dyn_cast<MatrixAccessExprAST>(Object)) {
+        MatrixColumnAssigner assigner(matAccess, Member, Init);
         return assigner.codegen();
     }
-    
+
     // Find variable alloca (struct/vector)
     AllocaInst* alloca = nullptr;
     VariableExprAST* baseVar = nullptr;
-    if (auto* varExpr = dynamic_cast<VariableExprAST*>(Object.get())) {
+    if (auto* varExpr = llvm::dyn_cast<VariableExprAST>(Object)) {
         auto it = NamedValues.find(varExpr->Name);
         if (it != NamedValues.end()) {
             alloca = it->second;
@@ -362,7 +431,7 @@ llvm::Value* MemberAssignmentExprAST::codegen() {
     }
     
     if (!alloca) {
-        logError("Assignment LHS must be variable (e.g., a.xy = ..., lights[0].prop1 = ...)");
+        logErrorAt(line, col,"Assignment LHS must be variable (e.g., a.xy = ..., lights[0].prop1 = ...)");
         return nullptr;
     }
     
@@ -370,17 +439,17 @@ llvm::Value* MemberAssignmentExprAST::codegen() {
     
     // STRUCT field: light.pos.x = ...
     if (objTy->isStructTy()) {
-        StructFieldAssigner assigner(Object.get(), Member, Init.get());
+        StructFieldAssigner assigner(Object, Member, Init);
         return assigner.codegen();
     }
-    
+
     // VECTOR swizzle: pos.xy = ...
     if (objTy->isVectorTy()) {
-        VectorSwizzleAssigner assigner(Object.get(), Member, Init.get());
+        VectorSwizzleAssigner assigner(Object, Member, Init);
         return assigner.codegen();
     }
     
-    logError("Unsupported member assignment type");
+    logErrorAt(line, col,"Unsupported member assignment type");
     return nullptr;
 }
 
@@ -414,12 +483,12 @@ Value* CallExprAST::codegen() {
     // User-defined function
     Function* CalleeF = TheModule->getFunction(Callee);
     if (!CalleeF) {
-        logError("Unknown function referenced: " + Callee);
+        logErrorAt(line, col,"Unknown function referenced: " + Callee);
         return nullptr;
     }
 
     if (CalleeF->arg_size() != Args.size()) {
-        logError(fmt::format("Incorrect number of arguments for function {}. Expected {}, got {}",
+        logErrorAt(line, col,fmt::format("Incorrect number of arguments for function {}. Expected {}, got {}",
                            Callee, CalleeF->arg_size(), Args.size()));
         return nullptr;
     }
@@ -432,7 +501,7 @@ Value* CallExprAST::codegen() {
         if (argVal->getType() != expectedTy) {
             Value* casted = castScalarTo(argVal, expectedTy);
             if (!casted) {
-                logError(fmt::format("Cannot cast argument {} to expected type for function {}", i, Callee));
+                logErrorAt(line, col,fmt::format("Cannot cast argument {} to expected type for function {}", i, Callee));
                 return nullptr;
             }
             argVal = casted;
@@ -536,7 +605,7 @@ llvm::Value* AssignmentExprAST::codegen() {
     if (VarType.empty()) {
         auto it = NamedValues.find(VarName);
         if (it == NamedValues.end()) {
-            logError(fmt::format("Undefined variable in assignment: {}", VarName));
+            logErrorAt(line, col,fmt::format("Undefined variable in assignment: {}", VarName));
             return nullptr;
         }
         AllocaInst* Alloca = it->second;
@@ -549,14 +618,14 @@ llvm::Value* AssignmentExprAST::codegen() {
                 Type* elemTy = vecTy->getElementType();
                 Value* scalar = castScalarTo(val, elemTy);
                 if (!scalar) {
-                    logError("Cannot cast scalar to vector element type");
+                    logErrorAt(line, col,"Cannot cast scalar to vector element type");
                     return nullptr;
                 }
                 val = splatScalarToVector(scalar, vecTy);
             } else {
                 Value* casted = castScalarTo(val, targetType);
                 if (!casted) {
-                    logError("Cannot cast value to target type");
+                    logErrorAt(line, col,"Cannot cast value to target type");
                     return nullptr;
                 }
                 val = casted;
@@ -570,7 +639,7 @@ llvm::Value* AssignmentExprAST::codegen() {
     // EXISTING CODE for declaration with initialization - remains the same!
     Type* Ty = resolveTypeByName(VarType);
     if (!Ty) {
-        logError(fmt::format("Unknown type in assignment: {}", VarType));
+        logErrorAt(line, col,fmt::format("Unknown type in assignment: {}", VarType));
         return nullptr;
     }
 
@@ -584,7 +653,7 @@ llvm::Value* AssignmentExprAST::codegen() {
     } else {
         Alloca = it->second;
         if (Alloca->getAllocatedType() != Ty) {
-            logError(fmt::format("Type mismatch for variable '{}'", VarName));
+            logErrorAt(line, col,fmt::format("Type mismatch for variable '{}'", VarName));
             return nullptr;
         }
     }
@@ -595,12 +664,12 @@ llvm::Value* AssignmentExprAST::codegen() {
             Type* elemTy = vecTy->getElementType();
 
             if (val->getType()->isVectorTy()) {
-                logError(fmt::format("Vector type mismatch in assignment to {}", VarName));
+                logErrorAt(line, col,fmt::format("Vector type mismatch in assignment to {}", VarName));
                 return nullptr;
             } else {
                 Value* scalar = castScalarTo(val, elemTy);
                 if (!scalar) {
-                    logError("Cannot cast scalar to vector element type");
+                    logErrorAt(line, col,"Cannot cast scalar to vector element type");
                     return nullptr;
                 }
                 val = splatScalarToVector(scalar, vecTy);
@@ -608,12 +677,12 @@ llvm::Value* AssignmentExprAST::codegen() {
         } else if (Ty->isDoubleTy() || Ty->isFloatTy() || Ty->isIntegerTy()) {
             Value* casted = castScalarTo(val, Ty);
             if (!casted) {
-                logError("Cannot cast initializer to target scalar type");
+                logErrorAt(line, col,"Cannot cast initializer to target scalar type");
                 return nullptr;
             }
             val = casted;
         } else {
-            logError("Unsupported target type in assignment");
+            logErrorAt(line, col,"Unsupported target type in assignment");
             return nullptr;
         }
     }
@@ -623,9 +692,9 @@ llvm::Value* AssignmentExprAST::codegen() {
 }
 
 Value *MatrixAccessExprAST::codegen() {
-    auto *lhsVar = dynamic_cast<VariableExprAST *>(Object.get());
+    auto *lhsVar = llvm::dyn_cast<VariableExprAST>(Object);
     if (!lhsVar) {
-        logError("Matrix/array access LHS must be a variable (e.g., M[i] or M[i][j])");
+        logErrorAt(line, col,"Matrix/array access LHS must be a variable (e.g., M[i] or M[i][j])");
         return nullptr;
     }
 
@@ -635,7 +704,7 @@ Value *MatrixAccessExprAST::codegen() {
         Type *baseTy       = alloca->getAllocatedType();
 
         if (!baseTy->isArrayTy()) {
-            logError("Matrix/array access only supported on array types for local vars");
+            logErrorAt(line, col,"Matrix/array access only supported on array types for local vars");
             return nullptr;
         }
 
@@ -644,7 +713,7 @@ Value *MatrixAccessExprAST::codegen() {
 
         // first index
         if (!Index) {
-            logError("Array/matrix access requires first index");
+            logErrorAt(line, col,"Array/matrix access requires first index");
             return nullptr;
         }
 
@@ -652,7 +721,7 @@ Value *MatrixAccessExprAST::codegen() {
         if (!iVal) return nullptr;
         iVal = toI32(iVal);
         if (!iVal) {
-            logError("First index is not convertible to i32");
+            logErrorAt(line, col,"First index is not convertible to i32");
             return nullptr;
         }
 
@@ -669,7 +738,7 @@ Value *MatrixAccessExprAST::codegen() {
         }
 
         if (!elemTy->isVectorTy()) {
-            logError("Second index is only valid for matrix (array-of-vector)");
+            logErrorAt(line, col,"Second index is only valid for matrix (array-of-vector)");
             return nullptr;
         }
 
@@ -680,7 +749,7 @@ Value *MatrixAccessExprAST::codegen() {
         if (!jVal) return nullptr;
         jVal = toI32(jVal);
         if (!jVal) {
-            logError("Second index is not convertible to i32");
+            logErrorAt(this->line, this->col,"Second index is not convertible to i32");
             return nullptr;
         }
 
@@ -703,7 +772,7 @@ Value *MatrixAccessExprAST::codegen() {
         Value* iVal = Index->codegen();
         if (!iVal) return nullptr;
         iVal = toI32(iVal);
-        if (!iVal) { logError("Storage buffer index not convertible to i32"); return nullptr; }
+        if (!iVal) { logErrorAt(line, col,"Storage buffer index not convertible to i32"); return nullptr; }
         // GEP into the buffer: getelementptr elemTy, ptr %p, i32 idx
         Value* elemPtr = Builder->CreateInBoundsGEP(
             info.elemTy, bufPtr, {iVal}, lhsVar->Name + ".elem.ptr");
@@ -712,7 +781,7 @@ Value *MatrixAccessExprAST::codegen() {
 
     auto uit = UniformArrays.find(lhsVar->Name);
     if (uit == UniformArrays.end()) {
-        logError(fmt::format("Unknown variable '{}' in matrix/array access", lhsVar->Name));
+        logErrorAt(line, col,fmt::format("Unknown variable '{}' in matrix/array access", lhsVar->Name));
         return nullptr;
     }
 
@@ -720,7 +789,7 @@ Value *MatrixAccessExprAST::codegen() {
     Type *baseTy = gv->getValueType();
 
     if (!baseTy->isArrayTy()) {
-        logError(fmt::format("Uniform '{}' is not an array type", lhsVar->Name));
+        logErrorAt(line, col,fmt::format("Uniform '{}' is not an array type", lhsVar->Name));
         return nullptr;
     }
 
@@ -728,7 +797,7 @@ Value *MatrixAccessExprAST::codegen() {
     Type *elemTy = arrTy->getElementType();
 
     if (!Index) {
-        logError(fmt::format("Uniform array '{}' requires an index", lhsVar->Name));
+        logErrorAt(line, col,fmt::format("Uniform array '{}' requires an index", lhsVar->Name));
         return nullptr;
     }
 
@@ -736,7 +805,7 @@ Value *MatrixAccessExprAST::codegen() {
     if (!iVal) return nullptr;
     iVal = toI32(iVal);
     if (!iVal) {
-        logError("First index is not convertible to i32 for uniform array");
+        logErrorAt(line, col,"First index is not convertible to i32 for uniform array");
         return nullptr;
     }
 
@@ -754,7 +823,7 @@ Value *MatrixAccessExprAST::codegen() {
 
     // Uniform matrix = uniform array-of-vector (e.g., uniform mat4x4 in Mat[4])
     if (!elemTy->isVectorTy()) {
-        logError("Second index is only valid for matrix-like uniform (array-of-vector)");
+        logErrorAt(line, col,"Second index is only valid for matrix-like uniform (array-of-vector)");
         return nullptr;
     }
 
@@ -765,7 +834,7 @@ Value *MatrixAccessExprAST::codegen() {
     if (!jVal) return nullptr;
     jVal = toI32(jVal);
     if (!jVal) {
-        logError("Second index is not convertible to i32 for uniform matrix");
+        logErrorAt(this->line, this->col,"Second index is not convertible to i32 for uniform matrix");
         return nullptr;
     }
 
@@ -774,9 +843,9 @@ Value *MatrixAccessExprAST::codegen() {
 
 // Matrix / storage-buffer element assignment: a[i] = val  or  a[i][j] = val
 Value* MatrixAssignmentExprAST::codegen() {
-    auto* lhsVar = dynamic_cast<VariableExprAST*>(Object.get());
+    auto* lhsVar = llvm::dyn_cast<VariableExprAST>(Object);
     if (!lhsVar) {
-        logError("Array assignment LHS must be a named variable");
+        logErrorAt(line, col,"Array assignment LHS must be a named variable");
         return nullptr;
     }
 
@@ -792,7 +861,7 @@ Value* MatrixAssignmentExprAST::codegen() {
         Value* iVal = Index->codegen();
         if (!iVal) return nullptr;
         iVal = toI32(iVal);
-        if (!iVal) { logError("Storage buffer index not convertible to i32"); return nullptr; }
+        if (!iVal) { logErrorAt(line, col,"Storage buffer index not convertible to i32"); return nullptr; }
         Value* elemPtr = Builder->CreateInBoundsGEP(
             info.elemTy, bufPtr, {iVal}, lhsVar->Name + ".wr.ptr");
         Value* rhs = RHS->codegen();
@@ -812,13 +881,13 @@ Value* MatrixAssignmentExprAST::codegen() {
     // Local array write: arr[i] = val
     auto it = NamedValues.find(lhsVar->Name);
     if (it == NamedValues.end()) {
-        logError(fmt::format("Unknown variable '{}' in array assignment", lhsVar->Name));
+        logErrorAt(line, col,fmt::format("Unknown variable '{}' in array assignment", lhsVar->Name));
         return nullptr;
     }
     AllocaInst* alloca = it->second;
     Type* matTy = alloca->getAllocatedType();
     if (!matTy->isArrayTy()) {
-        logError(fmt::format("'{}' is not an array type", lhsVar->Name));
+        logErrorAt(line, col,fmt::format("'{}' is not an array type", lhsVar->Name));
         return nullptr;
     }
     auto* arrTy = cast<ArrayType>(matTy);
@@ -857,7 +926,7 @@ llvm::Value* PrototypeAST::codegen() {
     } else {
         retTy = resolveTypeByName(RetType);
         if (!retTy) { 
-            logError(fmt::format("Unknown return type: {}", RetType));
+            logErrorAt(line, col,fmt::format("Unknown return type: {}", RetType));
             return nullptr; 
         }
     }
@@ -868,7 +937,7 @@ llvm::Value* PrototypeAST::codegen() {
     for (auto& [tyName, argName] : Args) {
         Type* ty = resolveTypeByName(tyName);
         if (!ty) { 
-            logError(fmt::format("Unknown param type: {}", tyName));
+            logErrorAt(line, col,fmt::format("Unknown param type: {}", tyName));
             return nullptr; 
         }
         paramTys.push_back(ty);
@@ -910,7 +979,7 @@ llvm::Value* FunctionAST::codegen() {
             outVarTypes.push_back(vec4Ty);
             for (auto& sv : StageOutputVars) {
                 Type* t = resolveTypeByName(sv.typeName);
-                if (!t) { logError(fmt::format("Unknown out-var type: {}", sv.typeName)); return nullptr; }
+                if (!t) { logErrorAt(line, col,fmt::format("Unknown out-var type: {}", sv.typeName)); return nullptr; }
                 outVarNames.push_back(sv.name);
                 outVarTypes.push_back(t);
             }
@@ -918,7 +987,7 @@ llvm::Value* FunctionAST::codegen() {
         } else if (stage == ShaderStage::Fragment) {
             for (auto& sv : StageOutputVars) {
                 Type* t = resolveTypeByName(sv.typeName);
-                if (!t) { logError(fmt::format("Unknown out-var type: {}", sv.typeName)); return nullptr; }
+                if (!t) { logErrorAt(line, col,fmt::format("Unknown out-var type: {}", sv.typeName)); return nullptr; }
                 outVarNames.push_back(sv.name);
                 outVarTypes.push_back(t);
             }
@@ -933,12 +1002,18 @@ llvm::Value* FunctionAST::codegen() {
         if (stage == ShaderStage::Vertex) {
             paramTys.push_back(i32Ty);  paramNames.push_back("gl_VertexID");
             paramTys.push_back(i32Ty);  paramNames.push_back("gl_InstanceID");
+            for (auto& sv : StageInputVars) {
+                Type* t = resolveTypeByName(sv.typeName);
+                if (!t) { logErrorAt(line, col,fmt::format("Unknown in-var type: {}", sv.typeName)); return nullptr; }
+                paramTys.push_back(t);
+                paramNames.push_back(sv.name);
+            }
             paramTys.push_back(ptrTy);  paramNames.push_back("_out");
         } else if (stage == ShaderStage::Fragment) {
             paramTys.push_back(vec4Ty); paramNames.push_back("gl_FragCoord");
             for (auto& sv : StageInputVars) {
                 Type* t = resolveTypeByName(sv.typeName);
-                if (!t) { logError(fmt::format("Unknown in-var type: {}", sv.typeName)); return nullptr; }
+                if (!t) { logErrorAt(line, col,fmt::format("Unknown in-var type: {}", sv.typeName)); return nullptr; }
                 paramTys.push_back(t);
                 paramNames.push_back(sv.name);
             }
@@ -1036,7 +1111,7 @@ llvm::Value* FunctionAST::codegen() {
         }
 
         if (verifyFunction(*F, &errs())) {
-            logError(fmt::format("Entry function verification failed for '{}'", Proto->Name));
+            logErrorAt(line, col,fmt::format("Entry function verification failed for '{}'", Proto->Name));
             F->eraseFromParent();
             Builder->restoreIP(savedIP);
             return nullptr;
@@ -1072,10 +1147,10 @@ llvm::Value* FunctionAST::codegen() {
         if (F->getReturnType()->isVoidTy()) {
             Builder->CreateRetVoid();
         } else {
-            if (allPathsReturn(Body.get())) {
+            if (allPathsReturn(Body)) {
                 Builder->CreateUnreachable();
             } else {
-                logError(fmt::format("Missing return terminator in '{}'", Proto->Name));
+                logErrorAt(line, col,fmt::format("Missing return terminator in '{}'", Proto->Name));
                 F->eraseFromParent();
                 Builder->restoreIP(savedIP);
                 return nullptr;
@@ -1084,7 +1159,7 @@ llvm::Value* FunctionAST::codegen() {
     }
 
     if (verifyFunction(*F, &errs())) {
-        logError(fmt::format("Function verification failed for '{}'", Proto->Name));
+        logErrorAt(line, col,fmt::format("Function verification failed for '{}'", Proto->Name));
         F->eraseFromParent();
         Builder->restoreIP(savedIP);
         return nullptr;
@@ -1102,7 +1177,7 @@ llvm::Value* ReturnStmtAST::codegen() {
     // Handle void return
     if (RTy->isVoidTy()) {
         if (Expr) {
-            logError("Cannot return a value from void function");
+            logErrorAt(line, col,"Cannot return a value from void function");
             return nullptr;
         }
         return Builder->CreateRetVoid();
@@ -1110,13 +1185,13 @@ llvm::Value* ReturnStmtAST::codegen() {
     
     // Non-void return must have an expression
     if (!Expr) {
-        logError("Non-void function must return a value");
+        logErrorAt(line, col,"Non-void function must return a value");
         return nullptr;
     }
     
     Value* V = Expr->codegen();
     if (!V) {
-        logError("Return expression codegen failed");
+        logErrorAt(line, col,"Return expression codegen failed");
         return nullptr;
     }
     
@@ -1124,7 +1199,7 @@ llvm::Value* ReturnStmtAST::codegen() {
     if (V->getType() != RTy) {
         V = castScalarTo(V, RTy);
         if (!V) {
-            logError("Cannot cast return value to function return type");
+            logErrorAt(line, col,"Cannot cast return value to function return type");
             return nullptr;
         }
     }
@@ -1135,7 +1210,7 @@ llvm::Value* ReturnStmtAST::codegen() {
 // Break statement
 Value* BreakStmtAST::codegen() {
     if (BreakStack.empty()) {
-        logError("Break statement outside of loop");
+        logErrorAt(line, col,"Break statement outside of loop");
         return nullptr;
     }
     Builder->CreateBr(BreakStack.back());
@@ -1145,7 +1220,7 @@ Value* BreakStmtAST::codegen() {
 // Continue statement
 Value* ContinueStmtAST::codegen() {
     if (ContinueStack.empty()) {
-        logError("Continue statement outside of loop");
+        logErrorAt(line, col,"Continue statement outside of loop");
         return nullptr;
     }
     Builder->CreateBr(ContinueStack.back());
@@ -1262,21 +1337,45 @@ Value* ForExprAST::codegen() {
 
 // STRUCT DECLARATION
 
+// Register an opaque StructType under `Name`. Idempotent: if predeclare()
+// is called twice (or once before codegen()), the second call is a no-op.
+// Enables forward struct references — `struct A { B b; }` declared before
+// `struct B { ... }`.
+void StructDeclExprAST::predeclare() {
+    using namespace llvm;
+    if (NamedStructTypes.find(Name) != NamedStructTypes.end()) return;
+    StructType* ST = StructType::create(*Context, Name);
+    StructInfo info;
+    info.Type = ST;
+    // FieldNames stays empty until codegen() fills it.
+    NamedStructTypes[Name] = std::move(info);
+}
+
 llvm::Value* StructDeclExprAST::codegen() {
     using namespace llvm;
-    if (NamedStructTypes.find(Name) != NamedStructTypes.end()) {
-        logError(fmt::format("Struct {} already declared", Name));
-        return nullptr;
+    auto it = NamedStructTypes.find(Name);
+    StructType* ST = nullptr;
+    if (it != NamedStructTypes.end()) {
+        // Predeclared: complete the opaque body. Reject only if a body was
+        // already set (i.e. duplicate decl, not the predeclare placeholder).
+        if (it->second.Type->isOpaque()) {
+            ST = it->second.Type;
+        } else {
+            logErrorAt(line, col,
+                       fmt::format("Struct {} already declared", Name));
+            return nullptr;
+        }
+    } else {
+        ST = StructType::create(*Context, Name);
     }
 
-    StructType* ST = StructType::create(*Context, Name);
     std::vector<Type*> elems;
     elems.reserve(Fields.size());
     std::vector<std::string> fieldNames;
     for (auto &f : Fields) {
         Type* t = resolveTypeByName(f.first);
         if (!t) { 
-            logError(fmt::format("Unknown field type '{}' in struct {}", f.first, Name));
+            logErrorAt(line, col,fmt::format("Unknown field type '{}' in struct {}", f.first, Name));
             return nullptr; 
         }
         elems.push_back(t);
@@ -1312,24 +1411,27 @@ Value* UniformDeclExprAST::codegen() {
     using namespace llvm;
     Type* t = resolveTypeByName(TypeName);
     if (!t) {
-        logError(fmt::format( "Unknown type for uniform: {}", TypeName));
+        logErrorAt(line, col,fmt::format( "Unknown type for uniform: {}", TypeName));
         return nullptr;
     }
 
     GlobalVariable* G = TheModule->getGlobalVariable(Name);
     if (!G) {
         auto *init = Constant::getNullValue(t);
+        // LinkOnceODR so the same uniform declared in both VS and FS modules
+        // merges cleanly when llvm-link joins them. ExternalLinkage would
+        // error on duplicate definition; LinkOnceODR keeps one copy.
         G = new GlobalVariable(
             *TheModule,
             t,
             false,
-            GlobalValue::ExternalLinkage,
+            GlobalValue::LinkOnceODRLinkage,
             init,
             Name
         );
     } else {
         if (G->getValueType() != t) {
-            logError(fmt::format( "Uniform re-declared with different type: {}", Name));
+            logErrorAt(line, col,fmt::format( "Uniform re-declared with different type: {}", Name));
             return nullptr;
         }
     }
@@ -1340,7 +1442,7 @@ Value* UniformDeclExprAST::codegen() {
 
 Value* ArrayInitExprAST::codegen() {
     if (Elements.empty()) {
-        logError("Array initializer cannot be empty");
+        logErrorAt(line, col,"Array initializer cannot be empty");
         return nullptr;
     }
 
@@ -1356,7 +1458,7 @@ Value* ArrayInitExprAST::codegen() {
         if (!elemType) {
             elemType = v->getType();
         } else if (v->getType() != elemType) {
-            logError("Array initializer elements must have the same type");
+            logErrorAt(line, col,"Array initializer elements must have the same type");
             return nullptr;
         }
         values.push_back(v);
@@ -1381,13 +1483,13 @@ Value* ArrayDeclExprAST::codegen() {
     // Resolve element type
     Type* elemType = resolveTypeByName(ElementType);
     if (!elemType) {
-        logError(fmt::format("Unknown type '{}' in array declaration", ElementType));
+        logErrorAt(line, col,fmt::format("Unknown type '{}' in array declaration", ElementType));
         return nullptr;
     }
 
     // Check if array size is valid
     if (Size <= 0) {
-        logError("Array size must be positive");
+        logErrorAt(line, col,"Array size must be positive");
         return nullptr;
     }
 
@@ -1397,7 +1499,7 @@ Value* ArrayDeclExprAST::codegen() {
     // Get current function
     Function* F = Builder->GetInsertBlock()->getParent();
     if (!F) {
-        logError("Array declaration must be inside a function");
+        logErrorAt(line, col,"Array declaration must be inside a function");
         return nullptr;
     }
 
@@ -1409,15 +1511,15 @@ Value* ArrayDeclExprAST::codegen() {
 
     // If there's an initializer, process it
     if (Init) {
-        auto* initExpr = dynamic_cast<ArrayInitExprAST*>(Init.get());
+        auto* initExpr = llvm::dyn_cast<ArrayInitExprAST>(Init);
         if (!initExpr) {
-            logError("Array initializer must be ArrayInitExprAST");
+            logErrorAt(line, col,"Array initializer must be ArrayInitExprAST");
             return nullptr;
         }
 
         // Check initializer size matches array size
         if (initExpr->Elements.size() != static_cast<size_t>(Size)) {
-            logError(fmt::format("Array initializer size ({}) doesn't match array size ({})",
+            logErrorAt(line, col,fmt::format("Array initializer size ({}) doesn't match array size ({})",
                                initExpr->Elements.size(), Size));
             return nullptr;
         }
@@ -1456,7 +1558,7 @@ Value* ArrayDeclExprAST::codegen() {
 Value* UniformArrayDeclExprAST::codegen() {
     Type* elemType = resolveTypeByName(TypeName);
     if (!elemType) {
-        logError(fmt::format("Unknown type for uniform array: {}", TypeName));
+        logErrorAt(line, col,fmt::format("Unknown type for uniform array: {}", TypeName));
         return nullptr;
     }
     // Create array type
@@ -1474,7 +1576,7 @@ Value* UniformArrayDeclExprAST::codegen() {
         );
     } else {
         if (G->getValueType() != arrayType) {
-            logError(fmt::format("Uniform array re-declared with different type: {}", Name));
+            logErrorAt(line, col,fmt::format("Uniform array re-declared with different type: {}", Name));
             return nullptr;
         }
     }
@@ -1487,7 +1589,7 @@ Value* UniformArrayDeclExprAST::codegen() {
 Value* StorageBufferDeclAST::codegen() {
     Type* elemTy = resolveTypeByName(ElemType);
     if (!elemTy) {
-        logError(fmt::format("Unknown element type for storage buffer: {}", ElemType));
+        logErrorAt(line, col,fmt::format("Unknown element type for storage buffer: {}", ElemType));
         return nullptr;
     }
     // Declare as an external opaque pointer global.
@@ -1506,4 +1608,57 @@ Value* StorageBufferDeclAST::codegen() {
     }
     StorageBufferInfos[Name] = {G, elemTy, isReadOnly};
     return G;
+}
+
+// Postfix x++ / x--:
+//   old = load x
+//   new = old ± 1   (typed: int → i32, float → fp)
+//   store new, x
+//   return old
+//
+// The crucial bit is returning `old`, not `new`. The parser is responsible
+// for placing this node in any context where the *value* of `x++` matters
+// (`a[i++]`, `f(i++)`, `j = i++`). For an expression-statement `i++;` the
+// returned value is simply discarded.
+Value* PostfixIncrExprAST::codegen() {
+    auto* var = llvm::dyn_cast<VariableExprAST>(Target);
+    if (!var) {
+        logErrorAt(line, col, "Postfix ++/-- target must be a variable");
+        return nullptr;
+    }
+
+    auto it = NamedValues.find(var->Name);
+    if (it == NamedValues.end()) {
+        logErrorAt(line, col,
+                   fmt::format("Undefined variable in postfix expression: {}",
+                               var->Name));
+        return nullptr;
+    }
+    AllocaInst* alloca = it->second;
+    Type* ty = alloca->getAllocatedType();
+
+    Value* oldVal = Builder->CreateLoad(ty, alloca, var->Name + ".old");
+
+    Value* one = nullptr;
+    if (ty->isIntegerTy()) {
+        one = ConstantInt::get(ty, 1);
+    } else if (ty->isFloatingPointTy()) {
+        one = ConstantFP::get(ty, 1.0);
+    } else {
+        logErrorAt(line, col,
+                   "Postfix ++/-- only supported on int / float scalars");
+        return nullptr;
+    }
+
+    Value* newVal = nullptr;
+    if (ty->isIntegerTy()) {
+        newVal = isDecrement ? Builder->CreateSub(oldVal, one, "dec")
+                             : Builder->CreateAdd(oldVal, one, "inc");
+    } else {
+        newVal = isDecrement ? Builder->CreateFSub(oldVal, one, "dec")
+                             : Builder->CreateFAdd(oldVal, one, "inc");
+    }
+
+    Builder->CreateStore(newVal, alloca);
+    return oldVal;
 }

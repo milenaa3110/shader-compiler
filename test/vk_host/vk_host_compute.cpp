@@ -11,6 +11,8 @@
 // Build: g++ -std=c++20 -O2 test/vk_host/vk_host_compute.cpp -o build/spirv/spirv_vulkan_life_host -lvulkan
 
 #include <vulkan/vulkan.h>
+#include "../../error_utils_fmt.h"
+
 #include <vector>
 #include <iostream>
 #include <fstream>
@@ -23,13 +25,19 @@
 #include <sys/stat.h>
 
 static void check(VkResult r, const char* w) {
-    if (r != VK_SUCCESS) { std::cerr << "Vulkan error " << r << " at " << w << "\n"; std::exit(1); }
+    if (r != VK_SUCCESS) {
+        logErrorFmt("Vulkan error {} at {}", (int)r, w);
+        std::exit(1);
+    }
 }
 #define VK(e) check((e), #e)
 
 static std::vector<uint32_t> readSpv(const char* path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) { std::cerr << "Cannot open " << path << "\n"; std::exit(1); }
+    if (!f) {
+        logErrorFmt("Cannot open {}", path);
+        std::exit(1);
+    }
     size_t sz = f.tellg(); f.seekg(0);
     std::vector<uint32_t> data(sz / 4);
     f.read(reinterpret_cast<char*>(data.data()), sz);
@@ -71,7 +79,7 @@ int main(int argc, char** argv) {
     auto findMem = [&](uint32_t bits, VkMemoryPropertyFlags fl) -> uint32_t {
         for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
             if ((bits & (1u<<i)) && (memProps.memoryTypes[i].propertyFlags & fl) == fl) return i;
-        std::cerr << "No memory type\n"; std::exit(1);
+        logError("No memory type"); std::exit(1);
     };
 
     uint32_t qFamilyIdx = 0;

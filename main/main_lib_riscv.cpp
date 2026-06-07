@@ -4,17 +4,19 @@
 
 #include "../parser/parser.h"
 #include "../ast/ast.h"
+#include "../ast/ast_context.h"
+#include "../sema/sema.h"
 #include "../codegen_state/codegen_state.h"
+#include "../error_utils_fmt.h"
 
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 #include <iostream>
+#include <iterator>
+#include <string>
 
 #include "emit_trampolines.h"
-
-extern int CurTok;
-int getNextToken();
 
 using namespace llvm;
 
@@ -29,12 +31,32 @@ int main(int argc, char* argv[]) {
     InitializeModule();
     NamedValues.clear();
 
-    getNextToken();
-    auto nodes = ParseProgram();
-    if (nodes.empty()) { std::cerr << "Parse failed or program is empty.\n"; return 1; }
+    // Slurp the whole shader from stdin; the source string must outlive
+    // ParseProgram (the lexer views into it).
+    std::string source((std::istreambuf_iterator<char>(std::cin)),
+                        std::istreambuf_iterator<char>());
+    diag::setSource(source);  // enable caret diagnostics for parse/sema/codegen
 
-    for (auto& n : nodes) {
-        if (n && !n->codegen()) { std::cerr << "Codegen failed.\n"; return 1; }
+    // Per-compilation arena. Owns every AST node + interned string until
+    // it falls out of scope at end of main. Drop after codegen finishes.
+    ASTContext astCtx;
+    auto nodes = ParseProgram(astCtx, source);
+    if (nodes.empty()) { logError("Parse failed or program is empty"); return 1; }
+
+    // Post-parse semantic pass — registers struct decls, detects cyclic
+    // field dependencies, validates every type-name reference.
+    SemanticAnalyzer sema;
+    if (sema.run(nodes) != 0) { logError("Semantic analysis failed"); return 1; }
+
+    // Forward-declare all structs so codegen can resolve out-of-order
+    // field references (`struct A { B b; }; struct B { ... };`).
+    for (auto* n : nodes) {
+        if (auto* sd = llvm::dyn_cast_or_null<StructDeclExprAST>(n))
+            sd->predeclare();
+    }
+
+    for (auto* n : nodes) {
+        if (n && !n->codegen()) { logError("Codegen failed"); return 1; }
     }
 
     // Emit pipeline trampolines for stage-entry shaders
@@ -56,12 +78,12 @@ int main(int argc, char* argv[]) {
     }
 
     if (llvm::verifyModule(*TheModule, &llvm::errs())) {
-        std::cerr << "Invalid LLVM module.\n"; return 1;
+        logError("Invalid LLVM module"); return 1;
     }
 
     std::error_code EC;
     llvm::raw_fd_ostream OS(outPath, EC, llvm::sys::fs::OF_Text);
-    if (EC) { std::cerr << "Cannot open " << outPath << ": " << EC.message() << "\n"; return 1; }
+    if (EC) { logErrorFmt("Cannot open {}: {}", outPath, EC.message()); return 1; }
     TheModule->print(OS, nullptr);
     std::cout << "Wrote " << outPath << " (RISC-V + RVV target)\n";
     return 0;

@@ -2,7 +2,7 @@
 #include "assignment_helpers.h"
 #include "../ast/ast.h"
 #include "../codegen_state/codegen_state.h"
-#include "../error_utils.h"
+#include "../error_utils_fmt.h"
 #include "../helpers/utils.h" 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -21,12 +21,12 @@ std::vector<unsigned> AssignmentHelper::parseSwizzle(unsigned maxDim, bool allow
     for (char c : Member) {
         int idx = charToIndex(c);
         if (idx < 0 || (unsigned)idx >= maxDim) {
-            logErrorFmt("Invalid swizzle '{}': '{}' out of range [0-{}]", 
+            logErrorFmtAt(Object->line, Object->col,"Invalid swizzle '{}': '{}' out of range [0-{}]", 
                        Member, c, maxDim-1);
             return {};
         }
         if (!allowOverlap && touched[idx]) {
-            logError("Overlapping swizzle not allowed");
+            logErrorAt(Object->line, Object->col,"Overlapping swizzle not allowed");
             return {};
         }
         touched[idx] = true;
@@ -36,7 +36,7 @@ std::vector<unsigned> AssignmentHelper::parseSwizzle(unsigned maxDim, bool allow
 }
 
 AllocaInst* AssignmentHelper::findVariableAlloca() {
-    if (auto* var = dynamic_cast<VariableExprAST*>(Object)) {
+    if (auto* var = llvm::dyn_cast<VariableExprAST>(Object)) {
         auto it = NamedValues.find(var->Name);
         return it != NamedValues.end() ? it->second : nullptr;
     }
@@ -46,25 +46,25 @@ AllocaInst* AssignmentHelper::findVariableAlloca() {
 // ================= MATRIX COLUMN ASSIGNMENT =================
 MatrixColumnAssigner::MatrixColumnAssigner(MatrixAccessExprAST* matAccess, 
     const std::string& swizzle, ExprAST* rhs)
-    : AssignmentHelper(matAccess->Object.get(), swizzle, rhs), MatAccess(matAccess) {}
+    : AssignmentHelper(matAccess->Object, swizzle, rhs), MatAccess(matAccess) {}
 
 Value* MatrixColumnAssigner::codegen() {
-    auto* lhsVar = dynamic_cast<VariableExprAST*>(MatAccess->Object.get());
+    auto* lhsVar = llvm::dyn_cast<VariableExprAST>(MatAccess->Object);
     if (!lhsVar) {
-        logError("Matrix swizzle assignment LHS must be variable matrix");
+        logErrorAt(Object->line, Object->col,"Matrix swizzle assignment LHS must be variable matrix");
         return nullptr;
     }
 
     auto it = NamedValues.find(lhsVar->Name);
     if (it == NamedValues.end()) {
-        logErrorFmt("Unknown variable '{}' in matrix assignment", lhsVar->Name);
+        logErrorFmtAt(Object->line, Object->col,"Unknown variable '{}' in matrix assignment", lhsVar->Name);
         return nullptr;
     }
     AllocaInst* alloca = it->second;
 
     Type* matTy = alloca->getAllocatedType();
     if (!matTy->isArrayTy()) {
-        logError("Expected matrix type for swizzle assignment");
+        logErrorAt(Object->line, Object->col,"Expected matrix type for swizzle assignment");
         return nullptr;
     }
 
@@ -90,7 +90,7 @@ Value* MatrixColumnAssigner::codegen() {
     if (rhs->getType()->isVectorTy()) {
         auto* rVecTy = cast<FixedVectorType>(rhs->getType());
         if (rVecTy->getNumElements() != K) {
-            logError("RHS vector size mismatch in matrix swizzle assignment");
+            logErrorAt(Object->line, Object->col,"RHS vector size mismatch in matrix swizzle assignment");
             return nullptr;
         }
         Type* rElemTy = rVecTy->getElementType();
@@ -134,20 +134,20 @@ StructFieldAssigner::StructFieldAssigner(ExprAST* obj, const std::string& field,
 unsigned StructFieldAssigner::findFieldIndex(StructType* st) {
     std::string stName = st->hasName() ? st->getName().str() : "";
     if (stName.empty()) {
-        logError("Cannot assign field of unnamed struct");
+        logErrorAt(Object->line, Object->col,"Cannot assign field of unnamed struct");
         return -1u;
     }
 
     auto itNames = NamedStructTypes.find(stName);
     if (itNames == NamedStructTypes.end()) {
-        logErrorFmt("Struct field names not registered for {}", stName);
+        logErrorFmtAt(Object->line, Object->col,"Struct field names not registered for {}", stName);
         return -1u;
     }
 
     const auto& fields = itNames->second.FieldNames;
     auto fit = std::find(fields.begin(), fields.end(), Member);
     if (fit == fields.end()) {
-        logErrorFmt("Struct {} has no field '{}'", stName, Member);
+        logErrorFmtAt(Object->line, Object->col,"Struct {} has no field '{}'", stName, Member);
         return -1u;
     }
 
@@ -175,13 +175,13 @@ Value* StructFieldAssigner::coerceRHS(Type* fieldTy) {
 Value* StructFieldAssigner::codegen() {
     AllocaInst* alloca = findVariableAlloca();
     if (!alloca) {
-        logError("Struct assignment LHS must be variable");
+        logErrorAt(Object->line, Object->col,"Struct assignment LHS must be variable");
         return nullptr;
     }
 
     Type* objTy = alloca->getAllocatedType();
     if (!objTy->isStructTy()) {
-        logError("Struct field assignment: LHS is not a struct type");
+        logErrorAt(Object->line, Object->col,"Struct field assignment: LHS is not a struct type");
         return nullptr;
     }
 
@@ -193,13 +193,13 @@ Value* StructFieldAssigner::codegen() {
     Value* rhs = coerceRHS(fieldTy);
     if (!rhs) return nullptr;
 
-    if (auto* baseVar = dynamic_cast<VariableExprAST*>(Object)) {
+    if (auto* baseVar = llvm::dyn_cast<VariableExprAST>(Object)) {
         Value* cur = Builder->CreateLoad(objTy, alloca, (baseVar->Name + ".old").c_str());
         Value* updated = Builder->CreateInsertValue(cur, rhs, {idx});
         Builder->CreateStore(updated, alloca);
         return updated;
     }
-    logError("Struct field assignment: LHS must be a simple variable expression");
+    logErrorAt(Object->line, Object->col,"Struct field assignment: LHS must be a simple variable expression");
     return nullptr;
 }
 VectorSwizzleAssigner::VectorSwizzleAssigner(ExprAST* vecVar, const std::string& swizzle, ExprAST* rhs)
@@ -209,13 +209,13 @@ VectorSwizzleAssigner::VectorSwizzleAssigner(ExprAST* vecVar, const std::string&
 Value* VectorSwizzleAssigner::codegen() {
     AllocaInst* alloca = findVariableAlloca();
     if (!alloca) {
-        logError("Vector swizzle LHS must be variable");
+        logErrorAt(Object->line, Object->col,"Vector swizzle LHS must be variable");
         return nullptr;
     }
 
     Type* objTy = alloca->getAllocatedType();
     if (!objTy->isVectorTy()) {
-        logError("Swizzle assignment only supported on vector variables");
+        logErrorAt(Object->line, Object->col,"Swizzle assignment only supported on vector variables");
         return nullptr;
     }
 
@@ -236,7 +236,7 @@ Value* VectorSwizzleAssigner::codegen() {
     if (rhs->getType()->isVectorTy()) {
         auto* rVecTy = cast<FixedVectorType>(rhs->getType());
         if (rVecTy->getNumElements() != K) {
-            logErrorFmt("RHS vector width ({}) must match swizzle length ({})", 
+            logErrorFmtAt(Object->line, Object->col,"RHS vector width ({}) must match swizzle length ({})", 
                        rVecTy->getNumElements(), K);
             return nullptr;
         }
@@ -259,7 +259,7 @@ Value* VectorSwizzleAssigner::codegen() {
             comps.push_back(s);
     }
 
-    if (auto* baseVar = dynamic_cast<VariableExprAST*>(Object)) {
+    if (auto* baseVar = llvm::dyn_cast<VariableExprAST>(Object)) {
         Value* base = Builder->CreateLoad(objTy, alloca, (baseVar->Name + ".old").c_str());
         Value* newVec = base;
         for (unsigned i = 0; i < K; ++i) {

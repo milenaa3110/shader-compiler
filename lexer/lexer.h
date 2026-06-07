@@ -1,125 +1,160 @@
 #ifndef LEXER_H
 #define LEXER_H
 
-#include <string>
+#include <string_view>
 
-enum Token {
-    tok_eof = -1,
-    tok_identifier = -2,
-    tok_number = -3,
-    tok_if = -4,
-    tok_else = -5,
-	tok_while = -6,
-	tok_for = -7,
-    tok_break = -8,
-    tok_vec2 = -10,
-    tok_vec3 = -11,
-    tok_vec4 = -12,
-    tok_double = -13,
-    tok_float = -14,
-    tok_int = -15,
-    tok_uint = -16,
-    tok_bool = -17,
-    tok_true = -18,
-    tok_false = -19,
-    tok_mat2 = -20,
-    tok_mat3 = -21,
-    tok_mat4 = -22,
-    tok_mat2x3 = -23,
-    tok_mat2x4 = -24,
-    tok_mat3x2 = -25,
-    tok_mat3x4 = -26,
-    tok_mat4x2 = -27,
-    tok_mat4x3 = -28,
-    tok_plus = -50,
-    tok_assign = -51,
-    tok_lparen = -52,
-    tok_rparen = -53,
-    tok_comma = -54,
-    tok_semicolon = -55,
-    tok_lbrace = -56,
-    tok_rbrace = -57,
-    tok_dot = -58,
-    tok_minus = -59,
-    tok_multiply = -60,
-    tok_divide = -61,
-    tok_greater = -62,
-    tok_greater_equal = -63,
-    tok_less = -64,
-    tok_less_equal = -65,
-    tok_equal = -66,
-    tok_not_equal = -67,
-    tok_lbracket = -68,
-    tok_rbracket = -69,
-    tok_return = -70,
-    tok_fn = -71,
-    tok_and = -72,
-    tok_or = -73,
-	tok_struct = -74,
-	tok_uniform = -75,
-	tok_void = -76,
-	tok_not = -77,
-    tok_at = -78,
-    tok_entry = -79,
-    tok_stage = -80,
-    tok_vertex = -81,
-    tok_fragment = -82,
-    tok_compute = -83,
-    tok_bitwise_and = -84,   // bare '&' — bitwise AND not supported; triggers parse error
-    tok_bitwise_or  = -85,   // bare '|' — bitwise OR  not supported; triggers parse error
+// Token kinds
+enum class TokenKind {
+  // Structural
+  Eof,
+  Identifier,
+  Number,
+  InvalidNumber,  // malformed numeric literal (e.g. 1e5e6, 1.2.3)
+  Unknown,        // a character the lexer doesn't recognise
 
-    // Stage interface qualifiers
-    tok_in    = -86,
-    tok_out   = -87,
-    tok_inout = -88,
+  // Keywords — control flow
+  If,
+  Else,
+  While,
+  For,
+  Break,
+  Continue,
+  Return,
+  Discard,
 
-    // Unsigned/signed int vector types
-    tok_uvec2 = -89,
-    tok_uvec3 = -90,
-    tok_uvec4 = -91,
-    tok_ivec2 = -92,
-    tok_ivec3 = -93,
-    tok_ivec4 = -94,
+  // Keywords — scalar / vector / matrix types
+  Vec2,
+  Vec3,
+  Vec4,
+  Double,
+  Float,
+  Int,
+  Uint,
+  Bool,
+  True,
+  False,
+  Mat2,
+  Mat3,
+  Mat4,
+  Mat2x3,
+  Mat2x4,
+  Mat3x2,
+  Mat3x4,
+  Mat4x2,
+  Mat4x3,
+  Uvec2,
+  Uvec3,
+  Uvec4,
+  Ivec2,
+  Ivec3,
+  Ivec4,
+  Sampler2D,
+  Sampler3D,
+  SamplerCube,
+  Image2D,
+  Void,
 
-    // Sampler / image opaque types
-    tok_sampler2D   = -95,
-    tok_sampler3D   = -96,
-    tok_samplerCube = -97,
-    tok_image2D     = -98,
+  // Keywords — declarations / qualifiers
+  Fn,
+  Struct,
+  Uniform,
+  Const,
+  Buffer,
+  Readonly,
+  Writeonly,
+  In,
+  Out,
+  Inout,
+  Stage,
+  Entry,
+  Vertex,
+  Fragment,
+  Compute,
 
-    // Additional statement keywords
-    tok_continue = -99,
-    tok_discard  = -110,
-    tok_const    = -111,
+  // Operators — arithmetic
+  Plus,
+  Minus,
+  Multiply,
+  Divide,
+  Percent,
+  Assign,
+  PlusAssign,
+  MinusAssign,
+  MulAssign,
+  DivAssign,
+  ModAssign,
+  Increment,
+  Decrement,
 
-    // Compound assignment operators
-    tok_plus_assign  = -112,  // +=
-    tok_minus_assign = -113,  // -=
-    tok_mul_assign   = -114,  // *=
-    tok_div_assign   = -115,  // /=
+  // Operators — comparison / logical
+  Greater,
+  GreaterEqual,
+  Less,
+  LessEqual,
+  Equal,
+  NotEqual,
+  And,
+  Or,
+  Not,
 
-    // Increment / decrement
-    tok_increment = -116,  // ++
-    tok_decrement = -117,  // --
+  // Operators — bitwise (integer scalars/vectors)
+  BitwiseAnd,
+  BitwiseOr,
+  BitwiseXor,
+  BitwiseNot,
+  ShiftLeft,
+  ShiftRight,
 
-    // Ternary operator
-    tok_question = -118,  // ?
-    tok_colon    = -119,  // :
-
-    tok_invalid_number = -120,
-
-    // Storage buffer qualifiers (compute shaders)
-    tok_buffer    = -121,
-    tok_readonly  = -122,
-    tok_writeonly = -123,
+  // Punctuation
+  Lparen,
+  Rparen,
+  Lbrace,
+  Rbrace,
+  Lbracket,
+  Rbracket,
+  Comma,
+  Semicolon,
+  Dot,
+  At,
+  Question,
+  Colon,
 };
 
-// Set to true by gettok() when the last tok_number had no decimal point
-extern bool IsIntLiteral;
+// A single lexical token
+// text: A view into the original source (the source must outlive this token)
+// num/isInt: Only populated for numeric literals
+// line/col: Source location used for compiler diagnostics and error messages
+struct Token {
+  TokenKind kind = TokenKind::Eof;
+  std::string_view text;
+  double num = 0.0;
+  bool isInt = false;
+  int line = 1;
+  int col = 1;
+};
 
-extern std::string IdentifierStr;
-extern double NumVal;
+// Buffer-backed, instantiable, reentrant scanner
+class Lexer {
+ public:
+  explicit Lexer(std::string_view src)
+      : Cur(src.data()), End(src.data() + src.size()) {}
 
-int gettok();
+  // Scan and return the next token. Returns TokenKind::Eof past end.
+  Token next();
 
-#endif
+ private:
+  const char* Cur;
+  const char* End;
+  int Line = 1;
+  int Col = 1;
+
+  // Lookahead without consuming. Returns '\0' past End.
+  char peekCh(int n = 0) const { return (Cur + n < End) ? Cur[n] : '\0'; }
+  // Consume one char, maintaining Line/Col (handles \n, \r, \r\n).
+  void advance();
+};
+
+// Human-readable name for a token kind — used in diagnostics.
+const char* tokenKindName(TokenKind kind);
+
+#endif  // LEXER_H

@@ -1,0 +1,29 @@
+# test_postfix.src — postfix ++ / -- must return the OLD value.
+#
+# The crucial cases are `a[i++]` (the GEP must use pre-increment `i`) and
+# `j = i++` (j gets the old i, then i is bumped). A naive desugar to prefix
+# `i = i + 1` would give j the *new* i — that's the bug PostfixIncrExprAST
+# fixes. Regression for that fix.
+
+fn vec4 shade(vec2 uv) {
+    float buf[4];
+    buf[0] = 0.0;
+    buf[1] = 0.0;
+    buf[2] = 0.0;
+    buf[3] = 0.0;
+
+    int i = 0;
+    # Each statement must read the OLD i, then bump.
+    buf[i++] = 1.0;   # writes buf[0], i becomes 1
+    buf[i++] = 2.0;   # writes buf[1], i becomes 2
+    buf[i++] = 3.0;   # writes buf[2], i becomes 3
+    buf[i++] = 4.0;   # writes buf[3], i becomes 4
+
+    # j receives the old i (= 4), then i bumps to 5.
+    int j = i++;
+
+    # Postfix decrement returns old, then decrements.
+    int k = j--;
+
+    return vec4(buf[0] + buf[1] + buf[2] + buf[3], float(i), float(j), float(k));
+}

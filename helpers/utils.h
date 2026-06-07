@@ -5,7 +5,7 @@
 #include <llvm/IR/Type.h>
 #include <llvm/IR/IRBuilder.h>
 #include "../codegen_state/codegen_state.h"
-#include "../error_utils.h"
+#include "../error_utils_fmt.h"
 #include <string>
 
 using namespace llvm;
@@ -111,10 +111,13 @@ inline Value* toI32(Value *v) {
     }
 
     inline llvm::Type* resolveTypeByName(llvm::StringRef name) {
-        // for struct types
+        // For struct types. An opaque pre-declaration (FieldNames still
+        // empty) is a *valid* reference at struct-decl time: LLVM allows
+        // opaque struct types in nested field lists, and the body gets
+        // set when that struct's StructDeclExprAST::codegen() runs.
+        // Sema rejects truly unknown names before we get here.
         if (auto it = NamedStructTypes.find(name.str()); it != NamedStructTypes.end()) {
-            const auto& info = it->second;
-            return info.FieldNames.empty() ? nullptr : info.Type;
+            return it->second.Type;
         }
         // for scalar types
         if (name == "double") return Type::getDoubleTy(*Context);

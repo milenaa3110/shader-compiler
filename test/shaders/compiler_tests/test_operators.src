@@ -10,6 +10,7 @@ fn vec4 shade(vec2 uv) {
     a -= 0.1;
     a *= 2.0;
     a /= 1.5;
+    a %= 1.5;
 
     # prefix ++/--
     float b = 0.0;

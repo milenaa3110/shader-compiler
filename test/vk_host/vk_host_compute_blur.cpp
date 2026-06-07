@@ -14,6 +14,8 @@
 //            test/vk_host/vk_host_compute_blur.cpp -lvulkan
 
 #include <vulkan/vulkan.h>
+#include "../../error_utils_fmt.h"
+
 #include <vector>
 #include <fstream>
 #include <iostream>
@@ -27,13 +29,19 @@
 static int W = 512, H = 512, NRUNS = 100;
 
 static void check(VkResult r, const char* where) {
-    if (r != VK_SUCCESS) { std::cerr << "Vulkan error " << r << " at " << where << "\n"; std::exit(1); }
+    if (r != VK_SUCCESS) {
+        logErrorFmt("Vulkan error {} at {}", (int)r, where);
+        std::exit(1);
+    }
 }
 #define VK(expr) check((expr), #expr)
 
 static std::vector<uint32_t> readSpv(const char* path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) { std::cerr << "Cannot open " << path << "\n"; std::exit(1); }
+    if (!f) {
+        logErrorFmt("Cannot open {}", path);
+        std::exit(1);
+    }
     size_t sz = f.tellg(); f.seekg(0);
     std::vector<uint32_t> data(sz / 4);
     f.read(reinterpret_cast<char*>(data.data()), sz);
@@ -47,7 +55,8 @@ static uint32_t findMemType(VkPhysicalDevice pd, uint32_t typeBits, VkMemoryProp
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
         if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props)
             return i;
-    std::cerr << "No suitable memory type\n"; std::exit(1);
+    logError("No suitable memory type");
+    std::exit(1);
 }
 
 // Create a host-visible storage buffer
@@ -102,7 +111,7 @@ int main(int argc, char** argv) {
 
     uint32_t devCount = 0;
     vkEnumeratePhysicalDevices(instance, &devCount, nullptr);
-    if (!devCount) { std::cerr << "No Vulkan device.\n"; return 1; }
+    if (!devCount) { logError("No Vulkan device"); return 1; }
     std::vector<VkPhysicalDevice> physDevs(devCount);
     vkEnumeratePhysicalDevices(instance, &devCount, physDevs.data());
     VkPhysicalDevice pd = physDevs[0];
