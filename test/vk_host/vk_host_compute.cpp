@@ -11,7 +11,7 @@
 // Build: g++ -std=c++20 -O2 test/vk_host/vk_host_compute.cpp -o build/spirv/spirv_vulkan_life_host -lvulkan
 
 #include <vulkan/vulkan.h>
-#include "../../error_utils_fmt.h"
+#include "../../src/common/error_utils_fmt.h"
 
 #include <vector>
 #include <iostream>

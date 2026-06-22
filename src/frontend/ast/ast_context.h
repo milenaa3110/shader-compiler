@@ -29,12 +29,16 @@
 #ifndef AST_CONTEXT_H
 #define AST_CONTEXT_H
 
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/StringMap.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Allocator.h>
 #include <llvm/Support/StringSaver.h>
 
 #include <utility>
 #include <vector>
+
+#include "type.h"
 
 class ExprAST;  // fwd — full type only needed in the .cpp's destructor walk.
 
@@ -65,14 +69,68 @@ class ASTContext {
     // calls with equal content share storage.
     llvm::StringRef intern(llvm::StringRef s) { return saver_.save(s); }
 
+    // ── Canonical types ────────────────────────────────────────────────────
+    // Each getter returns the one-and-only instance for that type, so equal
+    // types compare pointer-equal. Types live in the bump pool for the life of
+    // the context. (See type.h. Scoped `glsl::Type` to avoid colliding with
+    // llvm::Type in the codegen TUs.)
+    const glsl::Type* getVoidTy();
+    const glsl::Type* getBoolTy();
+    const glsl::Type* getIntTy();
+    const glsl::Type* getUintTy();
+    const glsl::Type* getFloatTy();
+    const glsl::Type* getDoubleTy();
+
+    // Vector of `elem` (a scalar type) with `n` components (2..4).
+    const glsl::Type* getVectorTy(const glsl::Type* elem, unsigned n);
+    // Matrix of `cols` × `rows` floats (2..4 each).
+    const glsl::Type* getMatrixTy(unsigned cols, unsigned rows);
+    // Array of `elem` with a fixed `size` (>= 1). The reserved length-0
+    // "runtime-sized" encoding is NOT reachable here — an SSBO's `name[]` calls
+    // getUnsizedArrayTy, so a stray `T[0]` can never alias an unsized array.
+    const glsl::Type* getArrayTy(const glsl::Type* elem, unsigned size);
+    // Runtime-sized array (an SSBO's trailing `name[]` member).
+    const glsl::Type* getUnsizedArrayTy(const glsl::Type* elem);
+    const glsl::Type* getSamplerTy(glsl::Type::SamplerKind kind);
+    // Named user struct. Returns the one canonical instance for `name`, created
+    // incomplete on first reference (so forward refs resolve to the same type)
+    // and completed later via glsl::Type::setStructDecl from the analyzer.
+    const glsl::Type* getStructTy(llvm::StringRef name);
+
+    // Convenience wrappers for the common concrete vector/matrix types.
+    const glsl::Type* getVec2Ty() { return getVectorTy(getFloatTy(), 2); }
+    const glsl::Type* getVec3Ty() { return getVectorTy(getFloatTy(), 3); }
+    const glsl::Type* getVec4Ty() { return getVectorTy(getFloatTy(), 4); }
+
     // Direct allocator access — for the rare caller that needs to put
     // raw bytes (not an AST node) into the same pool. Use sparingly.
     llvm::BumpPtrAllocator& allocator() { return bump_; }
 
    private:
+    // Copy a freshly-built type prototype into the bump pool. Types are
+    // trivially destructible, so (unlike AST nodes) they need no destruction
+    // registration.
+    const glsl::Type* newType(const glsl::Type& proto);
+
+    // Shared uniquing for getArrayTy / getUnsizedArrayTy (size 0 == unsized).
+    const glsl::Type* internArrayTy(const glsl::Type* elem, unsigned size);
+
     llvm::BumpPtrAllocator   bump_;
     llvm::UniqueStringSaver  saver_;  // de-duplicating: equal content ⇒ same ptr
     std::vector<ExprAST*>    nodes_;
+
+    // Type uniquing tables. Scalars and samplers are fixed small sets indexed
+    // by kind; vectors/matrices/structs are keyed by their parameters.
+    const glsl::Type* scalarTys_[6] = {};   // indexed by glsl::Type::Kind
+    // Indexed by glsl::Type::SamplerKind; size tracks builtin_types.def.
+    const glsl::Type* samplerTys_[glsl::kNumSamplerKinds] = {};
+    llvm::DenseMap<std::pair<const glsl::Type*, unsigned>, const glsl::Type*>
+        vectorTys_;
+    llvm::DenseMap<std::pair<unsigned, unsigned>, const glsl::Type*> matrixTys_;
+    // Keyed by (element, length); length 0 is the canonical unsized array.
+    llvm::DenseMap<std::pair<const glsl::Type*, unsigned>, const glsl::Type*>
+        arrayTys_;
+    llvm::StringMap<const glsl::Type*> structTys_;
 };
 
 #endif  // AST_CONTEXT_H

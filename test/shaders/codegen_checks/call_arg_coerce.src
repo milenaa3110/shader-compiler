@@ -1,0 +1,20 @@
+# IR regression (Step 5b): a user-function call widens each argument to its
+# parameter type in sema (an ImplicitCast at the argument), so passing an int to
+# a float parameter emits a `sitofp` before the call and the call is typed
+# `@half(float ...)`. This is what keeps the call valid once Step 5 deletes the
+# codegen castScalarTo net that currently also covers it.
+
+out vec4 FragColor;
+
+fn float half(float x) { return x * 0.5; }
+
+@entry @stage(fragment)
+fn void main() {
+    int n = int(gl_FragCoord.x);
+    float r = half(n);
+    FragColor = vec4(r, 0.0, 0.0, 1.0);
+}
+
+# CHECK-LABEL: define{{.*}}@fs_main
+# CHECK: sitofp i32
+# CHECK: call float @half(float

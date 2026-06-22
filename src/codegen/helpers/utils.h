@@ -3,12 +3,18 @@
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Type.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/IRBuilder.h>
 #include "../codegen_state/codegen_state.h"
-#include "../error_utils_fmt.h"
+#include "../../common/error_utils_fmt.h"
 #include <string>
 
-using namespace llvm;
+// NOTE: no `using namespace llvm;` — this is a header, and a using-directive
+// here leaks llvm:: into every translation unit that includes it (and would
+// collide with glsl::Type vs llvm::Type). llvm names are qualified; `Builder`,
+// `Context`, `NamedStructTypes`, `logError`, and the helper functions are
+// project globals, not llvm.
 
 static inline int charToIndex(char c) {
     if (c == 'x' || c == 'r') return 0;
@@ -19,14 +25,18 @@ static inline int charToIndex(char c) {
 }
 
 // Convert value to i32
-inline Value* toI32(Value *v) {
+inline llvm::Value* toI32(llvm::Value* v) {
         if (!v) return nullptr;
         llvm::Type* type = v->getType();
-        llvm::Type* i32 = Type::getInt32Ty(*Context);
+        llvm::Type* i32 = llvm::Type::getInt32Ty(*Context);
         // Already i32
         if (type->isIntegerTy(32))
             return v;
-        // Integers that can be safely converted (i8, i16)
+        // bool (i1) is a 0/1 value — widen by ZERO-extension. sext would make
+        // `true` 0xFFFFFFFF (= -1), so e.g. arr[someBool] would index at -1.
+        if (type->isIntegerTy(1))
+            return Builder->CreateZExt(v, i32, "idx_zext");
+        // Narrower signed integers (i8, i16) — sign-extend.
         if (type->isIntegerTy() && type->getIntegerBitWidth() < 32)
             return Builder->CreateSExt(v, i32, "idx_sext");
         // Integers that are too big - reject
@@ -42,18 +52,18 @@ inline Value* toI32(Value *v) {
     }
 
     // Cast scalar value to destination type
-    inline Value* castScalarTo(Value* v, Type* dst) {
-        Type* src = v->getType();
+    inline llvm::Value* castScalarTo(llvm::Value* v, llvm::Type* dst) {
+        llvm::Type* src = v->getType();
         if (src == dst) return v;
         // type to boolean
         if (dst->isIntegerTy(1)) {
             if (src->isIntegerTy()) {
-                return Builder->CreateICmpNE(v, ConstantInt::get(src, 0), "tobool");
+                return Builder->CreateICmpNE(v, llvm::ConstantInt::get(src, 0), "tobool");
             }
             if (src->isFloatTy() || src->isDoubleTy()) {
-                Value* zero = src->isDoubleTy()
-                    ? static_cast<Value*>(ConstantFP::get(Type::getDoubleTy(*Context), 0.0))
-                    : static_cast<Value*>(ConstantFP::get(Type::getFloatTy(*Context), 0.0f));
+                llvm::Value* zero = src->isDoubleTy()
+                    ? static_cast<llvm::Value*>(llvm::ConstantFP::get(llvm::Type::getDoubleTy(*Context), 0.0))
+                    : static_cast<llvm::Value*>(llvm::ConstantFP::get(llvm::Type::getFloatTy(*Context), 0.0f));
                 return Builder->CreateFCmpUNE(v, zero, "tobool");
             }
             return nullptr;
@@ -64,9 +74,12 @@ inline Value* toI32(Value *v) {
         if (src->isFloatTy() && dst->isDoubleTy())
             return Builder->CreateFPExt(v, dst, "fpext");
 
-        // int to fp
+        // int to fp. bool (i1) is an unsigned 0/1 value → uitofp (sitofp would
+        // give -1.0 for true; GLSL §5.4.1: float(true) == 1.0). NOTE: signed-only
+        // for the int/uint split is still a Step-5 gap — only bool is fixed here.
         if (src->isIntegerTy() && (dst->isFloatTy() || dst->isDoubleTy())) {
-            return Builder->CreateSIToFP(v, dst, "sitofp");
+            return src->isIntegerTy(1) ? Builder->CreateUIToFP(v, dst, "uitofp")
+                                       : Builder->CreateSIToFP(v, dst, "sitofp");
         }
         // fp to int
         if ((src->isFloatTy() || src->isDoubleTy()) && dst->isIntegerTy()) {
@@ -77,34 +90,37 @@ inline Value* toI32(Value *v) {
             unsigned sw = src->getIntegerBitWidth();
             unsigned dw = dst->getIntegerBitWidth();
             if (sw == dw) return v;
-            if (sw < dw)  return Builder->CreateSExt(v, dst, "sext");
+            // bool (i1) widens by zero-extension so true→1, not -1.
+            if (sw < dw)
+                return src->isIntegerTy(1) ? Builder->CreateZExt(v, dst, "zext")
+                                           : Builder->CreateSExt(v, dst, "sext");
             return Builder->CreateTrunc(v, dst, "trunc");
         }
         return nullptr;
     }
 
     // Splat scalar to vector
-    inline Value* splatScalarToVector(Value* scalar, FixedVectorType* vecTy) {
+    inline llvm::Value* splatScalarToVector(llvm::Value* scalar, llvm::FixedVectorType* vecTy) {
         return Builder->CreateVectorSplat(vecTy->getNumElements(), scalar, "splat");
     }
 
     // Construct vector from scalars
-    inline Value* buildVectorFromScalars(ArrayRef<Value*> scalars, unsigned size) {
+    inline llvm::Value* buildVectorFromScalars(llvm::ArrayRef<llvm::Value*> scalars, unsigned size) {
         // zero vector
         if (scalars.empty()) {
-            auto* vecTy = FixedVectorType::get(Type::getFloatTy(*Context), size);
-            return ConstantAggregateZero::get(vecTy);  // <4 x float> zero
+            auto* vecTy = llvm::FixedVectorType::get(llvm::Type::getFloatTy(*Context), size);
+            return llvm::ConstantAggregateZero::get(vecTy);  // <4 x float> zero
         }
         // determine element type from first scalar and build vector
         llvm::Type* elementTy = scalars[0]->getType();
-        auto* vecTy = FixedVectorType::get(elementTy, size);
-        Value* res = UndefValue::get(vecTy);
+        auto* vecTy = llvm::FixedVectorType::get(elementTy, size);
+        llvm::Value* res = llvm::UndefValue::get(vecTy);
         for (unsigned i = 0; i < scalars.size(); ++i) {
             if (scalars[i]->getType() != elementTy) {
                 logError("Vector elements must have same type");
                 return nullptr;
             }
-            res = Builder->CreateInsertElement(res, scalars[i], 
+            res = Builder->CreateInsertElement(res, scalars[i],
                                             Builder->getInt32(i), "ins");
         }
         return res;
@@ -119,47 +135,22 @@ inline Value* toI32(Value *v) {
         if (auto it = NamedStructTypes.find(name.str()); it != NamedStructTypes.end()) {
             return it->second.Type;
         }
-        // for scalar types
-        if (name == "double") return Type::getDoubleTy(*Context);
-        if (name == "float")  return Type::getFloatTy(*Context);
-        if (name == "int")    return Type::getInt32Ty(*Context);
-        if (name == "uint")   return Type::getInt32Ty(*Context);
-        if (name == "bool")   return Type::getInt1Ty(*Context);
-        // integer vector types
-        if (name == "uvec2") return FixedVectorType::get(Type::getInt32Ty(*Context), 2);
-        if (name == "uvec3") return FixedVectorType::get(Type::getInt32Ty(*Context), 3);
-        if (name == "uvec4") return FixedVectorType::get(Type::getInt32Ty(*Context), 4);
-        if (name == "ivec2") return FixedVectorType::get(Type::getInt32Ty(*Context), 2);
-        if (name == "ivec3") return FixedVectorType::get(Type::getInt32Ty(*Context), 3);
-        if (name == "ivec4") return FixedVectorType::get(Type::getInt32Ty(*Context), 4);
-        // opaque sampler/image types → opaque pointer
-        if (name == "sampler2D"    || name == "sampler3D"   || name == "samplerCube" ||
-            name == "sampler2DArray" || name == "image2D"   || name == "imageBuffer")
-            return PointerType::getUnqual(*Context);
-        // for vector types
-        if (name.consume_front("vec")) {
-            if (unsigned n; !name.getAsInteger(10, n) && (n >= 2 && n <= 4))
-                return FixedVectorType::get(Type::getFloatTy(*Context), n);
-            logError("Invalid vector size");
-            return nullptr;
-        }
-        // for matrix types
-        if (name.consume_front("mat")) {
-            unsigned col = 0, row = 0;
-            // for mat2, mat3, mat4
-            if (name.size() == 1 && isdigit(name[0])) {
-                col = row = name[0] - '0';
-            }
-            // for mat2x3, mat3x2, mat4x2, mat2x4, mat3x4, mat4x3
-            else {
-                auto pos = name.find('x');
-                if (pos == StringRef::npos) return nullptr;
-                if (name.substr(0, pos).getAsInteger(10, col)) return nullptr;
-                if (name.substr(pos+1).getAsInteger(10, row)) return nullptr;
-            }
-            auto* colTy = FixedVectorType::get(Type::getFloatTy(*Context), row);
-            return ArrayType::get(colTy, col);
-        }
+        // Every value-bearing builtin from builtin_types.def — the same source
+        // the lexer/parser/sema use, so the lists can't drift. (Replaces the old
+        // hand-listed scalars + algorithmically-parsed vec/mat.) Matrices are
+        // column-major [Cols x <Rows x float>]; samplers are opaque pointers.
+#define BTYPE_SCALAR(Tok, Spelling, GlslKind, LlvmGetter) \
+        if (name == Spelling) return llvm::Type::LlvmGetter(*Context);
+#define BTYPE_VECTOR(Tok, Spelling, GlslElem, LlvmElem, N) \
+        if (name == Spelling) \
+            return llvm::FixedVectorType::get(llvm::Type::LlvmElem(*Context), N);
+#define BTYPE_MATRIX(Tok, Spelling, Cols, Rows) \
+        if (name == Spelling) \
+            return llvm::ArrayType::get( \
+                llvm::FixedVectorType::get(llvm::Type::getFloatTy(*Context), Rows), Cols);
+#define BTYPE_SAMPLER(Tok, Spelling, Kind, Dim, Arrayed, IsImage) \
+        if (name == Spelling) return llvm::PointerType::getUnqual(*Context);
+#include "../../frontend/ast/builtin_types.def"
         return nullptr;
     }
 
@@ -168,143 +159,7 @@ inline Value* toI32(Value *v) {
         NamedStructTypes[name] = {st, fieldNames};
     }
 
-    // make L and R have matching types
-    inline bool makeTypesMatch(Value*& L, Value*& R) {
-        Type* LTy = L->getType();
-        Type* RTy = R->getType();
-
-        if (LTy == RTy) return true;
-
-        // Helper lambda to convert entire vector to new element type
-        auto convertVectorElemType = [&](Value* vec, Type* targetElemTy) -> Value* {
-            auto* vecTy = cast<FixedVectorType>(vec->getType());
-            unsigned numElems = vecTy->getNumElements();
-            auto* targetVecTy = FixedVectorType::get(targetElemTy, numElems);
-            
-            Value* result = UndefValue::get(targetVecTy);
-            for (unsigned i = 0; i < numElems; ++i) {
-                Value* elem = Builder->CreateExtractElement(vec, Builder->getInt32(i));
-                Value* converted = castScalarTo(elem, targetElemTy);
-                if (!converted) return nullptr;
-                result = Builder->CreateInsertElement(result, converted, Builder->getInt32(i));
-            }
-            return result;
-        };
-
-        bool LIsVec = llvm::isa<llvm::FixedVectorType>(LTy);
-        bool RIsVec = llvm::isa<llvm::FixedVectorType>(RTy);
-
-
-        // Vector + Scalar - splat scalar to vector
-        if (LIsVec && !RIsVec) {
-            auto* vecTy = cast<FixedVectorType>(LTy);
-            Type* elemTy = vecTy->getElementType();
-            Value* scalar = castScalarTo(R, elemTy);
-            if (!scalar) return false;
-            R = splatScalarToVector(scalar, vecTy);
-            return true;
-        }
-
-        // Scalar + Vector - splat scalar to vector
-        if (!LIsVec && RIsVec) {
-            auto* vecTy = cast<FixedVectorType>(RTy);
-            Type* elemTy = vecTy->getElementType();
-            Value* scalar = castScalarTo(L, elemTy);
-            if (!scalar) return false;
-            L = splatScalarToVector(scalar, vecTy);
-            return true;
-        }
-
-        // Vector + Vector
-        if (LIsVec && RIsVec) {
-            auto* LVecTy = cast<FixedVectorType>(LTy);
-            auto* RVecTy = cast<FixedVectorType>(RTy);
-            
-            // Must have same number of elements
-            if (LVecTy->getNumElements() != RVecTy->getNumElements()) {
-                logError("Vector size mismatch");
-                return false;
-            }
-
-            Type* elemTyL = LVecTy->getElementType();
-            Type* elemTyR = RVecTy->getElementType();
-            
-            // Already same element type
-            if (elemTyL == elemTyR) {
-                return true;
-            }
-
-            // Promote to common element type
-            Type* targetElemTy = nullptr;
-            if (elemTyL->isDoubleTy() || elemTyR->isDoubleTy()) {
-                targetElemTy = Type::getDoubleTy(*Context);
-            } else if (elemTyL->isFloatTy() || elemTyR->isFloatTy()) {
-                targetElemTy = Type::getFloatTy(*Context);
-            } else if (elemTyL->isIntegerTy() && elemTyR->isIntegerTy()) {
-                // Promote integers to wider type
-                unsigned widthL = elemTyL->getIntegerBitWidth();
-                unsigned widthR = elemTyR->getIntegerBitWidth();
-                unsigned maxWidth = std::max(widthL, widthR);
-                targetElemTy = Type::getIntNTy(*Context, maxWidth);
-            } else {
-                return false; // Incompatible types
-            }
-
-            // Convert both vectors to target element type
-            if (elemTyL != targetElemTy) {
-                Value* converted = convertVectorElemType(L, targetElemTy);
-                if (!converted) return false;
-                L = converted;
-            }
-            if (elemTyR != targetElemTy) {
-                Value* converted = convertVectorElemType(R, targetElemTy);
-                if (!converted) return false;
-                R = converted;
-            }
-            return true;
-        }
-
-        // Scalar + Scalar - promote to higher precision
-        if (!LIsVec && !RIsVec) {
-            Type* targetTy = nullptr;
-
-            // Promotion hierarchy: double > float > int64 > int32 > bool
-            if (LTy->isDoubleTy() || RTy->isDoubleTy()) {
-                targetTy = Type::getDoubleTy(*Context);
-            } else if (LTy->isFloatTy() || RTy->isFloatTy()) {
-                targetTy = Type::getFloatTy(*Context);
-            } else if (LTy->isIntegerTy(64) || RTy->isIntegerTy(64)) {
-                targetTy = Type::getInt64Ty(*Context);
-            } else if (LTy->isIntegerTy(32) || RTy->isIntegerTy(32)) {
-                targetTy = Type::getInt32Ty(*Context);
-            } else if (LTy->isIntegerTy() || RTy->isIntegerTy()) {
-                // Handle other integer types
-                unsigned widthL = LTy->isIntegerTy() ? LTy->getIntegerBitWidth() : 1;
-                unsigned widthR = RTy->isIntegerTy() ? RTy->getIntegerBitWidth() : 1;
-                unsigned maxWidth = std::max(widthL, widthR);
-                targetTy = Type::getIntNTy(*Context, maxWidth);
-            } else {
-                targetTy = Type::getInt1Ty(*Context); // both bool
-            }
-
-            // Promote both scalars to target type
-            if (L->getType() != targetTy) {
-                Value* casted = castScalarTo(L, targetTy);
-                if (!casted) return false;
-                L = casted;
-            }
-            if (R->getType() != targetTy) {
-                Value* casted = castScalarTo(R, targetTy);
-                if (!casted) return false;
-                R = casted;
-            }
-            return true;
-        }
-
-        return false;
-    }
-
-    inline Value* extractStructMember(Value* obj, StructType* st, const std::string& fieldName) {
+    inline llvm::Value* extractStructMember(llvm::Value* obj, llvm::StructType* st, const std::string& fieldName) {
         // get struct type name
         std::string stName = st->hasName() ? st->getName().str() : "";
         if (stName.empty()) {
@@ -329,7 +184,7 @@ inline Value* toI32(Value *v) {
         return Builder->CreateExtractValue(obj, idx, ("memb." + fieldName).c_str());
     }
 
-    inline Value* extractVectorComponents(Value* vec, FixedVectorType* vecTy, const std::string& swizzle) {
+    inline llvm::Value* extractVectorComponents(llvm::Value* vec, llvm::FixedVectorType* vecTy, const std::string& swizzle) {
         unsigned numElems = vecTy->getNumElements();
         std::vector<int> indices;
         indices.reserve(swizzle.size());
@@ -347,7 +202,7 @@ inline Value* toI32(Value *v) {
             return Builder->CreateExtractElement(vec, Builder->getInt32(indices[0]), "comp");
         }
 
-        Value* undefVec = UndefValue::get(vecTy);
+        llvm::Value* undefVec = llvm::UndefValue::get(vecTy);
         return Builder->CreateShuffleVector(vec, undefVec, indices, "swizzle");
     }
 

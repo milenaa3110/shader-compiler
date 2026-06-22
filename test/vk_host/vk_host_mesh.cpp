@@ -15,7 +15,7 @@
 #include "icosphere.h"
 #include "mesh_data.h"
 #include "obj_loader.h"
-#include "../../error_utils_fmt.h"
+#include "../../src/common/error_utils_fmt.h"
 
 #include <vulkan/vulkan.h>
 

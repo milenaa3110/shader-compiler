@@ -1,0 +1,21 @@
+# IR regression: bool widens by ZERO-extension, never sign-extension.
+# `sext i1 true` is 0xFFFFFFFF (= -1); GLSL §5.4.1 says int(true)==1, float(true)==1.0.
+# So int(bool) must lower to `zext i1` and float(bool) to `uitofp i1` — never
+# `sext i1` / `sitofp i1`. The bool is derived at runtime (a comparison) so the
+# casts survive as real instructions instead of being constant-folded.
+
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    bool b = gl_FragCoord.x > 0.5;
+    int i = int(b);
+    float f = float(b);
+    FragColor = vec4(f, float(i), 0.0, 1.0);
+}
+
+# CHECK: define{{.*}}@fs_main
+# CHECK: zext i1
+# CHECK: uitofp i1
+# CHECK-NOT: sext i1
+# CHECK-NOT: sitofp i1

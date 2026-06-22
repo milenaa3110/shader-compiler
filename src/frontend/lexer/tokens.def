@@ -1,0 +1,113 @@
+// tokens.def — single source of truth for the token table (X-macro).
+
+//   TOK(Kind, Name) generic token; Name is its diagnostic spelling
+//   KEYWORD(Kind, Spelling) reserved word; matched in the keyword table
+//   PUNCT(Kind, Spelling) operator / punctuation
+
+#ifndef TOK
+#define TOK(Kind, Name)
+#endif
+#ifndef KEYWORD
+#define KEYWORD(Kind, Spelling) TOK(Kind, "'" Spelling "'")
+#endif
+#ifndef PUNCT
+#define PUNCT(Kind, Spelling) TOK(Kind, "'" Spelling "'")
+#endif
+
+// Structural
+TOK(Eof,           "end of input")
+TOK(Identifier,    "identifier")
+TOK(Number,        "number")
+TOK(InvalidNumber, "malformed number")   // e.g. 1e5e6, 1.2.3, 1.5u
+TOK(Unknown,       "unknown character")
+
+// Keywords — control flow
+KEYWORD(If,       "if")
+KEYWORD(Else,     "else")
+KEYWORD(While,    "while")
+KEYWORD(For,      "for")
+KEYWORD(Break,    "break")
+KEYWORD(Continue, "continue")
+KEYWORD(Return,   "return")
+KEYWORD(Discard,  "discard")
+
+// Keywords — value-bearing builtin types (scalar / vector / matrix / sampler).
+// Generated from the single source of truth so the lexer, parser, sema, and
+// codegen type lists can never drift apart.
+#define BTYPE(Tok, Spelling) KEYWORD(Tok, Spelling)
+#include "../ast/builtin_types.def"
+
+// Boolean literals and the return-only `void` are keywords but NOT value types,
+// so they live here rather than in builtin_types.def.
+KEYWORD(True,        "true")
+KEYWORD(False,       "false")
+KEYWORD(Void,        "void")
+
+// Keywords — declarations / qualifiers
+KEYWORD(Fn,        "fn")
+KEYWORD(Struct,    "struct")
+KEYWORD(Uniform,   "uniform")
+KEYWORD(Const,     "const")
+KEYWORD(Buffer,    "buffer")
+KEYWORD(Readonly,  "readonly")
+KEYWORD(Writeonly, "writeonly")
+KEYWORD(In,        "in")
+KEYWORD(Out,       "out")
+KEYWORD(Inout,     "inout")
+KEYWORD(Stage,     "stage")
+KEYWORD(Entry,     "entry")
+KEYWORD(Vertex,    "vertex")
+KEYWORD(Fragment,  "fragment")
+KEYWORD(Compute,   "compute")
+
+// Operators — arithmetic
+PUNCT(Plus,        "+")
+PUNCT(Minus,       "-")
+PUNCT(Multiply,    "*")
+PUNCT(Divide,      "/")
+PUNCT(Percent,     "%")
+PUNCT(Assign,      "=")
+PUNCT(PlusAssign,  "+=")
+PUNCT(MinusAssign, "-=")
+PUNCT(MulAssign,   "*=")
+PUNCT(DivAssign,   "/=")
+PUNCT(ModAssign,   "%=")
+PUNCT(Increment,   "++")
+PUNCT(Decrement,   "--")
+
+// Operators — comparison / logical
+PUNCT(Greater,      ">")
+PUNCT(GreaterEqual, ">=")
+PUNCT(Less,         "<")
+PUNCT(LessEqual,    "<=")
+PUNCT(Equal,        "==")
+PUNCT(NotEqual,     "!=")
+PUNCT(And,          "&&")
+PUNCT(Or,           "||")
+PUNCT(Not,          "!")
+
+// Operators — bitwise
+PUNCT(BitwiseAnd, "&")
+PUNCT(BitwiseOr,  "|")
+PUNCT(BitwiseXor, "^")
+PUNCT(BitwiseNot, "~")
+PUNCT(ShiftLeft,  "<<")
+PUNCT(ShiftRight, ">>")
+
+// Punctuation
+PUNCT(Lparen,    "(")
+PUNCT(Rparen,    ")")
+PUNCT(Lbrace,    "{")
+PUNCT(Rbrace,    "}")
+PUNCT(Lbracket,  "[")
+PUNCT(Rbracket,  "]")
+PUNCT(Comma,     ",")
+PUNCT(Semicolon, ";")
+PUNCT(Dot,       ".")
+PUNCT(At,        "@")
+PUNCT(Question,  "?")
+PUNCT(Colon,     ":")
+
+#undef TOK
+#undef KEYWORD
+#undef PUNCT

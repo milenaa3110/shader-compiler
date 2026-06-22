@@ -40,38 +40,38 @@ SPIR-V bytecode word-by-word.
 
 ## Directory map
 
-### `lexer/`
+### `src/frontend/lexer/`
 | File | Role |
 |------|------|
 | `lexer.h` | Token enum — every keyword, operator, and type the language understands |
 | `lexer.cpp` | Converts raw source text into a flat token stream |
 
-### `parser/`
+### `src/frontend/parser/`
 | File | Role |
 |------|------|
 | `parser.h` | Interface for the recursive-descent parser |
 | `parser.cpp` | Builds an AST from the token stream; handles operator precedence, function definitions, and all statement forms |
 
-### `ast/`
+### `src/frontend/ast/`
 | File | Role |
 |------|------|
 | `ast.h` | All AST node types: literals, binary ops, variables, if/while/for, function defs, stage annotations (`@entry @stage`) |
 | `ast.cpp` | `codegen()` on each node — walks the tree and emits LLVM IR via IRBuilder |
 
-### `codegen_state/`
+### `src/codegen/codegen_state/`
 | File | Role |
 |------|------|
 | `codegen_state.h` | Singleton holding the LLVM Context, Module, IRBuilder, symbol table, uniform list, and break/continue stacks |
 | `codegen_state.cpp` | Initializes and resets codegen state; provides helpers for vector splat, builtin lowering, and type queries |
 
-### `helpers/`
+### `src/codegen/helpers/`
 | File | Role |
 |------|------|
 | `utils.h` | Type casting utilities, scalar↔vector conversions, swizzle character-to-index mapping |
 | `call_helpers.h/.cpp` | Codegen for function calls: builtins (`sin`, `cos`, `dot`, `clamp`, `step`, …) and user-defined functions |
 | `assignment_helpers.h/.cpp` | Codegen for assignments, including swizzle writes (`v.xyz = …`) via `insertelement` chains |
 
-### `main/`
+### `src/codegen/emit/`
 | File | Role |
 |------|------|
 | `main_lib_riscv.cpp` | Entry point for `irgen_riscv` — emits LLVM IR with `riscv64` target triple and RVV feature flags; emits VS+FS+CS trampolines for the pipeline ABI |
@@ -79,12 +79,12 @@ SPIR-V bytecode word-by-word.
 | `emit_spirv_from_ir.h` | LLVM IR → SPIR-V binary translator. Handles types/constants, structured control flow, push constants for `uniform float`, runtime-sized SSBOs (`Uniform` storage class with `BufferBlock` decoration) for compute shaders, vertex input attributes, fragment output `Location 0`, GLCompute `LocalSize` from `!shader.workgroup_size` metadata |
 | `emit_trampolines.h` | Emits `vs_invoke(vid, iid, flat_in, flat_out)` / `fs_invoke(fragcoord, varyings, flat_out)` trampolines plus the layout constants `vs_total_floats`, `vs_varying_floats`, `vs_input_floats`, `fs_output_floats`. Also emits `cs_invoke` (single invocation) and `cs_dispatch_row` (X-loop, allows RVV auto-vectorization) for compute shaders |
 
-### `main_codegen/`
+### `src/driver/`
 | File | Role |
 |------|------|
 | `main_codegen.cpp` | Entry point for the interactive `shader_codegen` tool — reads stdin, prints IR to stdout |
 
-### `pipeline/`
+### `src/runtime/`
 | File | Role |
 |------|------|
 | `pipeline_abi.h` | Stable C ABI between the software rasterizer and a compiled VS+FS pipeline module: `vs_invoke` / `fs_invoke` declarations and the `vs_total_floats` / `vs_varying_floats` / `vs_input_floats` / `fs_output_floats` layout constants |
@@ -92,12 +92,12 @@ SPIR-V bytecode word-by-word.
 | `pipeline_runtime.cpp` | Software rasterizer — two-pass **tile-based** design. Pass 1 (parallel over triangles): runs the vertex shader for every vertex, then for each triangle computes its screen-space setup, culls back-facing / off-screen / degenerate cases, and bins survivors into the 32×32 screen tiles their bbox overlaps. Pass 2 (parallel over tiles): each tile is owned by one thread and rasterises its bin with perspective-correct interpolation — no per-triangle barrier and no z-buffer race, so it scales to multi-million-triangle meshes |
 | `tex_inline.cpp/.h` | Bilinear texture sampler (`__tex_lookup`, `__tex2d_sample`). Compiled to LLVM bitcode and `llvm-link`'d into each shader module before `opt -O3`, so the `always_inline` sampler bodies expand directly into the fragment shader's hot loop. `g_tex` storage and the host-facing `bind_texture` live in `pipeline_runtime.cpp` |
 
-### `passes/`
+### `src/passes/`
 | File | Role |
 |------|------|
 | `sincos_opt.cpp` | LLVM pass plugin loaded by `opt-18 --load-pass-plugin`. Scans functions for `llvm.sin.f32(X)` + `llvm.cos.f32(X)` pairs and replaces them with a single `sincosf(X, &s, &c)` call. Runs after `opt -O3` (which unifies identical arguments via GVN), so pairs are reliably detected |
 
-### Project-root error helpers
+### `src/common/` (error helpers)
 | File | Role |
 |------|------|
 | `error_utils.h` | Minimal logger: `logError(const char*)` / `logError(const std::string&)`. No fmt dependency — safe to include from cross-compiled (riscv64) sources |

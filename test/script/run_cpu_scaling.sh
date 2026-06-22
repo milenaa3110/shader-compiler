@@ -56,8 +56,8 @@ build_frag() {
     # Patch schedule in a temp copy of pipeline_runtime.cpp
     local tmp_rt="$BUILD_DIR/_tmp_rt_${sched}.cpp"
     sed "s/schedule(dynamic, 1)/schedule(${sched}, 1)/" \
-        pipeline/pipeline_runtime.cpp > "$tmp_rt"
-    $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Ipipeline \
+        src/runtime/pipeline_runtime.cpp > "$tmp_rt"
+    $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Isrc/runtime \
         -DANIM_NAME="\"${anim}\"" -DNFRAMES="$FRAG_FRAMES" \
         -DWIDTH="$FRAG_W" -DHEIGHT="$FRAG_H" \
         test/rv_host/rv_host_fragment.cpp \

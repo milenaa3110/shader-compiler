@@ -102,6 +102,16 @@ int main() {
     // ── Malformed numbers → InvalidNumber ────────────────────────────────────
     expectKinds("malformed 1e5e6", "1e5e6", {TokenKind::InvalidNumber});
     expectKinds("malformed 1.2.3", "1.2.3", {TokenKind::InvalidNumber});
+    // 'u' suffix is integer-only — no "unsigned float".
+    expectKinds("malformed 1.5u", "1.5u", {TokenKind::InvalidNumber});
+    expectKinds("malformed 1e3u", "1e3u", {TokenKind::InvalidNumber});
+    // Out-of-range magnitude is malformed, not a silent 0.0.
+    expectKinds("out-of-range 1e400", "1e400", {TokenKind::InvalidNumber});
+
+    // ── A multi-byte UTF-8 character is one Unknown token, not one per byte ───
+    expectKinds("utf-8 arrow is single Unknown", "a\xe2\x86\x92""b",
+                {TokenKind::Identifier, TokenKind::Unknown,
+                 TokenKind::Identifier});
 
     // ── Unknown character ────────────────────────────────────────────────────
     expectKinds("stray $", "a $ b",
@@ -117,14 +127,18 @@ int main() {
                 {TokenKind::Identifier, TokenKind::Dot, TokenKind::Number});
 
     // ── Position tracking, including \r\n line endings ───────────────────────
+    // The lexer only records byte offsets; SourceManager reconstructs line/col.
     {
-        Lexer lex("a\n  b\r\nc");
+        std::string_view src = "a\n  b\r\nc";
+        SourceManager sm(src, "<test>");
+        Lexer lex(src);
+        auto lc = [&](const Token& t) { return sm.getLineCol(t.loc); };
         Token a = lex.next();
-        CHECK(a.line == 1 && a.col == 1, "token 'a' at (1,1)");
+        CHECK(lc(a).line == 1 && lc(a).col == 1, "token 'a' at (1,1)");
         Token b = lex.next();
-        CHECK(b.line == 2 && b.col == 3, "token 'b' at (2,3) after indent");
+        CHECK(lc(b).line == 2 && lc(b).col == 3, "token 'b' at (2,3) after indent");
         Token c = lex.next();
-        CHECK(c.line == 3 && c.col == 1, "token 'c' at (3,1) after CRLF");
+        CHECK(lc(c).line == 3 && lc(c).col == 1, "token 'c' at (3,1) after CRLF");
     }
 
     // ── Token text spans the lexeme ──────────────────────────────────────────

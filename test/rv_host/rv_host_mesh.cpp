@@ -12,9 +12,9 @@
 #include "../vk_host/mesh_data.h"
 #include "../vk_host/obj_loader.h"
 
-#include "../../pipeline/pipeline_runtime.h"
-#include "../../pipeline/pipeline_abi.h"
-#include "../../error_utils.h"
+#include "../../src/runtime/pipeline_runtime.h"
+#include "../../src/runtime/pipeline_abi.h"
+#include "../../src/common/error_utils.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_JPEG

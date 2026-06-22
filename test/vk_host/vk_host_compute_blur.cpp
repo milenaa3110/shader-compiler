@@ -14,7 +14,7 @@
 //            test/vk_host/vk_host_compute_blur.cpp -lvulkan
 
 #include <vulkan/vulkan.h>
-#include "../../error_utils_fmt.h"
+#include "../../src/common/error_utils_fmt.h"
 
 #include <vector>
 #include <fstream>

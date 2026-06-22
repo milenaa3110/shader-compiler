@@ -302,9 +302,9 @@ llc-18 -O3 -filetype=obj -relocation-model=pic \
     -mattr=+m,+a,+f,+d \
     build/riscv/mandelbrot_rv.ll -o build/riscv/mandelbrot_scalar.o
 
-riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp -Ipipeline \
+riscv64-linux-gnu-g++ -std=c++20 -O3 -static -fopenmp -Isrc/runtime \
     -DANIM_NAME='"mandelbrot"' -DNFRAMES=8 -DWIDTH=256 -DHEIGHT=256 \
-    test/rv_host/rv_host_fragment.cpp pipeline/pipeline_runtime.cpp \
+    test/rv_host/rv_host_fragment.cpp src/runtime/pipeline_runtime.cpp \
     build/riscv/mandelbrot_scalar.o -o build/riscv/mandelbrot_scalar.rv
 
 # With RVV (default)

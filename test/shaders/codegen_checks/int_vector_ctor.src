@@ -1,0 +1,18 @@
+# IR regression: integer vector constructors (ivecN / uvecN) build <N x i32>,
+# not <N x float>. These were unimplemented in codegen (only vec2/3/4 existed)
+# until the type system gained real int/uint vectors; the corpus never uses them,
+# so only this pins the element type.
+
+out vec4 FragColor;
+
+fn int sum(ivec3 v) { return v.x + v.y + v.z; }
+
+@entry @stage(fragment)
+fn void main() {
+    ivec3 a = ivec3(1, 2, 3);   # exact   → <3 x i32>
+    uvec2 b = uvec2(7u);        # splat   → <2 x i32>
+    FragColor = vec4(float(sum(a)) + float(b.x), 0.0, 0.0, 1.0);
+}
+
+# CHECK: <3 x i32>
+# CHECK: <2 x i32>

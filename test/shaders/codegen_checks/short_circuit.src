@@ -1,0 +1,22 @@
+# IR regression for Bug 1: && / || must short-circuit.
+# The RHS operand (a side-effecting call) must be emitted ONLY inside the
+# logical.rhs block, never eagerly in entry — and exactly once. The CHECK-NOT
+# between `call @sideA` and the logical.rhs label is what catches a regression
+# back to eager evaluation (e.g. a future CodeGenFunction migration).
+
+out vec4 FragColor;
+
+fn int sideA(int x) { return x + 1; }
+fn int sideB(int x) { return x + 2; }
+
+@entry @stage(fragment)
+fn void main() {
+    bool b = (sideA(3) > 0) && (sideB(4) > 0);
+    FragColor = vec4(b ? 1.0 : 0.0, 0.0, 0.0, 1.0);
+}
+
+# CHECK: define{{.*}}@fs_main
+# CHECK: entry:
+# CHECK-NOT: call i32 @sideB
+# CHECK: logical.rhs:
+# CHECK: call i32 @sideB

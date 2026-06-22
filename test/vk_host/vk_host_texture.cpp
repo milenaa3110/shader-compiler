@@ -18,7 +18,7 @@
 #include <iostream>
 #include <vector>
 
-#include "../../error_utils_fmt.h"
+#include "../../src/common/error_utils_fmt.h"
 
 static constexpr VkFormat COLOR_FMT = VK_FORMAT_R8G8B8A8_UNORM;
 static constexpr VkFormat TEX_FMT = VK_FORMAT_R8G8B8A8_UNORM;

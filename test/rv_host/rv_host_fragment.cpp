@@ -5,13 +5,13 @@
 //
 // Usage (from Makefile):
 //   riscv64-linux-gnu-g++ -O3 -fopenmp -DANIM_NAME="mandelbrot" -DNFRAMES=60 \
-//       -Ipipeline rv_host_fragment.cpp pipeline/pipeline_runtime.cpp \
+//       -Isrc/runtime rv_host_fragment.cpp src/runtime/pipeline_runtime.cpp \
 //       mandelbrot_riscv.o -o mandelbrot.rv
 //   OMP_NUM_THREADS=8 qemu-riscv64-static -L /usr/riscv64-linux-gnu ./mandelbrot.rv
 
-#include "../../pipeline/pipeline_runtime.h"
-#include "../../pipeline/pipeline_abi.h"
-#include "../../error_utils.h"
+#include "../../src/runtime/pipeline_runtime.h"
+#include "../../src/runtime/pipeline_abi.h"
+#include "../../src/common/error_utils.h"
 
 #include <vector>
 #include <iostream>

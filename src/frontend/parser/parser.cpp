@@ -1,6 +1,6 @@
 #include "parser.h"
 #include "../ast/ast_context.h"
-#include "../error_utils_fmt.h"
+#include "../../common/error_utils_fmt.h"
 #include "../lexer/lexer.h"
 #include <string>
 #include <string_view>
@@ -10,22 +10,10 @@
 #include <vector>
 #include <fmt/core.h>
 
-// Defines all built-in types usable for variables, fields, and parameters.
-// Uses the X-Macro pattern to automatically sync type checking (isTypeTok),
-// string conversion (tokToTypeName), and AST construction across the parser.
-//
-// 'Void' is omitted on purpose: it is only a valid function return type,
-// never a value-bearing declaration, and is handled separately.
-#define TYPE_TOKENS(X) \
-    X(Double, "double") X(Float, "float") X(Int, "int") X(Uint, "uint") X(Bool, "bool") \
-    X(Vec2, "vec2") X(Vec3, "vec3") X(Vec4, "vec4") \
-    X(Mat2, "mat2") X(Mat2x3, "mat2x3") X(Mat2x4, "mat2x4") \
-    X(Mat3, "mat3") X(Mat3x2, "mat3x2") X(Mat3x4, "mat3x4") \
-    X(Mat4, "mat4") X(Mat4x2, "mat4x2") X(Mat4x3, "mat4x3") \
-    X(Uvec2, "uvec2") X(Uvec3, "uvec3") X(Uvec4, "uvec4") \
-    X(Ivec2, "ivec2") X(Ivec3, "ivec3") X(Ivec4, "ivec4") \
-    X(Sampler2D, "sampler2D") X(Sampler3D, "sampler3D") X(SamplerCube, "samplerCube") \
-    X(Image2D, "image2D")
+// The builtin type-keyword list is no longer hand-maintained here: isTypeTok,
+// tokToTypeName, and parsePrimary all expand ../ast/builtin_types.def (the same
+// source the lexer, sema, and codegen use), so the lists can't drift. `void` is
+// not in it (function-return type only) and is handled separately at each site.
 
 class Parser {
 public:
@@ -53,10 +41,10 @@ public:
     // in AST parsing functions that return pointers.
     std::nullptr_t error(const std::string& msg) {
         if (errorCount_ < kMaxErrors) {
-            logErrorAt(Cur.line, Cur.col, msg);
+            logErrorAt(Cur.loc, msg);
             ++errorCount_;
         } else if (errorCount_ == kMaxErrors) {
-            logErrorAt(Cur.line, Cur.col,
+            logErrorAt(Cur.loc,
                        "too many parse errors; remaining errors suppressed");
             ++errorCount_;
         }
@@ -87,25 +75,23 @@ public:
     // Takes a raw pointer (the ASTContext owns the storage); a null pointer
     // passes through unchanged for the "log error, return nullptr" pattern.
     template <class T>
-    static T* at(T* n, int line, int col) {
-        if (n) { n->line = line; n->col = col; }
+    static T* at(T* n, SourceLocation loc) {
+        if (n) n->loc = loc;
         return n;
     }
 
     // RAII position-stamper. Construct at the start of a parse method to
-    // snapshot the current token's (line, col); call stamp(node) at every
-    // return point to stamp without rewriting `int _sl=…, _sc=…; … at(node,
-    // _sl, _sc)` boilerplate. Stays a no-op for null nodes, matching at().
+    // snapshot the current token's location; call stamp(node) at every return
+    // point to stamp without rewriting `SourceLocation _l = …; … at(node, _l)`
+    // boilerplate. Stays a no-op for null nodes, matching at().
     class ScopedLoc {
      public:
-        explicit ScopedLoc(const Parser& p) : line_(p.Cur.line), col_(p.Cur.col) {}
+        explicit ScopedLoc(const Parser& p) : loc_(p.Cur.loc) {}
         template <class T>
-        T* stamp(T* n) const { return Parser::at(n, line_, col_); }
-        int line() const { return line_; }
-        int col()  const { return col_;  }
+        T* stamp(T* n) const { return Parser::at(n, loc_); }
+        SourceLocation loc() const { return loc_; }
      private:
-        int line_;
-        int col_;
+        SourceLocation loc_;
     };
 
     std::vector<ExprAST*> ParseProgram();
@@ -154,14 +140,14 @@ private:
     static constexpr int kMaxErrors = 20;
     int errorCount_ = 0;
 
-    // Single source of truth for type-keyword tokens — see TYPE_TOKENS
-    // above. Adding a type is one X(...) line in TYPE_TOKENS; this switch,
-    // tokToTypeName, and parsePrimary's constructor case all expand from it.
+    // Which token kinds are builtin types. Expanded from ../ast/builtin_types.def
+    // (the same source the lexer, sema, and codegen use); this switch,
+    // tokToTypeName, and parsePrimary's constructor case all derive from it, so
+    // adding a type is one row in that .def.
     static bool isTypeTok(TokenKind tok) {
         switch (tok) {
-#define X(Tok, _Name) case TokenKind::Tok:
-            TYPE_TOKENS(X)
-#undef X
+#define BTYPE(Tok, _Spelling) case TokenKind::Tok:
+#include "../ast/builtin_types.def"
                 return true;
             default: return false;
         }
@@ -204,15 +190,13 @@ private:
         }
     }
 
-    // Map a type-keyword token to its spelling. Drives both name-emission
-    // for declared variables and the parsePrimary constructor switch.
-    // Void is the one type-keyword not in TYPE_TOKENS (it's not a value
-    // type), so it gets its own case.
+    // Map a type-keyword token to its spelling (from builtin_types.def). Void is
+    // the one type keyword not in the .def (return-only, not a value type), so it
+    // gets its own case.
     static std::string_view tokToTypeName(TokenKind tok) {
         switch (tok) {
-#define X(Tok, Name) case TokenKind::Tok: return Name;
-            TYPE_TOKENS(X)
-#undef X
+#define BTYPE(Tok, Spelling) case TokenKind::Tok: return Spelling;
+#include "../ast/builtin_types.def"
             case TokenKind::Void: return "void";
             default: return "";
         }
@@ -1193,10 +1177,10 @@ ExprAST* Parser::parseAssignmentOrExprStatement(bool consumeSemi) {
         if (auto* var = llvm::dyn_cast<VariableExprAST>(lhs)) {
             // Desugar `a += b` → `a = a + b`; the synthetic nodes inherit the
             // lvalue's source position.
-            int ll = lhs->line, lc = lhs->col;
-            auto* lhsCopy = at(Ctx.create<VariableExprAST>(var->Name), ll, lc);
-            auto* binExpr = at(Ctx.create<BinaryExprAST>(binOp, lhsCopy, rhs), ll, lc);
-            return at(Ctx.create<AssignmentExprAST>("", var->Name, binExpr), ll, lc);
+            SourceLocation l = lhs->loc;
+            auto* lhsCopy = at(Ctx.create<VariableExprAST>(var->Name), l);
+            auto* binExpr = at(Ctx.create<BinaryExprAST>(binOp, lhsCopy, rhs), l);
+            return at(Ctx.create<AssignmentExprAST>("", var->Name, binExpr), l);
         }
         error("Compound assignment only supported for simple variables");
         return nullptr;
@@ -1320,13 +1304,12 @@ ExprAST* Parser::parsePrimary() {
     ScopedLoc loc(*this);
     ExprAST* expr = nullptr;
     switch (peek()) {
-        // Identifier and every built-in type-keyword dispatch to the same
-        // path — TYPE_TOKENS(X) keeps the list in sync with isTypeTok and
-        // tokToTypeName so adding a new type only edits the macro.
+        // Identifier and every builtin type keyword dispatch to the same path
+        // (a type keyword here begins a constructor call like `vec3(...)`). The
+        // case list expands builtin_types.def, in sync with isTypeTok.
         case TokenKind::Identifier:
-#define X(Tok, _Name) case TokenKind::Tok:
-        TYPE_TOKENS(X)
-#undef X
+#define BTYPE(Tok, _Spelling) case TokenKind::Tok:
+#include "../ast/builtin_types.def"
             expr = parseIdentifierOrCtorExpr();
             break;
         case TokenKind::Number:
@@ -1366,7 +1349,7 @@ ExprAST* Parser::parsePrimary() {
 // number literal
 // example: 42, 3.14
 ExprAST* Parser::parseNumberExpr() {
-    auto result = Ctx.create<NumberExprAST>(Cur.num, Cur.isInt);
+    auto result = Ctx.create<NumberExprAST>(Cur.num, Cur.isInt, Cur.isUnsigned);
     next();
     return result;
 }
@@ -1431,13 +1414,13 @@ ExprAST* Parser::parsePostfixAfterIdent(ExprAST* base) {
             // check if single component or swizzle
             std::string member(Cur.text);
             next();
-            int bl = base->line, bc = base->col;
-            base = at(Ctx.create<MemberAccessExprAST>(std::move(base), member), bl, bc);
+            SourceLocation l = base->loc;
+            base = at(Ctx.create<MemberAccessExprAST>(std::move(base), member), l);
             continue;
         }
         // matrix access - someMat[i] or someMat[i][j]
         if (peek() == TokenKind::Lbracket) {
-            int bl = base->line, bc = base->col;
+            SourceLocation l = base->loc;
             auto idx1 = parseBracketIndex();
             if (!idx1) return nullptr;
 
@@ -1448,12 +1431,12 @@ ExprAST* Parser::parsePostfixAfterIdent(ExprAST* base) {
                     std::move(base),
                     std::move(idx1),
                     std::move(idx2)
-                ), bl, bc);
+                ), l);
             } else {
                 base = at(Ctx.create<MatrixAccessExprAST>(
                     std::move(base),
                     std::move(idx1)
-                ), bl, bc);
+                ), l);
             }
             continue;
         }
@@ -1468,9 +1451,9 @@ ExprAST* Parser::parsePostfixAfterIdent(ExprAST* base) {
                 error("Postfix ++/-- only supported on simple variables");
                 return nullptr;
             }
-            int bl = base->line, bc = base->col;
+            SourceLocation l = base->loc;
             base = at(Ctx.create<PostfixIncrExprAST>(std::move(base), isDec),
-                      bl, bc);
+                      l);
             continue;
         }
         break;
@@ -1498,8 +1481,8 @@ ExprAST* Parser::parseBinOpRHS(int exprPrecedence, ExprAST* lhs) {
             if (!rhs) return nullptr;
         }
         // The composite BinaryExprAST is located at its left operand's start.
-        int cl = lhs->line, cc = lhs->col;
-        lhs = at(Ctx.create<BinaryExprAST>(op, lhs, rhs), cl, cc);
+        SourceLocation l = lhs->loc;
+        lhs = at(Ctx.create<BinaryExprAST>(op, lhs, rhs), l);
     }
 }
 

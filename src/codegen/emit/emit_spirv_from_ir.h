@@ -33,7 +33,7 @@
 #include <string>
 #include <vector>
 
-#include "../parser/parser.h"  // for ShaderStage
+#include "../../frontend/parser/parser.h"  // for ShaderStage
 
 namespace spv_emit {
 

@@ -2,12 +2,12 @@
 // module with the RISC-V target triple and RVV feature attributes so that
 // llc-18 emits native RISC-V code with vector (RVV) auto-vectorisation.
 
-#include "../parser/parser.h"
-#include "../ast/ast.h"
-#include "../ast/ast_context.h"
-#include "../sema/sema.h"
+#include "../../frontend/parser/parser.h"
+#include "../../frontend/ast/ast.h"
+#include "../../frontend/ast/ast_context.h"
+#include "../../frontend/sema/sema.h"
 #include "../codegen_state/codegen_state.h"
-#include "../error_utils_fmt.h"
+#include "../../common/error_utils_fmt.h"
 
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/FileSystem.h>
@@ -45,7 +45,7 @@ int main(int argc, char* argv[]) {
 
     // Post-parse semantic pass — registers struct decls, detects cyclic
     // field dependencies, validates every type-name reference.
-    SemanticAnalyzer sema;
+    SemanticAnalyzer sema(astCtx);
     if (sema.run(nodes) != 0) { logError("Semantic analysis failed"); return 1; }
 
     // Forward-declare all structs so codegen can resolve out-of-order

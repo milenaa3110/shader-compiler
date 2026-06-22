@@ -1,0 +1,25 @@
+# IR regression (Step a codegen half): matrix binary lowering over the
+# column-major [cols x <rows x float>] representation. mat*vec is a per-column
+# vector FMA (extractvalue a column, fmul <rows x float>); mat*mat builds a
+# [K x <R x float>] result via insertvalue (a different result SHAPE — array, not
+# vector — so it exercises the InsertValue path). `compose` is defined but
+# uncalled; irgen still lowers it.
+
+uniform mat4 MVP;
+out vec4 vColor;
+
+fn vec4 transform(vec4 p) { return MVP * p; }
+fn mat3 compose(mat3 a, mat3 b) { return a * b; }
+
+@entry @stage(vertex)
+fn void main() {
+    gl_Position = transform(vec4(float(gl_VertexID), 0.0, 0.0, 1.0));
+    vColor = vec4(1.0);
+}
+
+# CHECK-LABEL: define{{.*}}@transform
+# CHECK: extractvalue [4 x <4 x float>]
+# CHECK: fmul <4 x float>
+
+# CHECK-LABEL: define{{.*}}@compose
+# CHECK: insertvalue [3 x <3 x float>]

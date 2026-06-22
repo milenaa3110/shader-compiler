@@ -1,9 +1,9 @@
 // helpers/call_helpers.cpp
 #include "call_helpers.h"
-#include "../ast/ast.h"
+#include "../../frontend/ast/ast.h"
 #include "../codegen_state/codegen_state.h"
-#include "../helpers/utils.h"
-#include "../error_utils_fmt.h"
+#include "utils.h"
+#include "../../common/error_utils_fmt.h"
 
 #include <algorithm>
 #include <cctype>
@@ -95,7 +95,7 @@ llvm::Value* tryCodegenMatrixConstructor(const CallExprAST* call) {
             if (!v) return nullptr;
 
             if (!v->getType()->isVectorTy() || v->getType() != colTy) {
-                logErrorFmtAt(call->line, call->col,"Matrix constructor {}: expects column {} to be vec{} of float",
+                logErrorFmtAt(call->loc,"Matrix constructor {}: expects column {} to be vec{} of float",
                            call->Callee, c, rows);
                 return nullptr;
             }
@@ -125,20 +125,29 @@ llvm::Value* tryCodegenMatrixConstructor(const CallExprAST* call) {
         return mat;
     }
 
-    logErrorFmtAt(call->line, call->col,"Matrix constructor: unsupported argument pattern for {}", call->Callee);
+    logErrorFmtAt(call->loc,"Matrix constructor: unsupported argument pattern for {}", call->Callee);
     return nullptr;
 }
 
 llvm::Value* tryCodegenVectorConstructor(const CallExprAST* call) {
     const std::string& C = call->Callee;
-    if (C != "vec2" && C != "vec3" && C != "vec4") return nullptr;
+    // vecN → float elements; ivecN / uvecN → i32 elements. N ∈ {2,3,4}. (int and
+    // uint share the signless i32; the conversion of each component is what
+    // carries signedness, via castScalarTo below.)
+    llvm::Type* elemTy = nullptr;
+    if (C == "vec2" || C == "vec3" || C == "vec4")
+        elemTy = llvm::Type::getFloatTy(*Context);
+    else if (C == "ivec2" || C == "ivec3" || C == "ivec4" ||
+             C == "uvec2" || C == "uvec3" || C == "uvec4")
+        elemTy = llvm::Type::getInt32Ty(*Context);
+    else
+        return nullptr;
 
-    const unsigned N = (C == "vec2" ? 2u : (C == "vec3" ? 3u : 4u));
-    llvm::Type* elemTy = llvm::Type::getFloatTy(*Context);
+    const unsigned N = static_cast<unsigned>(C.back() - '0');
     auto* vecTy = llvm::FixedVectorType::get(elemTy, N);
 
     if (call->Args.empty()) {
-        logErrorFmtAt(call->line, call->col,"Constructor {} expects at least 1 argument", C);
+        logErrorFmtAt(call->loc,"Constructor {} expects at least 1 argument", C);
         return nullptr;
     }
 
@@ -179,7 +188,7 @@ llvm::Value* tryCodegenVectorConstructor(const CallExprAST* call) {
         if (v->getType()->isVectorTy()) {
             auto* vVecTy = llvm::dyn_cast<llvm::FixedVectorType>(v->getType());
             if (!vVecTy) {
-                logErrorFmtAt(call->line, call->col,"Constructor {}: only fixed-size vectors supported", C);
+                logErrorFmtAt(call->loc,"Constructor {}: only fixed-size vectors supported", C);
                 return nullptr;
             }
 
@@ -194,7 +203,7 @@ llvm::Value* tryCodegenVectorConstructor(const CallExprAST* call) {
             }
         } else {
             if (comps.size() == N) {
-                logErrorFmtAt(call->line, call->col,"Constructor {}: too many components", C);
+                logErrorFmtAt(call->loc,"Constructor {}: too many components", C);
                 return nullptr;
             }
             if (!pushComp(v)) return nullptr;
@@ -202,20 +211,22 @@ llvm::Value* tryCodegenVectorConstructor(const CallExprAST* call) {
 
         // If we've filled N but still have remaining arguments, that's an error.
         if (comps.size() == N && ai + 1 < argVals.size()) {
-            logErrorFmtAt(call->line, call->col,"Constructor {}: too many components", C);
+            logErrorFmtAt(call->loc,"Constructor {}: too many components", C);
             return nullptr;
         }
     }
 
-    // Fill missing components: default 0, but for vec4 missing w => 1
+    // Fill missing components: default 0, but for a 4-vector missing w => 1.
+    // The constant follows the element type (ConstantInt for ivec/uvec).
     if (comps.size() < N) {
-        llvm::Value* zero = llvm::ConstantFP::get(elemTy, 0.0);
-        while (comps.size() < N) comps.push_back(zero);
-
-        if (N == 4) {
-            // Set missing vec4.w to 1
-            comps[3] = llvm::ConstantFP::get(elemTy, 1.0);
-        }
+        auto elemConst = [&](double v) -> llvm::Value* {
+            return elemTy->isIntegerTy()
+                ? static_cast<llvm::Value*>(
+                      llvm::ConstantInt::get(elemTy, static_cast<uint64_t>(v)))
+                : static_cast<llvm::Value*>(llvm::ConstantFP::get(elemTy, v));
+        };
+        while (comps.size() < N) comps.push_back(elemConst(0.0));
+        if (N == 4) comps[3] = elemConst(1.0);  // missing w => 1
     }
 
     return buildVectorFromScalars(comps, N);
@@ -226,7 +237,7 @@ llvm::Value* tryCodegenScalarConstructor(const CallExprAST* call) {
     if (C != "float" && C != "double" && C != "int" && C != "uint" && C != "bool") return nullptr;
 
     if (call->Args.size() != 1) {
-        logErrorFmtAt(call->line, call->col,"Constructor {} expects exactly 1 argument", C);
+        logErrorFmtAt(call->loc,"Constructor {} expects exactly 1 argument", C);
         return nullptr;
     }
 
@@ -235,13 +246,13 @@ llvm::Value* tryCodegenScalarConstructor(const CallExprAST* call) {
 
     Type* dst = resolveTypeByName(C);
     if (!dst) {
-        logErrorFmtAt(call->line, call->col,"Unknown scalar constructor: {}", C);
+        logErrorFmtAt(call->loc,"Unknown scalar constructor: {}", C);
         return nullptr;
     }
 
     Value* cv = castScalarTo(v, dst);
     if (!cv) {
-        logErrorFmtAt(call->line, call->col,"Cannot cast to {}", C);
+        logErrorFmtAt(call->loc,"Cannot cast to {}", C);
         return nullptr;
     }
     return cv;
@@ -261,7 +272,7 @@ llvm::Value* tryCodegenStructConstructor(const CallExprAST* call) {
     }
 
     if (call->Args.size() != numFields) {
-        logErrorFmtAt(call->line, call->col,"Struct constructor {} expects {} arguments, got {}",
+        logErrorFmtAt(call->loc,"Struct constructor {} expects {} arguments, got {}",
                    call->Callee, numFields, call->Args.size());
         return nullptr;
     }
@@ -278,7 +289,7 @@ llvm::Value* tryCodegenStructConstructor(const CallExprAST* call) {
             if (fieldTy->isVectorTy() && !argVal->getType()->isVectorTy()) {
                 auto* vecTy = dyn_cast<FixedVectorType>(fieldTy);
                 if (!vecTy) {
-                    logErrorFmtAt(call->line, call->col,"Struct constructor {}: only fixed-size vectors supported for field {}",
+                    logErrorFmtAt(call->loc,"Struct constructor {}: only fixed-size vectors supported for field {}",
                                call->Callee, i);
                     return nullptr;
                 }

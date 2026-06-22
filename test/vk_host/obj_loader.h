@@ -20,7 +20,7 @@
 #pragma once
 
 #include "mesh_data.h"
-#include "../../error_utils.h"
+#include "../../src/common/error_utils.h"
 
 #include <algorithm>
 #include <array>

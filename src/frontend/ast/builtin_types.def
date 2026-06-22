@@ -1,0 +1,82 @@
+// builtin_types.def — THE single source of truth for value-bearing builtin
+// types. One row per type; every layer derives its own view:
+//   * lexer  tokens.def            → KEYWORD tokens (so `vec3` lexes as a token)
+//   * parser isTypeTok/tokToTypeName/parsePrimary → which TokenKinds are types
+//   * sema   resolveTypeName/isBuiltinType        → name → glsl::Type
+//   * codegen resolveTypeByName                   → name → llvm::Type
+//   * type.h SamplerKind enum + toString          → sampler kinds
+// so the four lists CANNOT diverge (the sampler2DArray/imageBuffer bug — sema
+// rejecting what codegen accepted — came from keeping them separate).
+//
+// `void` is intentionally absent: it is a function-return type only, never a
+// value-bearing declaration, and every site handles it separately.
+//
+// A consumer defines whichever macro it needs; the rest fall back to the 2-arg
+// BTYPE(Tok, Spelling), which falls back to a no-op. Categories carry the params
+// each backend needs:
+//   BTYPE_SCALAR (Tok, Spelling, GlslKind, LlvmGetter)
+//        GlslKind  → Ctx.get<GlslKind>Ty()         (Bool/Int/Uint/Float/Double)
+//        LlvmGetter→ llvm::Type::<LlvmGetter>(ctx)  (getInt1Ty/getInt32Ty/…)
+//   BTYPE_VECTOR (Tok, Spelling, GlslElem, LlvmElem, N)
+//   BTYPE_MATRIX (Tok, Spelling, Cols, Rows)        — elements always float
+//   BTYPE_SAMPLER(Tok, Spelling, SamplerKind, Dim, Arrayed, IsImage)
+//        Dim/Arrayed/IsImage describe the GLSL structure for the SPIR-V
+//        OpTypeImage emitter (which still hardcodes 2D) — inert until wired.
+//
+// No include guard: included multiple times; it #undefs all its macros at the
+// end so each inclusion is self-contained (the includer only #defines).
+
+#ifndef BTYPE
+#define BTYPE(Tok, Spelling)
+#endif
+#ifndef BTYPE_SCALAR
+#define BTYPE_SCALAR(Tok, Spelling, GlslKind, LlvmGetter) BTYPE(Tok, Spelling)
+#endif
+#ifndef BTYPE_VECTOR
+#define BTYPE_VECTOR(Tok, Spelling, GlslElem, LlvmElem, N) BTYPE(Tok, Spelling)
+#endif
+#ifndef BTYPE_MATRIX
+#define BTYPE_MATRIX(Tok, Spelling, Cols, Rows) BTYPE(Tok, Spelling)
+#endif
+#ifndef BTYPE_SAMPLER
+#define BTYPE_SAMPLER(Tok, Spelling, Kind, Dim, Arrayed, IsImage) BTYPE(Tok, Spelling)
+#endif
+
+BTYPE_SCALAR(Bool,   "bool",   Bool,   getInt1Ty)
+BTYPE_SCALAR(Int,    "int",    Int,    getInt32Ty)
+BTYPE_SCALAR(Uint,   "uint",   Uint,   getInt32Ty)
+BTYPE_SCALAR(Float,  "float",  Float,  getFloatTy)
+BTYPE_SCALAR(Double, "double", Double, getDoubleTy)
+
+BTYPE_VECTOR(Vec2,  "vec2",  Float, getFloatTy, 2)
+BTYPE_VECTOR(Vec3,  "vec3",  Float, getFloatTy, 3)
+BTYPE_VECTOR(Vec4,  "vec4",  Float, getFloatTy, 4)
+BTYPE_VECTOR(Ivec2, "ivec2", Int,   getInt32Ty, 2)
+BTYPE_VECTOR(Ivec3, "ivec3", Int,   getInt32Ty, 3)
+BTYPE_VECTOR(Ivec4, "ivec4", Int,   getInt32Ty, 4)
+BTYPE_VECTOR(Uvec2, "uvec2", Uint,  getInt32Ty, 2)
+BTYPE_VECTOR(Uvec3, "uvec3", Uint,  getInt32Ty, 3)
+BTYPE_VECTOR(Uvec4, "uvec4", Uint,  getInt32Ty, 4)
+
+BTYPE_MATRIX(Mat2,   "mat2",   2, 2)
+BTYPE_MATRIX(Mat3,   "mat3",   3, 3)
+BTYPE_MATRIX(Mat4,   "mat4",   4, 4)
+BTYPE_MATRIX(Mat2x3, "mat2x3", 2, 3)
+BTYPE_MATRIX(Mat2x4, "mat2x4", 2, 4)
+BTYPE_MATRIX(Mat3x2, "mat3x2", 3, 2)
+BTYPE_MATRIX(Mat3x4, "mat3x4", 3, 4)
+BTYPE_MATRIX(Mat4x2, "mat4x2", 4, 2)
+BTYPE_MATRIX(Mat4x3, "mat4x3", 4, 3)
+
+BTYPE_SAMPLER(Sampler2D,      "sampler2D",      Sampler2D,      Dim2D,     0, 0)
+BTYPE_SAMPLER(Sampler3D,      "sampler3D",      Sampler3D,      Dim3D,     0, 0)
+BTYPE_SAMPLER(SamplerCube,    "samplerCube",    SamplerCube,    DimCube,   0, 0)
+BTYPE_SAMPLER(Sampler2DArray, "sampler2DArray", Sampler2DArray, Dim2D,     1, 0)
+BTYPE_SAMPLER(Image2D,        "image2D",        Image2D,        Dim2D,     0, 1)
+BTYPE_SAMPLER(ImageBuffer,    "imageBuffer",    ImageBuffer,    DimBuffer, 0, 1)
+
+#undef BTYPE
+#undef BTYPE_SCALAR
+#undef BTYPE_VECTOR
+#undef BTYPE_MATRIX
+#undef BTYPE_SAMPLER

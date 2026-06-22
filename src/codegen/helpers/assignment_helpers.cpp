@@ -1,9 +1,9 @@
 // helpers/assignment_helpers.cpp
 #include "assignment_helpers.h"
-#include "../ast/ast.h"
+#include "../../frontend/ast/ast.h"
 #include "../codegen_state/codegen_state.h"
-#include "../error_utils_fmt.h"
-#include "../helpers/utils.h" 
+#include "../../common/error_utils_fmt.h"
+#include "utils.h" 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <fmt/core.h>
@@ -21,12 +21,12 @@ std::vector<unsigned> AssignmentHelper::parseSwizzle(unsigned maxDim, bool allow
     for (char c : Member) {
         int idx = charToIndex(c);
         if (idx < 0 || (unsigned)idx >= maxDim) {
-            logErrorFmtAt(Object->line, Object->col,"Invalid swizzle '{}': '{}' out of range [0-{}]", 
+            logErrorFmtAt(Object->loc,"Invalid swizzle '{}': '{}' out of range [0-{}]", 
                        Member, c, maxDim-1);
             return {};
         }
         if (!allowOverlap && touched[idx]) {
-            logErrorAt(Object->line, Object->col,"Overlapping swizzle not allowed");
+            logErrorAt(Object->loc,"Overlapping swizzle not allowed");
             return {};
         }
         touched[idx] = true;
@@ -51,20 +51,20 @@ MatrixColumnAssigner::MatrixColumnAssigner(MatrixAccessExprAST* matAccess,
 Value* MatrixColumnAssigner::codegen() {
     auto* lhsVar = llvm::dyn_cast<VariableExprAST>(MatAccess->Object);
     if (!lhsVar) {
-        logErrorAt(Object->line, Object->col,"Matrix swizzle assignment LHS must be variable matrix");
+        logErrorAt(Object->loc,"Matrix swizzle assignment LHS must be variable matrix");
         return nullptr;
     }
 
     auto it = NamedValues.find(lhsVar->Name);
     if (it == NamedValues.end()) {
-        logErrorFmtAt(Object->line, Object->col,"Unknown variable '{}' in matrix assignment", lhsVar->Name);
+        logErrorFmtAt(Object->loc,"Unknown variable '{}' in matrix assignment", lhsVar->Name);
         return nullptr;
     }
     AllocaInst* alloca = it->second;
 
     Type* matTy = alloca->getAllocatedType();
     if (!matTy->isArrayTy()) {
-        logErrorAt(Object->line, Object->col,"Expected matrix type for swizzle assignment");
+        logErrorAt(Object->loc,"Expected matrix type for swizzle assignment");
         return nullptr;
     }
 
@@ -90,7 +90,7 @@ Value* MatrixColumnAssigner::codegen() {
     if (rhs->getType()->isVectorTy()) {
         auto* rVecTy = cast<FixedVectorType>(rhs->getType());
         if (rVecTy->getNumElements() != K) {
-            logErrorAt(Object->line, Object->col,"RHS vector size mismatch in matrix swizzle assignment");
+            logErrorAt(Object->loc,"RHS vector size mismatch in matrix swizzle assignment");
             return nullptr;
         }
         Type* rElemTy = rVecTy->getElementType();
@@ -134,20 +134,20 @@ StructFieldAssigner::StructFieldAssigner(ExprAST* obj, const std::string& field,
 unsigned StructFieldAssigner::findFieldIndex(StructType* st) {
     std::string stName = st->hasName() ? st->getName().str() : "";
     if (stName.empty()) {
-        logErrorAt(Object->line, Object->col,"Cannot assign field of unnamed struct");
+        logErrorAt(Object->loc,"Cannot assign field of unnamed struct");
         return -1u;
     }
 
     auto itNames = NamedStructTypes.find(stName);
     if (itNames == NamedStructTypes.end()) {
-        logErrorFmtAt(Object->line, Object->col,"Struct field names not registered for {}", stName);
+        logErrorFmtAt(Object->loc,"Struct field names not registered for {}", stName);
         return -1u;
     }
 
     const auto& fields = itNames->second.FieldNames;
     auto fit = std::find(fields.begin(), fields.end(), Member);
     if (fit == fields.end()) {
-        logErrorFmtAt(Object->line, Object->col,"Struct {} has no field '{}'", stName, Member);
+        logErrorFmtAt(Object->loc,"Struct {} has no field '{}'", stName, Member);
         return -1u;
     }
 
@@ -175,13 +175,13 @@ Value* StructFieldAssigner::coerceRHS(Type* fieldTy) {
 Value* StructFieldAssigner::codegen() {
     AllocaInst* alloca = findVariableAlloca();
     if (!alloca) {
-        logErrorAt(Object->line, Object->col,"Struct assignment LHS must be variable");
+        logErrorAt(Object->loc,"Struct assignment LHS must be variable");
         return nullptr;
     }
 
     Type* objTy = alloca->getAllocatedType();
     if (!objTy->isStructTy()) {
-        logErrorAt(Object->line, Object->col,"Struct field assignment: LHS is not a struct type");
+        logErrorAt(Object->loc,"Struct field assignment: LHS is not a struct type");
         return nullptr;
     }
 
@@ -199,7 +199,7 @@ Value* StructFieldAssigner::codegen() {
         Builder->CreateStore(updated, alloca);
         return updated;
     }
-    logErrorAt(Object->line, Object->col,"Struct field assignment: LHS must be a simple variable expression");
+    logErrorAt(Object->loc,"Struct field assignment: LHS must be a simple variable expression");
     return nullptr;
 }
 VectorSwizzleAssigner::VectorSwizzleAssigner(ExprAST* vecVar, const std::string& swizzle, ExprAST* rhs)
@@ -209,13 +209,13 @@ VectorSwizzleAssigner::VectorSwizzleAssigner(ExprAST* vecVar, const std::string&
 Value* VectorSwizzleAssigner::codegen() {
     AllocaInst* alloca = findVariableAlloca();
     if (!alloca) {
-        logErrorAt(Object->line, Object->col,"Vector swizzle LHS must be variable");
+        logErrorAt(Object->loc,"Vector swizzle LHS must be variable");
         return nullptr;
     }
 
     Type* objTy = alloca->getAllocatedType();
     if (!objTy->isVectorTy()) {
-        logErrorAt(Object->line, Object->col,"Swizzle assignment only supported on vector variables");
+        logErrorAt(Object->loc,"Swizzle assignment only supported on vector variables");
         return nullptr;
     }
 
@@ -236,7 +236,7 @@ Value* VectorSwizzleAssigner::codegen() {
     if (rhs->getType()->isVectorTy()) {
         auto* rVecTy = cast<FixedVectorType>(rhs->getType());
         if (rVecTy->getNumElements() != K) {
-            logErrorFmtAt(Object->line, Object->col,"RHS vector width ({}) must match swizzle length ({})", 
+            logErrorFmtAt(Object->loc,"RHS vector width ({}) must match swizzle length ({})", 
                        rVecTy->getNumElements(), K);
             return nullptr;
         }

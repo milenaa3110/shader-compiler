@@ -10,7 +10,9 @@ fn vec4 shade(vec2 uv) {
     a -= 0.1;
     a *= 2.0;
     a /= 1.5;
-    a %= 1.5;
+    # '%' is integer-only in GLSL (floats use mod()); exercise %= on an int.
+    int n = 7;
+    n %= 3;
 
     # prefix ++/--
     float b = 0.0;

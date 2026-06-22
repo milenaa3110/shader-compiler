@@ -1,0 +1,22 @@
+# IR regression for Bug 2: a ternary's widening cast must be emitted in the arm
+# block (before its branch to the merge), NOT in the merge block — otherwise the
+# cast fails to dominate the PHI edge it feeds ("instruction does not dominate
+# all uses"). Here the int arm `a` is widened to float; the sitofp must sit
+# inside ternary.then, ahead of `br label %ternary.merge`.
+
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    int a = 5;
+    float c = 2.0;
+    bool cond = a > 1;
+    float r = cond ? a : c;
+    FragColor = vec4(r, 0.0, 0.0, 1.0);
+}
+
+# CHECK-LABEL: ternary.then:
+# CHECK: sitofp i32 {{.*}} to float
+# CHECK: br label %ternary.merge
+# CHECK-LABEL: ternary.merge:
+# CHECK: phi float

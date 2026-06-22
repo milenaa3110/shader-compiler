@@ -1,0 +1,25 @@
+# IR regression (Step 5a): sema materializes scalar→vector splat and elementwise
+# vector→vector widening as ImplicitCast nodes, so the conversion no longer rides
+# on the codegen makeTypesMatch net (which Step 5 will delete). `vec3 * float`
+# must splat the scalar (a shufflevector broadcast) before a <3 x float> fmul;
+# `ivec3 + vec3` must widen the int vector with one `sitofp <3 x i32>` before a
+# <3 x float> fadd. (mixi is defined but uncalled — irgen still lowers it.)
+
+out vec4 FragColor;
+
+fn vec3 scale(vec3 v, float s) { return v * s; }
+fn vec3 mixi(ivec3 a, vec3 b) { return a + b; }
+
+@entry @stage(fragment)
+fn void main() {
+    vec3 c = scale(vec3(gl_FragCoord.x), gl_FragCoord.y);
+    FragColor = vec4(c, 1.0);
+}
+
+# CHECK-LABEL: define{{.*}}@scale
+# CHECK: shufflevector
+# CHECK: fmul <3 x float>
+
+# CHECK-LABEL: define{{.*}}@mixi
+# CHECK: sitofp <3 x i32>
+# CHECK: fadd <3 x float>

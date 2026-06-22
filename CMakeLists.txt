@@ -43,7 +43,7 @@ message(STATUS "  spirv-headers: ${SPIRV_HEADERS_INCLUDE_DIR}")
 # RISC-V cross compiler (optional — only needed for `rv-*` targets).
 find_program(CROSS_CXX_BIN NAMES riscv64-linux-gnu-g++ g++)
 
-# clang is used to compile `pipeline/tex_inline.cpp` to RV LLVM bitcode for
+# clang is used to compile `src/runtime/tex_inline.cpp` to RV LLVM bitcode for
 # linking into shader modules (eliminates the per-fragment cross-TU call to
 # the bilinear sampler). Required when CROSS_CXX_BIN is set.
 find_program(CLANG_CXX_BIN NAMES clang++-${LLVM_VERSION_MAJOR} clang++-18 clang++-17 clang++)
@@ -94,14 +94,14 @@ add_custom_target(_output_dirs DEPENDS ${_OUTPUT_DIRS_STAMP})
 # Shared compiler library — the lexer/parser/AST/codegen, used by all 3 tools
 # ─────────────────────────────────────────────────────────────────────────────
 add_library(compiler_common STATIC
-    lexer/lexer.cpp
-    parser/parser.cpp
-    sema/sema.cpp
-    codegen_state/codegen_state.cpp
-    ast/ast.cpp
-    ast/ast_context.cpp
-    helpers/call_helpers.cpp
-    helpers/assignment_helpers.cpp
+    src/frontend/lexer/lexer.cpp
+    src/frontend/parser/parser.cpp
+    src/frontend/sema/sema.cpp
+    src/frontend/ast/ast.cpp
+    src/frontend/ast/ast_context.cpp
+    src/codegen/codegen_state/codegen_state.cpp
+    src/codegen/helpers/call_helpers.cpp
+    src/codegen/helpers/assignment_helpers.cpp
 )
 target_include_directories(compiler_common PUBLIC
     ${CMAKE_SOURCE_DIR}
@@ -116,11 +116,38 @@ set_property(TARGET compiler_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 # Standalone lexer unit test — links only lexer.cpp (no LLVM, no parser).
 # The buffer-backed Lexer is the one cleanly unit-isolatable component.
 # ─────────────────────────────────────────────────────────────────────────────
-add_executable(lexer_test test/lexer_test.cpp lexer/lexer.cpp)
-target_include_directories(lexer_test PRIVATE ${CMAKE_SOURCE_DIR})
+add_executable(lexer_test test/lexer_test.cpp src/frontend/lexer/lexer.cpp)
+target_include_directories(lexer_test PRIVATE ${CMAKE_SOURCE_DIR}/src/frontend)
 set_target_properties(lexer_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 enable_testing()
 add_test(NAME lexer_test COMMAND lexer_test)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sema type-stamp test — links compiler_common (parser + sema + AST) and checks
+# that SemanticAnalyzer stamps the expected glsl::Type on expression nodes.
+# ─────────────────────────────────────────────────────────────────────────────
+add_executable(sema_test test/sema_test.cpp)
+target_link_libraries(sema_test PRIVATE compiler_common)
+target_include_directories(sema_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_target_properties(sema_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+add_test(NAME sema_test COMMAND sema_test)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IR-shape regression tests (FileCheck). Validity (llvm-as in run_tests.sh) can't
+# catch *where* an instruction lands — these pin properties that can silently
+# regress: && / || short-circuit, and a ternary's widening cast sitting in the
+# arm block (PHI dominance). Each test/shaders/codegen_checks/*.src carries its
+# own `# CHECK:` directives. Opt-in on FileCheck being installed; runs the
+# already-built irgen_riscv (so it must be in the default build, which it is).
+# ─────────────────────────────────────────────────────────────────────────────
+find_program(FILECHECK_EXE NAMES FileCheck-18 FileCheck)
+if(FILECHECK_EXE)
+    add_test(NAME ir_checks
+             COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_ir_checks.sh --no-build)
+    set_tests_properties(ir_checks PROPERTIES ENVIRONMENT "FILECHECK=${FILECHECK_EXE}")
+else()
+    message(STATUS "FileCheck not found — skipping ir_checks regression test")
+endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Parser fuzzer (libFuzzer). Opt-in: requires clang with -fsanitize=fuzzer.
@@ -140,14 +167,14 @@ if(ENABLE_FUZZER)
     endif()
     add_executable(parser_fuzz
         test/fuzz/parser_fuzz.cpp
-        lexer/lexer.cpp
-        parser/parser.cpp
-        sema/sema.cpp
-        ast/ast.cpp
-        ast/ast_context.cpp
-        codegen_state/codegen_state.cpp
-        helpers/call_helpers.cpp
-        helpers/assignment_helpers.cpp
+        src/frontend/lexer/lexer.cpp
+        src/frontend/parser/parser.cpp
+        src/frontend/sema/sema.cpp
+        src/frontend/ast/ast.cpp
+        src/frontend/ast/ast_context.cpp
+        src/codegen/codegen_state/codegen_state.cpp
+        src/codegen/helpers/call_helpers.cpp
+        src/codegen/helpers/assignment_helpers.cpp
     )
     target_include_directories(parser_fuzz PRIVATE
         ${CMAKE_SOURCE_DIR} ${LLVM_INCLUDE_DIRS})
@@ -165,29 +192,21 @@ endif()
 # ─────────────────────────────────────────────────────────────────────────────
 # Compiler tool binaries
 # ─────────────────────────────────────────────────────────────────────────────
-add_executable(shader_codegen main_codegen/main_codegen.cpp)
+add_executable(shader_codegen src/driver/main_codegen.cpp)
 target_link_libraries(shader_codegen PRIVATE compiler_common)
-target_include_directories(shader_codegen PRIVATE
-    ${CMAKE_SOURCE_DIR}/lexer ${CMAKE_SOURCE_DIR}/parser
-    ${CMAKE_SOURCE_DIR}/ast   ${CMAKE_SOURCE_DIR}/codegen_state
-    ${CMAKE_SOURCE_DIR}/helpers)
+target_include_directories(shader_codegen PRIVATE ${CMAKE_SOURCE_DIR}/src)
 set_target_properties(shader_codegen PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
-add_executable(irgen_riscv main/main_lib_riscv.cpp)
+add_executable(irgen_riscv src/codegen/emit/main_lib_riscv.cpp)
 target_link_libraries(irgen_riscv PRIVATE compiler_common)
-target_include_directories(irgen_riscv PRIVATE
-    ${CMAKE_SOURCE_DIR}/lexer ${CMAKE_SOURCE_DIR}/parser
-    ${CMAKE_SOURCE_DIR}/ast   ${CMAKE_SOURCE_DIR}/codegen_state
-    ${CMAKE_SOURCE_DIR}/helpers)
+target_include_directories(irgen_riscv PRIVATE ${CMAKE_SOURCE_DIR}/src)
 set_target_properties(irgen_riscv PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${RISCV_DIR})
 add_dependencies(irgen_riscv _output_dirs)
 
-add_executable(irgen_spirv main/main_lib_spirv.cpp)
+add_executable(irgen_spirv src/codegen/emit/main_lib_spirv.cpp)
 target_link_libraries(irgen_spirv PRIVATE compiler_common)
 target_include_directories(irgen_spirv PRIVATE
-    ${CMAKE_SOURCE_DIR}/lexer ${CMAKE_SOURCE_DIR}/parser
-    ${CMAKE_SOURCE_DIR}/ast   ${CMAKE_SOURCE_DIR}/codegen_state
-    ${CMAKE_SOURCE_DIR}/helpers
+    ${CMAKE_SOURCE_DIR}/src
     ${SPIRV_HEADERS_INCLUDE_DIR})
 set_target_properties(irgen_spirv PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${SPV_DIR})
 add_dependencies(irgen_spirv _output_dirs)
@@ -197,7 +216,7 @@ add_dependencies(irgen_spirv _output_dirs)
 # Combines llvm.sin.f32(X)+llvm.cos.f32(X) into a single sincosf call after
 # opt -O3 has unified duplicate sin/cos arguments via GVN.
 # ─────────────────────────────────────────────────────────────────────────────
-add_library(sincos_opt MODULE passes/sincos_opt.cpp)
+add_library(sincos_opt MODULE src/passes/sincos_opt.cpp)
 target_include_directories(sincos_opt PRIVATE ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(sincos_opt PRIVATE ${LLVM_DEFINITIONS})
 target_compile_features(sincos_opt PRIVATE cxx_std_17)  # LLVM pass API uses C++17
@@ -229,7 +248,7 @@ add_vulkan_host(spirv_vulkan_texture_host test/vk_host/vk_host_texture.cpp)
 # Shader compilation: helper functions
 # ─────────────────────────────────────────────────────────────────────────────
 set(ANIM_SHADER_DIR ${CMAKE_SOURCE_DIR}/test/shaders/animations)
-set(PIPELINE_DIR    ${CMAKE_SOURCE_DIR}/pipeline)
+set(PIPELINE_DIR    ${CMAKE_SOURCE_DIR}/src/runtime)
 set(RV_HOST_SRC     ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_fragment.cpp)
 set(SCENE_VS_SRC    ${CMAKE_SOURCE_DIR}/test/shaders/pipeline/scene_vs.src)
 

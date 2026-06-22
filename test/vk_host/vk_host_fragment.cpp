@@ -7,7 +7,7 @@
 // Requires: libvulkan-dev, LavaPipe ICD (libvulkan_lvp.so already present)
 
 #include <vulkan/vulkan.h>
-#include "../../error_utils_fmt.h"
+#include "../../src/common/error_utils_fmt.h"
 
 #include <vector>
 #include <fstream>

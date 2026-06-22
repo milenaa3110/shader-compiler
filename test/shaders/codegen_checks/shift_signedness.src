@@ -1,0 +1,19 @@
+# IR regression: >> signedness follows the LHS operand only (GLSL §5.9), not the
+# OR of both operands. `int >> uint` must be an arithmetic shift (ashr) — a
+# logical shift (lshr) would zero-fill a negative value's high bits, giving a
+# huge positive result instead of floor-division-by-2. The value is runtime (a
+# function param) so the shift survives as a real instruction.
+
+out vec4 FragColor;
+
+fn int shr(int x) { return x >> 1u; }   # x is signed → ashr, despite 1u
+
+@entry @stage(fragment)
+fn void main() {
+    int r = shr(int(gl_FragCoord.x) - 100);
+    FragColor = vec4(float(r), 0.0, 0.0, 1.0);
+}
+
+# CHECK-LABEL: define{{.*}}@shr
+# CHECK: ashr i32
+# CHECK-NOT: lshr i32

@@ -129,11 +129,11 @@ for A in "${ANIMATIONS[@]}"; do
             echo -e "  CPU (RISC-V) : ${YELLOW}SKIP (no RISC-V runtime — install qemu-user-static or run on RISC-V hardware)${RESET}"
         elif [[ -f "build/riscv/${A}_rv.o" ]]; then
             # Build rv binary with OpenMP
-            $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Ipipeline \
+            $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Isrc/runtime \
                 -DANIM_NAME="\"${A}\"" -DNFRAMES="${VK_FRAMES}" -DFPS=30 \
                 -DWIDTH="${RV_WIDTH}" -DHEIGHT="${RV_HEIGHT}" \
                 test/rv_host/rv_host_fragment.cpp \
-                pipeline/pipeline_runtime.cpp \
+                src/runtime/pipeline_runtime.cpp \
                 "build/riscv/${A}_rv.o" -o "build/riscv/${A}_bench.rv" 2>/dev/null
 
             echo -n "  CPU (RISC-V) : running on ${SIM_NAME} (${RV_WIDTH}x${RV_HEIGHT}, ${VK_FRAMES} frame(s))…"

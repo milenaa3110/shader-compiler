@@ -12,15 +12,20 @@ The primary goal is to compare GPU and CPU execution of the same shader logic, m
 
 ```
 .
-├── lexer/              Tokeniser
-├── parser/             Recursive-descent parser → AST
-├── ast/                AST node definitions
-├── codegen_state/      Codegen context and symbol table
-├── main/               irgen_riscv and irgen_spirv entry points
-├── main_codegen/       shader_codegen (interactive IR dump tool)
-├── helpers/            call_helpers, assignment_helpers
-├── passes/             sincos_opt.cpp — LLVM pass plugin
-├── pipeline/           Software rasterizer (pipeline_runtime.cpp/h, pipeline_abi.h)
+├── src/
+│   ├── frontend/       Language front-end
+│   │   ├── lexer/        Tokeniser
+│   │   ├── parser/       Recursive-descent parser → AST
+│   │   ├── sema/         Semantic analysis
+│   │   └── ast/          AST node definitions + codegen
+│   ├── codegen/        IR generation back-end
+│   │   ├── codegen_state/  Codegen context and symbol table
+│   │   ├── helpers/        call_helpers, assignment_helpers, utils
+│   │   └── emit/           irgen_riscv / irgen_spirv entry points + SPIR-V/trampoline emitters
+│   ├── passes/         sincos_opt.cpp — LLVM pass plugin
+│   ├── runtime/        Software rasterizer (pipeline_runtime.cpp/h, pipeline_abi.h, tex_inline)
+│   ├── driver/         shader_codegen (interactive IR dump tool)
+│   └── common/         error_utils helpers
 ├── test/
 │   ├── assets/         3D mesh data (cube, Stanford bunny, textured jeep, high-poly teddy, Mixamo boss)
 │   ├── rv_host/        RISC-V benchmark hosts (cross-compiled, run under QEMU)
@@ -260,9 +265,9 @@ llc-18 -O3 --fp-contract=fast -filetype=obj \
        -mtriple=riscv64-unknown-linux-gnu -mattr=+m,+a,+f,+d,+v final.ll -o shader.o
 
 # 6. Link with host + rasterizer
-riscv64-linux-gnu-g++ -O3 -static -fopenmp -Ipipeline \
+riscv64-linux-gnu-g++ -O3 -static -fopenmp -Isrc/runtime \
     -DANIM_NAME='"mandelbrot"' -DNFRAMES=60 \
-    test/rv_host/rv_host_fragment.cpp pipeline/pipeline_runtime.cpp \
+    test/rv_host/rv_host_fragment.cpp src/runtime/pipeline_runtime.cpp \
     shader.o -o mandelbrot.rv
 
 # 7. Run under QEMU

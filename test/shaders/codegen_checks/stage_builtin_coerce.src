@@ -1,0 +1,19 @@
+# IR regression: integer stage builtins (gl_VertexID, gl_GlobalInvocationID, …)
+# are TYPED by sema (bound per stage), so using one in a mixed int/float op
+# materializes the int→float cast at the operand — `gl_VertexID * 2.0` emits
+# `sitofp i32 ... to float` then `fmul float`. Before stage-builtin binding this
+# was the one hole that kept the legacy makeTypesMatch net alive (the corpus
+# never hits it — compute shaders convert via int()/uint() first).
+
+out vec4 vColor;
+
+@entry @stage(vertex)
+fn void main() {
+    float x = gl_VertexID * 2.0;
+    gl_Position = vec4(x, 0.0, 0.0, 1.0);
+    vColor = vec4(1.0);
+}
+
+# CHECK-LABEL: define{{.*}}@vs_main
+# CHECK: sitofp i32
+# CHECK: fmul float

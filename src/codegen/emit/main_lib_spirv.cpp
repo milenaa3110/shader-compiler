@@ -8,12 +8,12 @@
 // Usage:
 //   ./irgen_spirv <output.spv> < shader_fs.src
 
-#include "../parser/parser.h"
-#include "../ast/ast.h"
-#include "../ast/ast_context.h"
-#include "../sema/sema.h"
+#include "../../frontend/parser/parser.h"
+#include "../../frontend/ast/ast.h"
+#include "../../frontend/ast/ast_context.h"
+#include "../../frontend/sema/sema.h"
 #include "../codegen_state/codegen_state.h"
-#include "../error_utils_fmt.h"
+#include "../../common/error_utils_fmt.h"
 
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/FileSystem.h>
@@ -57,7 +57,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Post-parse semantic pass — see main_lib_riscv.cpp for rationale.
-    SemanticAnalyzer sema;
+    SemanticAnalyzer sema(astCtx);
     if (sema.run(nodes) != 0) {
         logError("[irgen_spirv] Semantic analysis failed");
         return 1;

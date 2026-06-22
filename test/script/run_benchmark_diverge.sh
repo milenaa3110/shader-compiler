@@ -60,11 +60,11 @@ rv_ms_for() {
 
     build_target "${anim}_rv.o" >/dev/null 2>&1 || { echo "N/A"; return; }
 
-    $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Ipipeline \
+    $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Isrc/runtime \
         -DANIM_NAME="\"${anim}\"" -DNFRAMES="$frames" \
         -DWIDTH="$w" -DHEIGHT="$h" \
         test/rv_host/rv_host_fragment.cpp \
-        pipeline/pipeline_runtime.cpp \
+        src/runtime/pipeline_runtime.cpp \
         "build/riscv/${anim}_rv.o" -o "$bin" >/dev/null 2>&1 || { echo "N/A"; return; }
 
     local out

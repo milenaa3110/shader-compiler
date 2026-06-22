@@ -11,6 +11,7 @@
 #include <llvm/Support/Casting.h>
 
 #include "../lexer/lexer.h"
+#include "type.h"
 
 // ── AST ownership model ─────────────────────────────────────────────────────
 //
@@ -100,6 +101,7 @@ class ExprAST {
     UniformArrayDecl,
     StorageBufferDecl,
     PostfixIncr,
+    ImplicitCast,
   };
 
   virtual ~ExprAST() = default;
@@ -109,10 +111,17 @@ class ExprAST {
   Kind getKind() const { return kind_; }
 
   // Source position of the construct's first token, stamped by the parser via
-  // Parser::at(). 0 means unstamped — codegen errors then print "line 0,
-  // col 0", a signal that a parse path missed the stamp.
-  int line = 0;
-  int col  = 0;
+  // Parser::at(). A default (invalid) location is the "unstamped" signal — a
+  // codegen error there prints "line 0, col 0", flagging a parse path that
+  // missed the stamp.
+  SourceLocation loc;
+
+  // Semantic type of this expression, filled in by SemanticAnalyzer (Step 2 of
+  // the type-system bring-up). nullptr until typed — during the bring-up only
+  // some node kinds are typed, so callers must null-check. Once codegen
+  // dispatches on it (Step 4) every value-producing node will carry one.
+  const glsl::Type* getType() const { return Ty; }
+  void setType(const glsl::Type* t) { Ty = t; }
 
  protected:
   // No default constructor: every subclass MUST forward its Kind. A missed
@@ -121,16 +130,22 @@ class ExprAST {
 
  private:
   Kind kind_;
+  const glsl::Type* Ty = nullptr;  // set by SemanticAnalyzer; see get/setType
 };
 
 // Number literal
 class NumberExprAST : public ExprAST {
  public:
   double Val;
-  bool isInt;  // true if without decimal point (e.g. 3, not 3.0)
+  bool isInt;       // true if without decimal point (e.g. 3, not 3.0)
+  bool isUnsigned;  // true if the literal had a 'u' suffix (only when isInt)
 
-  explicit NumberExprAST(double val, bool isInt_ = false)
-      : ExprAST(Kind::Number), Val(val), isInt(isInt_) {}
+  explicit NumberExprAST(double val, bool isInt_ = false,
+                         bool isUnsigned_ = false)
+      : ExprAST(Kind::Number),
+        Val(val),
+        isInt(isInt_),
+        isUnsigned(isUnsigned_) {}
   llvm::Value* codegen() override;
 
   void print(int indent = 0) const override {
@@ -888,6 +903,36 @@ class PostfixIncrExprAST : public ExprAST {
 
   static bool classof(const ExprAST* e) {
     return e->getKind() == Kind::PostfixIncr;
+  }
+};
+
+// Implicit conversion inserted by SemanticAnalyzer (GLSL §4.1.10), e.g. the
+// int→float promotion in `1.0 + 2`. The target type is carried in ExprAST::Ty
+// (set by the constructor). Making conversions explicit AST nodes — Clang's
+// ImplicitCastExpr — means later passes never face a silent type mismatch.
+//
+// Step 3: codegen() is a transparent pass-through; the legacy on-the-fly
+// conversions in the surrounding codegen still do the real work. Step 4 moves
+// that lowering here (sitofp / zext / splat / …), keyed on the target type.
+class ImplicitCastExprAST : public ExprAST {
+ public:
+  ExprAST* Operand;  // the value being converted (non-owning)
+
+  ImplicitCastExprAST(ExprAST* operand, const glsl::Type* target)
+      : ExprAST(Kind::ImplicitCast), Operand(operand) {
+    setType(target);
+  }
+
+  llvm::Value* codegen() override;
+  void print(int indent = 0) const override {
+    printIndent(indent);
+    std::cout << "ImplicitCast -> "
+              << (getType() ? getType()->toString() : "?") << "\n";
+    if (Operand) Operand->print(indent + 1);
+  }
+
+  static bool classof(const ExprAST* e) {
+    return e->getKind() == Kind::ImplicitCast;
   }
 };
 

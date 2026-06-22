@@ -21,9 +21,9 @@
 // have to InitializeModule per call (slow + state-leak prone). Parser +
 // sema is where the input-driven complexity lives.
 
-#include "../../ast/ast_context.h"
-#include "../../parser/parser.h"
-#include "../../sema/sema.h"
+#include "../../src/frontend/ast/ast_context.h"
+#include "../../src/frontend/parser/parser.h"
+#include "../../src/frontend/sema/sema.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -43,7 +43,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     // to walk a half-built AST. The parser owns input-validation; sema
     // owns whole-program type validation.
     if (!nodes.empty()) {
-        SemanticAnalyzer sema;
+        SemanticAnalyzer sema(astCtx);
         (void)sema.run(nodes);
     }
     return 0;
