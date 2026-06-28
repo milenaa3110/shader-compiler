@@ -18,17 +18,17 @@ struct StructInfo {
     std::vector<std::string> FieldNames;
 };
 
-// Stage variable descriptor (in/out declarations at file scope)
+// Interstage shader I/O variable descriptor.
 struct StageVar {
     std::string name;
     std::string typeName;
-    bool isInput; // true = "in", false = "out"
-    int  binding; // -1 if no layout(binding=N)
+    bool isInput;
+    int  location; // Slot index, or -1 if unassigned.
 };
 
-// Resource binding descriptor (sampler/image uniforms)
+// Resource binding descriptor for samplers and images.
 struct ResourceBinding {
-    std::string typeName; // "sampler2D", "samplerCube", "image2D", ...
+    std::string typeName;
     std::string name;
     int         binding;
 };
@@ -39,16 +39,20 @@ extern std::unique_ptr<llvm::IRBuilder<>> Builder;
 extern std::map<std::string, llvm::AllocaInst*> NamedValues;
 extern std::unordered_map<std::string, StructInfo> NamedStructTypes;
 extern std::vector<llvm::BasicBlock*> BreakStack;
-extern std::vector<llvm::BasicBlock*> ContinueStack;  // for 'continue' statement
+extern std::vector<llvm::BasicBlock*> ContinueStack;
 extern std::map<std::string, llvm::GlobalVariable*> UniformArrays;
 
-// Storage buffer descriptors — populated by StorageBufferDeclAST::codegen()
+// Storage buffer descriptor populated by StorageBufferDeclAST.
 struct StorageBufferInfo {
-    llvm::GlobalVariable* gv;      // external global ptr variable
-    llvm::Type*           elemTy;  // element type (e.g. i32, <4 x float>)
+    llvm::GlobalVariable* gv;
+    llvm::Type*           elemTy;
     bool                  isReadOnly;
 };
 extern std::map<std::string, StorageBufferInfo> StorageBufferInfos;
+
+// Parameter directions (0=in, 1=out, 2=inout) mapped by function name.
+// Used to lower pass-by-reference arguments at call sites.
+extern std::map<std::string, std::vector<uint8_t>> FunctionParamDirs;
 
 inline llvm::AllocaInst* CreateEntryBlockAlloca(llvm::Function* F,
                                                 const std::string& name,

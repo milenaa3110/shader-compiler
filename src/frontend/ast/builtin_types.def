@@ -1,30 +1,13 @@
-// builtin_types.def — THE single source of truth for value-bearing builtin
-// types. One row per type; every layer derives its own view:
-//   * lexer  tokens.def            → KEYWORD tokens (so `vec3` lexes as a token)
-//   * parser isTypeTok/tokToTypeName/parsePrimary → which TokenKinds are types
-//   * sema   resolveTypeName/isBuiltinType        → name → glsl::Type
-//   * codegen resolveTypeByName                   → name → llvm::Type
-//   * type.h SamplerKind enum + toString          → sampler kinds
-// so the four lists CANNOT diverge (the sampler2DArray/imageBuffer bug — sema
-// rejecting what codegen accepted — came from keeping them separate).
+// builtin_types.def — X-Macro repository for GLSL builtin types.
+// Used to keep Lexer, Parser, Sema, and Codegen type lists synchronized.
 //
-// `void` is intentionally absent: it is a function-return type only, never a
-// value-bearing declaration, and every site handles it separately.
+// Category macros (all default to BTYPE(Tok, Spelling) if not defined):
+//   BTYPE_SCALAR(Tok, Spelling, GlslKind, LlvmGetter)
+//   BTYPE_VECTOR(Tok, Spelling, GlslElem, LlvmElem, N)
+//   BTYPE_MATRIX(Tok, Spelling, Cols, Rows)
+//   BTYPE_SAMPLER(Tok, Spelling, Kind, Dim, Arrayed, IsImage)
 //
-// A consumer defines whichever macro it needs; the rest fall back to the 2-arg
-// BTYPE(Tok, Spelling), which falls back to a no-op. Categories carry the params
-// each backend needs:
-//   BTYPE_SCALAR (Tok, Spelling, GlslKind, LlvmGetter)
-//        GlslKind  → Ctx.get<GlslKind>Ty()         (Bool/Int/Uint/Float/Double)
-//        LlvmGetter→ llvm::Type::<LlvmGetter>(ctx)  (getInt1Ty/getInt32Ty/…)
-//   BTYPE_VECTOR (Tok, Spelling, GlslElem, LlvmElem, N)
-//   BTYPE_MATRIX (Tok, Spelling, Cols, Rows)        — elements always float
-//   BTYPE_SAMPLER(Tok, Spelling, SamplerKind, Dim, Arrayed, IsImage)
-//        Dim/Arrayed/IsImage describe the GLSL structure for the SPIR-V
-//        OpTypeImage emitter (which still hardcodes 2D) — inert until wired.
-//
-// No include guard: included multiple times; it #undefs all its macros at the
-// end so each inclusion is self-contained (the includer only #defines).
+// Note: `void` is intentionally omitted. No include guards (multi-inclusion).
 
 #ifndef BTYPE
 #define BTYPE(Tok, Spelling)

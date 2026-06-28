@@ -14,6 +14,7 @@
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
@@ -196,6 +197,11 @@ class IRToSPIRV {
   Word typeFor(llvm::Type* t);
   Word ptrTypeFor(llvm::Type* pointee, SpvStorageClass sc);
   Word funcTypeFor(llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params);
+  Word funcTypeForIDs(Word retID, llvm::ArrayRef<Word> paramIDs);
+  // SPIR-V type id for a function parameter. An opaque pointer (out/inout
+  // by-reference param) carries no pointee type, so recover it from a load/store
+  // through the parameter inside the function body.
+  Word paramTypeID(llvm::Argument& A);
   Word structTypeFor(llvm::ArrayRef<Word> memberTypeIDs);
 
   Word constInt(llvm::Type* ty, int64_t v);
@@ -347,6 +353,35 @@ inline Word IRToSPIRV::funcTypeFor(llvm::Type* ret,
   ops[0] = id;
   appendOpV(typesGlobals, SpvOpTypeFunction, ops);
   return id;
+}
+
+inline Word IRToSPIRV::funcTypeForIDs(Word retID,
+                                      llvm::ArrayRef<Word> paramIDs) {
+  std::vector<Word> ops;
+  ops.push_back(0);
+  ops.push_back(retID);
+  for (Word p : paramIDs) ops.push_back(p);
+  Word id = allocID();
+  ops[0] = id;
+  appendOpV(typesGlobals, SpvOpTypeFunction, ops);
+  return id;
+}
+
+inline Word IRToSPIRV::paramTypeID(llvm::Argument& A) {
+  if (!A.getType()->isPointerTy()) return typeFor(A.getType());
+  llvm::Type* pointee = nullptr;
+  for (auto* U : A.users()) {
+    if (auto* LI = llvm::dyn_cast<llvm::LoadInst>(U)) {
+      if (LI->getPointerOperand() == &A) { pointee = LI->getType(); break; }
+    } else if (auto* SI = llvm::dyn_cast<llvm::StoreInst>(U)) {
+      if (SI->getPointerOperand() == &A) {
+        pointee = SI->getValueOperand()->getType();
+        break;
+      }
+    }
+  }
+  if (!pointee) pointee = llvm::Type::getInt32Ty(M.getContext());
+  return ptrTypeFor(pointee, SpvStorageClassFunction);
 }
 
 inline Word IRToSPIRV::structTypeFor(llvm::ArrayRef<Word> memberTypeIDs) {
@@ -590,6 +625,16 @@ inline void IRToSPIRV::analyzeUniforms() {
   }
 }
 
+// Explicit layout(binding=N) recorded on a sampler/SSBO global by codegen
+// (ast.cpp), or -1 when the shader gave none — in which case the caller keeps
+// its positional counter.
+static inline int explicitBindingOf(llvm::GlobalVariable& G) {
+  if (auto* md = G.getMetadata("shader.binding"))
+    return (int)llvm::mdconst::extract<llvm::ConstantInt>(md->getOperand(0))
+        ->getSExtValue();
+  return -1;
+}
+
 inline void IRToSPIRV::analyzeSSBOs() {
   // SPIR-V 1.0 has no StorageBuffer storage class — SSBOs use the Uniform
   // storage class with the BufferBlock decoration on the wrapping struct.
@@ -614,6 +659,9 @@ inline void IRToSPIRV::analyzeSSBOs() {
   uint32_t binding = 0;
   for (auto& G : M.globals()) {
     if (!isSSBOGlobal(G)) continue;
+
+    int explicitB = explicitBindingOf(G);
+    uint32_t slot = explicitB >= 0 ? (uint32_t)explicitB : binding++;
 
     Type* elemTy = inferElemType(G);
     Word elemTypeID = typeFor(elemTy);
@@ -645,7 +693,7 @@ inline void IRToSPIRV::analyzeSSBOs() {
     appendOp(annotations, SpvOpDecorate,
              {varID, SpvDecorationDescriptorSet, 0u});
     appendOp(annotations, SpvOpDecorate,
-             {varID, SpvDecorationBinding, binding});
+             {varID, SpvDecorationBinding, slot});
 
     // OpTypePointer Uniform <elem> — used as the result type of OpAccessChain.
     Word elemPtrTypeID = ptrTypeFor(elemTy, SpvStorageClassUniform);
@@ -653,9 +701,8 @@ inline void IRToSPIRV::analyzeSSBOs() {
     SSBOInfo info;
     info.varID = varID;
     info.elemPtrTypeID = elemPtrTypeID;
-    info.binding = binding;
+    info.binding = slot;
     ssboInfo[&G] = info;
-    binding++;
   }
 }
 
@@ -665,6 +712,9 @@ inline void IRToSPIRV::analyzeSamplers() {
   uint32_t binding = 0;
   for (auto& G : M.globals()) {
     if (!isSamplerGlobal(G)) continue;
+
+    int explicitB = explicitBindingOf(G);
+    uint32_t slot = explicitB >= 0 ? (uint32_t)explicitB : binding++;
 
     Word floatTID = typeFor(Type::getFloatTy(M.getContext()));
 
@@ -691,14 +741,13 @@ inline void IRToSPIRV::analyzeSamplers() {
     appendOp(annotations, SpvOpDecorate,
              {varID, SpvDecorationDescriptorSet, 0u});
     appendOp(annotations, SpvOpDecorate,
-             {varID, SpvDecorationBinding, binding});
+             {varID, SpvDecorationBinding, slot});
 
     SamplerInfo info;
     info.varID = varID;
     info.sampledImageTypeID = sampledImageTID;
-    info.binding = binding;
+    info.binding = slot;
     samplerInfo[&G] = info;
-    binding++;
   }
 }
 
@@ -744,6 +793,21 @@ inline bool IRToSPIRV::isPointerAlloca(llvm::AllocaInst* AI) {
 inline void IRToSPIRV::emitStageIO() {
   if (!entryFn) return;
 
+  // Explicit `layout(location=N)` slots, keyed by in/out var name, as recorded
+  // on the entry function by ast.cpp. When a name is present here we decorate
+  // that exact Location (matching VS-out to FS-in across modules); otherwise we
+  // fall back to the positional counters below.
+  std::unordered_map<std::string, uint32_t> explicitLoc;
+  if (auto* md = entryFn->getMetadata("shader.io.location")) {
+    for (auto& op : md->operands()) {
+      auto* t = llvm::cast<llvm::MDNode>(op.get());
+      auto name = llvm::cast<llvm::MDString>(t->getOperand(0))->getString();
+      auto loc = llvm::mdconst::extract<llvm::ConstantInt>(t->getOperand(1))
+                     ->getZExtValue();
+      explicitLoc[name.str()] = static_cast<uint32_t>(loc);
+    }
+  }
+
   auto declareInputBuiltin = [&](llvm::Argument& A, SpvBuiltIn bi) -> Word {
     Word ptrID = ptrTypeFor(A.getType(), SpvStorageClassInput);
     Word vid = allocID();
@@ -767,7 +831,9 @@ inline void IRToSPIRV::emitStageIO() {
     if (bi != (SpvBuiltIn)-1) {
       vid = declareInputBuiltin(A, bi);
     } else {
-      vid = declareInputLocation(A, inputLoc++);
+      auto it = explicitLoc.find(A.getName().str());
+      uint32_t loc = it != explicitLoc.end() ? it->second : inputLoc++;
+      vid = declareInputLocation(A, loc);
     }
     argInputVarID[&A] = vid;
     entryPointInterface.push_back(vid);
@@ -798,7 +864,9 @@ inline void IRToSPIRV::emitStageIO() {
       Word vid = allocID();
       appendOp(typesGlobals, SpvOpVariable,
                {ptrID, vid, SpvStorageClassOutput});
-      appendOp(annotations, SpvOpDecorate, {vid, SpvDecorationLocation, 0});
+      auto it = explicitLoc.find("FragColor");
+      uint32_t loc = it != explicitLoc.end() ? it->second : 0;
+      appendOp(annotations, SpvOpDecorate, {vid, SpvDecorationLocation, loc});
       allocaToOutputVar[AI] = vid;
       entryPointInterface.push_back(vid);
     } else if (n == "gl_Position") {
@@ -843,8 +911,10 @@ inline void IRToSPIRV::emitStageIO() {
       Word vid = allocID();
       appendOp(typesGlobals, SpvOpVariable,
                {ptrID, vid, SpvStorageClassOutput});
+      auto le = explicitLoc.find(AI->getName().str());
+      uint32_t loc = le != explicitLoc.end() ? le->second : outLoc++;
       appendOp(annotations, SpvOpDecorate,
-               {vid, SpvDecorationLocation, outLoc++});
+               {vid, SpvDecorationLocation, loc});
       allocaToOutputVar[AI] = vid;
       entryPointInterface.push_back(vid);
     }
@@ -861,6 +931,11 @@ inline void IRToSPIRV::analyzeCFG(llvm::Function& F) {
   loopMerge.clear();
   loopContinue.clear();
 
+  // Used to locate a loop's back-edge latch (the continue target) precisely,
+  // including nested loops: the latch is the in-loop predecessor of the header,
+  // i.e. the predecessor the header dominates.
+  llvm::DominatorTree DT(F);
+
   auto findByPrefix = [&](llvm::StringRef pfx) -> llvm::BasicBlock* {
     for (auto& BB : F)
       if (BB.getName().starts_with(pfx)) return &BB;
@@ -871,27 +946,29 @@ inline void IRToSPIRV::analyzeCFG(llvm::Function& F) {
   for (auto& BB : F) {
     llvm::StringRef n = BB.getName();
 
-    if (n.starts_with("for.cond")) {
-      // Loop header. Conditional branch to for.body / for.end.
+    // Loop header: for.cond / while.cond, ending in a conditional branch to the
+    // body and the exit. A `while` loop has no separate `.inc` latch — its
+    // back-edge comes straight from the body — so the old for.inc-only search
+    // missed it entirely, leaving the header without an OpLoopMerge and the
+    // back-edge invalid. Find the merge by its `.end` name and the continue
+    // latch via dominance (the in-loop predecessor of the header), which is
+    // correct for `for`, `while`, and nested loops alike.
+    if (n.starts_with("for.cond") || n.starts_with("while.cond")) {
       auto* term = BB.getTerminator();
       if (auto* br = dyn_cast<llvm::BranchInst>(term)) {
         if (br->isConditional()) {
           llvm::BasicBlock* mergeBB = nullptr;
-          llvm::BasicBlock* contBB = nullptr;
           for (auto* succ : llvm::successors(&BB)) {
-            if (succ->getName().starts_with("for.end")) mergeBB = succ;
-            if (succ->getName().starts_with("for.body")) { /* not the merge */
-            }
+            llvm::StringRef sn = succ->getName();
+            if (sn.starts_with("for.end") || sn.starts_with("while.end"))
+              mergeBB = succ;
           }
-          // Continue is the for.inc block; find by prefix matching this loop's
-          // suffix. We're permissive: pick any for.inc block in the function
-          // whose successor is this for.cond. For nested loops this needs
-          // improvement — TODO.
-          for (auto& B2 : F) {
-            if (!B2.getName().starts_with("for.inc")) continue;
-            auto* t2 = dyn_cast<llvm::BranchInst>(B2.getTerminator());
-            if (t2 && !t2->isConditional() && t2->getSuccessor(0) == &BB) {
-              contBB = &B2;
+          llvm::BasicBlock* contBB = nullptr;
+          for (auto* pred : llvm::predecessors(&BB)) {
+            // The pre-header sits outside the loop (not dominated by the
+            // header); the back-edge latch is inside it (dominated).
+            if (pred != &BB && DT.dominates(&BB, pred)) {
+              contBB = pred;
               break;
             }
           }
@@ -1161,9 +1238,36 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
       valueIDs[&I] = 0;
       return;
     }
-    // We don't yet need GEPs except for the trampoline (already dead).
-    // Generic OpAccessChain: rare case — skip silently for now.
-    deadValues.insert(&I);
+    // Generic GEP on a Function-storage aggregate (local array element or
+    // struct field, possibly chained: `s.a[i]`) → OpAccessChain. The first LLVM
+    // index addresses the base pointer itself (always 0 for an alloca) and is
+    // implicit in a SPIR-V access chain, so drop it; the remaining indices walk
+    // into the pointee. Struct-member indices are ConstantInts, which valueOf
+    // lowers to the OpConstant that OpAccessChain requires there.
+    Word baseID = valueOf(basePtr);
+    if (baseID == 0) {
+      deadValues.insert(&I);
+      valueIDs[&I] = 0;
+      return;
+    }
+    // The result pointer's storage class must match the base's. Local allocas
+    // are Function, but an arrayed in/out var's shadow alloca is mapped to an
+    // Input/Output interface variable — index that in its own storage class.
+    SpvStorageClass sc = SpvStorageClassFunction;
+    if (auto* AI = dyn_cast<AllocaInst>(basePtr)) {
+      if (allocaToInputVar.count(AI)) sc = SpvStorageClassInput;
+      else if (allocaToOutputVar.count(AI)) sc = SpvStorageClassOutput;
+    }
+    Word resPtrTy = ptrTypeFor(GEP->getResultElementType(), sc);
+    Word acID = allocID();
+    valueIDs[&I] = acID;
+    std::vector<Word> ops = {resPtrTy, acID, baseID};
+    bool firstIdx = true;
+    for (auto& idx : GEP->indices()) {
+      if (firstIdx) { firstIdx = false; continue; }  // drop the leading 0
+      ops.push_back(valueOf(idx.get()));
+    }
+    appendOpV(out, SpvOpAccessChain, ops);
     return;
   }
 
@@ -1407,6 +1511,52 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
     return;
   }
 
+  // Aggregate field access (struct members): extractvalue / insertvalue carry
+  // constant LITERAL indices, lowering to OpCompositeExtract / OpCompositeInsert
+  // (distinct from the vector Extract/InsertElement above, whose index is an id).
+  if (auto* EV = dyn_cast<ExtractValueInst>(&I)) {
+    Word agg = valueOf(EV->getAggregateOperand());
+    Word ty = typeFor(EV->getType());
+    Word id = allocID();
+    valueIDs[&I] = id;
+    std::vector<Word> ops = {ty, id, agg};
+    for (unsigned idx : EV->indices()) ops.push_back(idx);
+    appendOpV(out, SpvOpCompositeExtract, ops);
+    return;
+  }
+
+  if (auto* IV = dyn_cast<InsertValueInst>(&I)) {
+    Word agg = valueOf(IV->getAggregateOperand());
+    Word el = valueOf(IV->getInsertedValueOperand());
+    Word ty = typeFor(IV->getType());
+    Word id = allocID();
+    valueIDs[&I] = id;
+    std::vector<Word> ops = {ty, id, el, agg};
+    for (unsigned idx : IV->indices()) ops.push_back(idx);
+    appendOpV(out, SpvOpCompositeInsert, ops);
+    return;
+  }
+
+  // shufflevector — selects components from two vectors by a constant mask.
+  // GLSL scalar→vector splats (`vec4(x)`) lower to `insertelement poison, x, 0`
+  // followed by a splat shuffle (mask all-zeros), so this MUST be handled or
+  // the shuffle result stays an undefined forward reference.
+  if (auto* SV = dyn_cast<ShuffleVectorInst>(&I)) {
+    Word v1 = valueOf(SV->getOperand(0));
+    Word v2 = valueOf(SV->getOperand(1));
+    Word ty = typeFor(SV->getType());
+    Word id = allocID();
+    valueIDs[&I] = id;
+    llvm::SmallVector<int, 16> mask;
+    SV->getShuffleMask(mask);
+    std::vector<Word> ops = {ty, id, v1, v2};
+    // LLVM uses -1 for an undef/poison lane; SPIR-V spells that 0xFFFFFFFF.
+    for (int m : mask)
+      ops.push_back(m < 0 ? 0xFFFFFFFFu : (Word)m);
+    appendOpV(out, SpvOpVectorShuffle, ops);
+    return;
+  }
+
   // Casts ── all just become the appropriate Op*Convert*
   if (auto* CI = dyn_cast<CastInst>(&I)) {
     Word src = valueOf(CI->getOperand(0));
@@ -1603,28 +1753,27 @@ inline void IRToSPIRV::emitFunction(llvm::Function& F) {
   // The entry function gets a particular id; helpers get fresh ids.
   Word fnID = valueOf(&F);
 
-  // Build function type.
-  std::vector<llvm::Type*> paramTys;
-  // For the entry function we pretend the function signature is `void()` — all
-  // inputs/outputs are routed through globals.
-  llvm::Type* retTy = nullptr;
-  if (&F == entryFn) {
-    retTy = llvm::Type::getVoidTy(M.getContext());
-  } else {
-    retTy = F.getReturnType();
-    for (auto& A : F.args()) paramTys.push_back(A.getType());
-  }
-  Word fnTypeID = funcTypeFor(retTy, paramTys);
+  // Build function type. For the entry function we pretend the signature is
+  // `void()` — all inputs/outputs are routed through globals. Param type ids are
+  // computed via paramTypeID so opaque-pointer (out/inout) params get the right
+  // pointee, and the OpFunctionParameter decls reuse the very same ids.
+  llvm::Type* retTy =
+      (&F == entryFn) ? llvm::Type::getVoidTy(M.getContext()) : F.getReturnType();
+  std::vector<Word> paramTypeIDs;
+  if (&F != entryFn)
+    for (auto& A : F.args()) paramTypeIDs.push_back(paramTypeID(A));
+  Word fnTypeID = funcTypeForIDs(typeFor(retTy), paramTypeIDs);
 
   appendOp(functions, SpvOpFunction,
            {typeFor(retTy), fnID, SpvFunctionControlMaskNone, fnTypeID});
 
   // Function parameters (skipped for entry function).
   if (&F != entryFn) {
+    unsigned k = 0;
     for (auto& A : F.args()) {
       Word id = allocID();
       valueIDs[&A] = id;
-      appendOp(functions, SpvOpFunctionParameter, {typeFor(A.getType()), id});
+      appendOp(functions, SpvOpFunctionParameter, {paramTypeIDs[k++], id});
     }
   }
 

@@ -135,6 +135,16 @@ inline llvm::Value* toI32(llvm::Value* v) {
         if (auto it = NamedStructTypes.find(name.str()); it != NamedStructTypes.end()) {
             return it->second.Type;
         }
+        // Array spelling "T[N]" (struct array fields) → [N x <T>].
+        if (auto lb = name.find('[');
+            lb != llvm::StringRef::npos && name.ends_with("]")) {
+            llvm::StringRef numStr = name.substr(lb + 1, name.size() - lb - 2);
+            int n = 0;
+            if (!numStr.getAsInteger(10, n) && n > 0)
+                if (llvm::Type* elem = resolveTypeByName(name.substr(0, lb)))
+                    return llvm::ArrayType::get(elem, n);
+            return nullptr;
+        }
         // Every value-bearing builtin from builtin_types.def — the same source
         // the lexer/parser/sema use, so the lists can't drift. (Replaces the old
         // hand-listed scalars + algorithmically-parsed vec/mat.) Matrices are

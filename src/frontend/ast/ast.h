@@ -13,23 +13,15 @@
 #include "../lexer/lexer.h"
 #include "type.h"
 
-// ── AST ownership model ─────────────────────────────────────────────────────
+// AST ownership model
 //
-// AST nodes are allocated out of an `ASTContext` (see ast_context.h):
-// a per-compilation BumpPtrAllocator + StringSaver + destructor list. Every
-// `ExprAST*` you see below is *non-owning* — the context owns the storage
-// and runs destructors when it's destroyed. As a result:
-//
-//   * Constructors take `ExprAST*`, never `std::unique_ptr<ExprAST>`.
-//   * Child fields are raw `ExprAST*`. They're nullable; check before deref.
-//   * `std::move()` and `.get()` from the unique_ptr era are gone — pass
-//     the pointer through directly.
-//
-// `std::string`/`std::vector` members are still per-node owners of their
-// own backing storage; the context's destruction walk calls each node's
-// virtual destructor, which cleans those up before the bump pool resets.
+// All AST nodes are non-owning and allocated via an ASTContext bump pool.
+// Context destruction performs a single reverse-walk to invoke virtual 
+// destructors (clearing node-owned members like std::vector/std::string) 
+// before freeing the underlying arena. Subclasses must forward their 
+// ExprAST::Kind to enable high-performance LLVM-style RTTI casting.
 
-// ── Shader stage and function attributes ─────────────────────────────────────
+// Shader stage and function attributes
 enum class ShaderStage { Vertex, Fragment, Compute };
 
 struct FunctionAttrs {
@@ -63,11 +55,9 @@ inline void printIndent(int indent) {
 
 // Base class for all expression nodes.
 //
-// Uses LLVM-style RTTI: every subclass passes its `Kind` to the base
-// constructor and implements `static bool classof(const ExprAST*)`. Use
-// `llvm::isa<T>(p)`, `llvm::dyn_cast<T>(p)`, `llvm::cast<T>(p)` — *not*
-// C++ `dynamic_cast`. The `Kind` field is a single byte that fully
-// determines the dynamic type; the inheritance chain is never walked.
+// Uses LLVM-style RTTI via a single-byte discriminator ('Kind') passed to 
+// the base constructor. This avoids C++ vtable/dynamic_cast performance 
+// overhead, enabling O(1) type evaluation via llvm::isa/cast/dyn_cast.
 class ExprAST {
  public:
   enum class Kind {
@@ -100,8 +90,9 @@ class ExprAST {
     ArrayDecl,
     UniformArrayDecl,
     StorageBufferDecl,
-    PostfixIncr,
+    IncrDecr,
     ImplicitCast,
+    RawValue,
   };
 
   virtual ~ExprAST() = default;
@@ -110,27 +101,25 @@ class ExprAST {
 
   Kind getKind() const { return kind_; }
 
-  // Source position of the construct's first token, stamped by the parser via
-  // Parser::at(). A default (invalid) location is the "unstamped" signal — a
-  // codegen error there prints "line 0, col 0", flagging a parse path that
-  // missed the stamp.
+  // Source location of the construct's first token, stamped by Parser::at().
+  // An invalid/default location signals an unstamped node, defaulting 
+  // diagnostic fallback to "line 0, col 0" to flag missed parse paths.
   SourceLocation loc;
 
-  // Semantic type of this expression, filled in by SemanticAnalyzer (Step 2 of
-  // the type-system bring-up). nullptr until typed — during the bring-up only
-  // some node kinds are typed, so callers must null-check. Once codegen
-  // dispatches on it (Step 4) every value-producing node will carry one.
+  // The semantic type of this expression, resolved by SemanticAnalyzer.
+  // nullptr until type-checked; callers must null-check during partial AST passes.
+  // Guaranteed non-null for all value-producing nodes prior to code generation.
   const glsl::Type* getType() const { return Ty; }
   void setType(const glsl::Type* t) { Ty = t; }
 
  protected:
-  // No default constructor: every subclass MUST forward its Kind. A missed
-  // subclass becomes a compile error, not a silent classof() bug.
+  // No default constructor: every subclass MUST forward its Kind. 
+  // A missed subclass becomes a compile error
   explicit ExprAST(Kind k) : kind_(k) {}
 
  private:
   Kind kind_;
-  const glsl::Type* Ty = nullptr;  // set by SemanticAnalyzer; see get/setType
+  const glsl::Type* Ty = nullptr;  // set by SemanticAnalyzer
 };
 
 // Number literal
@@ -395,7 +384,7 @@ class IfExprAST : public ExprAST {
  public:
   ExprAST* Condition;
   ExprAST* ThenExpr;
-  ExprAST* ElseExpr;  // może biti nullptr
+  ExprAST* ElseExpr;  // can be nullptr
 
   IfExprAST(ExprAST* cond, ExprAST* then, ExprAST* elseExpr = nullptr)
       : ExprAST(Kind::If),
@@ -453,13 +442,16 @@ class AssignmentExprAST : public ExprAST {
   std::string VarName;
   std::string VarType;  // npr. "vec3"
   ExprAST* Init;
+  // True when the declaration carried a `const` qualifier (`const int x = 3;`)
+  bool IsConst = false;
 
   AssignmentExprAST(const std::string& type, const std::string& name,
-                    ExprAST* init)
+                    ExprAST* init, bool isConst = false)
       : ExprAST(Kind::Assignment),
         VarName(name),
         VarType(type),
-        Init(init) {}
+        Init(init),
+        IsConst(isConst) {}
 
   llvm::Value* codegen() override;
 
@@ -486,6 +478,9 @@ class PrototypeAST : public ExprAST {
   std::string Name;
   std::vector<std::pair<std::string, std::string>> Args;  // {type, name}
   std::string RetType;
+  // Parameter direction qualifiers, mapping 1:1 to Args (0=in, 1=out, 2=inout).
+  // An empty vector implicitly treats all parameters as 'in' (by-value).
+  std::vector<uint8_t> ArgDir;
 
   PrototypeAST(std::string name,
                std::vector<std::pair<std::string, std::string>> args,
@@ -704,10 +699,9 @@ class StructDeclExprAST : public ExprAST {
   StructDeclExprAST(const std::string& name,
                     std::vector<std::pair<std::string, std::string>> fields)
       : ExprAST(Kind::StructDecl), Name(name), Fields(std::move(fields)) {}
-  // Create an opaque StructType placeholder and register the name in
-  // NamedStructTypes (with empty field-name list). Used by the entry-point
-  // driver as a *first* pass so codegen of later structs / functions can
-  // resolve forward references like `struct A { B b; }; struct B { ... };`.
+  // Registers an opaque, empty llvm::StructType placeholder within the symbol 
+  // table prior to full emission. This initial pass allows subsequent type 
+  // definitions and function signatures to successfully resolve forward references.
   void predeclare();
   llvm::Value* codegen() override;
   void print(int indent = 0) const override {
@@ -730,15 +724,15 @@ class StageVarDeclAST : public ExprAST {
   bool isInput;  // true = "in", false = "out"
   std::string TypeName;
   std::string Name;
-  int binding;  // -1 if no layout(binding=N)
+  int location;  // -1 if no layout(location=N); the interstage IO slot
 
   StageVarDeclAST(bool isInput_, std::string typeName, std::string name,
-                  int binding_ = -1)
+                  int location_ = -1)
       : ExprAST(Kind::StageVarDecl),
         isInput(isInput_),
         TypeName(std::move(typeName)),
         Name(std::move(name)),
-        binding(binding_) {}
+        location(location_) {}
 
   llvm::Value* codegen() override;
   void print(int indent = 0) const override {
@@ -758,8 +752,14 @@ class UniformDeclExprAST : public ExprAST {
  public:
   std::string TypeName;
   std::string Name;
-  UniformDeclExprAST(const std::string& ty, const std::string& n)
-      : ExprAST(Kind::UniformDecl), TypeName(ty), Name(n) {}
+  // The layout(binding=N) slot index; holds -1 if unspecified.
+  // Used to assign Vulkan/SPIR-V descriptor bindings for sampler and image 
+  // uniforms. Plain scalar uniforms bypass this to leverage push constants.
+  int binding;
+
+  UniformDeclExprAST(const std::string& ty, const std::string& n,
+                     int bind = -1)
+      : ExprAST(Kind::UniformDecl), TypeName(ty), Name(n), binding(bind) {}
   llvm::Value* codegen() override;
   void print(int indent = 0) const override {
     printIndent(indent + 2);
@@ -804,14 +804,16 @@ class ArrayDeclExprAST : public ExprAST {
   std::string Name;
   int Size;
   ExprAST* Init;
+  bool IsConst = false;  // declared `const` — see AssignmentExprAST::IsConst.
 
   ArrayDeclExprAST(const std::string& type, const std::string& name, int size,
-                   ExprAST* init)
+                   ExprAST* init, bool isConst = false)
       : ExprAST(Kind::ArrayDecl),
         ElementType(type),
         Name(name),
         Size(size),
-        Init(init) {}
+        Init(init),
+        IsConst(isConst) {}
 
   llvm::Value* codegen() override;
 
@@ -834,9 +836,15 @@ class UniformArrayDeclExprAST : public ExprAST {
   std::string TypeName;
   std::string Name;
   int Size;
+  int binding;  // layout(binding=N); -1 if unspecified. See UniformDeclExprAST.
 
-  UniformArrayDeclExprAST(const std::string& ty, const std::string& n, int size)
-      : ExprAST(Kind::UniformArrayDecl), TypeName(ty), Name(n), Size(size) {}
+  UniformArrayDeclExprAST(const std::string& ty, const std::string& n, int size,
+                          int bind = -1)
+      : ExprAST(Kind::UniformArrayDecl),
+        TypeName(ty),
+        Name(n),
+        Size(size),
+        binding(bind) {}
 
   llvm::Value* codegen() override;
 
@@ -881,39 +889,54 @@ class StorageBufferDeclAST : public ExprAST {
   }
 };
 
-// Postfix increment / decrement: x++ / x--.
-//
-// Semantically distinct from prefix: codegen must store the new value but
-// return the OLD value. A naive desugar to AssignmentExprAST(x, x±1) would
-// give prefix semantics — `a[i++]` would index by the *new* `i`.
-class PostfixIncrExprAST : public ExprAST {
+// Handles increment/decrement side-effect expressions (++x, x--, --x, x++)
+// targeting variables. Both axes are flags: isPrefix (pre/post) and
+// isDecrement (++/--).
+class IncrDecrExprAST : public ExprAST {
  public:
-  ExprAST* Target;  // currently restricted to VariableExprAST
+  ExprAST* Target;  // VariableExprAST / MemberAccessExprAST / MatrixAccessExprAST
   bool isDecrement;
+  bool isPrefix;
 
-  PostfixIncrExprAST(ExprAST* target, bool dec)
-      : ExprAST(Kind::PostfixIncr), Target(target), isDecrement(dec) {}
+  IncrDecrExprAST(ExprAST* target, bool dec, bool prefix = false)
+      : ExprAST(Kind::IncrDecr),
+        Target(target),
+        isDecrement(dec),
+        isPrefix(prefix) {}
 
   llvm::Value* codegen() override;
   void print(int indent = 0) const override {
     printIndent(indent);
-    std::cout << "Postfix" << (isDecrement ? "Decr" : "Incr") << "\n";
+    std::cout << (isPrefix ? "Prefix" : "Postfix")
+              << (isDecrement ? "Decr" : "Incr") << "\n";
     if (Target) Target->print(indent + 1);
   }
 
   static bool classof(const ExprAST* e) {
-    return e->getKind() == Kind::PostfixIncr;
+    return e->getKind() == Kind::IncrDecr;
   }
 };
 
-// Implicit conversion inserted by SemanticAnalyzer (GLSL §4.1.10), e.g. the
-// int→float promotion in `1.0 + 2`. The target type is carried in ExprAST::Ty
-// (set by the constructor). Making conversions explicit AST nodes — Clang's
-// ImplicitCastExpr — means later passes never face a silent type mismatch.
-//
-// Step 3: codegen() is a transparent pass-through; the legacy on-the-fly
-// conversions in the surrounding codegen still do the real work. Step 4 moves
-// that lowering here (sitofp / zext / splat / …), keyed on the target type.
+// A transient node used to inject a pre-lowered llvm::Value* into existing 
+// AST emission logic (e.g., passing modified values to internal assignment 
+// handlers). Bypasses parsing and semantic analysis phases.
+class RawValueExprAST : public ExprAST {
+ public:
+  llvm::Value* V;
+  explicit RawValueExprAST(llvm::Value* v) : ExprAST(Kind::RawValue), V(v) {}
+  llvm::Value* codegen() override { return V; }
+  void print(int indent = 0) const override {
+    printIndent(indent);
+    std::cout << "RawValue\n";
+  }
+  static bool classof(const ExprAST* e) {
+    return e->getKind() == Kind::RawValue;
+  }
+};
+
+// Wraps operands undergoing implicit conversion (e.g., int-to-float promotion).
+// Prevents type mismatch bugs in downstream components by rendering compiler-
+// generated data type conversions explicit within the AST.
 class ImplicitCastExprAST : public ExprAST {
  public:
   ExprAST* Operand;  // the value being converted (non-owning)

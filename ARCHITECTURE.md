@@ -43,20 +43,30 @@ SPIR-V bytecode word-by-word.
 ### `src/frontend/lexer/`
 | File | Role |
 |------|------|
-| `lexer.h` | Token enum — every keyword, operator, and type the language understands |
+| `lexer.h` | Token type + the `Token` struct (stamped with a `SourceLocation` byte offset); interface for the tokeniser |
 | `lexer.cpp` | Converts raw source text into a flat token stream |
+| `tokens.def` | X-macro list of every keyword, operator, and punctuator — the single source of truth shared by the token enum and the lexer's keyword table |
 
 ### `src/frontend/parser/`
 | File | Role |
 |------|------|
 | `parser.h` | Interface for the recursive-descent parser |
-| `parser.cpp` | Builds an AST from the token stream; handles operator precedence, function definitions, and all statement forms |
+| `parser.cpp` | Builds an AST from the token stream; handles operator precedence, function definitions, and all statement forms. Pure syntax — defers type-level checks to sema. Allocates nodes out of the `ASTContext` arena |
+
+### `src/frontend/sema/`
+| File | Role |
+|------|------|
+| `sema.h` | Interface for the post-parse semantic analysis pass |
+| `sema.cpp` | Walks the AST and enforces the invariants the parser defers: collects struct declarations and detects cyclic field dependencies, and validates that every type-name string resolves to a builtin or a declared struct. Reports through the same `logErrorAt` channel as the parser; `run()` returns the error count and callers refuse codegen when nonzero |
 
 ### `src/frontend/ast/`
 | File | Role |
 |------|------|
 | `ast.h` | All AST node types: literals, binary ops, variables, if/while/for, function defs, stage annotations (`@entry @stage`) |
 | `ast.cpp` | `codegen()` on each node — walks the tree and emits LLVM IR via IRBuilder |
+| `ast_context.h/.cpp` | Per-compilation arena that owns every AST node and interned string. `create<T>(...)` placement-news into a `BumpPtrAllocator` (no per-node new/delete; whole tree freed in one shot); `intern(s)` returns a stable, content-shared `StringRef`. Also the factory that uniques `Type` instances |
+| `type.h` | The language's semantic type system, modelled on `llvm::Type`: each distinct type has exactly one instance (uniqued by `ASTContext`), so type equality is a pointer compare. Scoped as `glsl::Type` to avoid colliding with `llvm::Type`. Being brought up incrementally — sema stamps nodes, codegen will dispatch on it instead of assuming `float` |
+| `builtin_types.def` | X-macro table of the builtin scalar/vector/matrix/sampler/image types — shared by the type system and type-name resolution |
 
 ### `src/codegen/codegen_state/`
 | File | Role |
@@ -102,11 +112,13 @@ SPIR-V bytecode word-by-word.
 |------|------|
 | `error_utils.h` | Minimal logger: `logError(const char*)` / `logError(const std::string&)`. No fmt dependency — safe to include from cross-compiled (riscv64) sources |
 | `error_utils_fmt.h` | Adds `logErrorFmt("...{}...", arg)` and `logErrorContext(ctx, msg)` on top of `error_utils.h`. Requires `fmt::fmt` to be linked (host-only) |
+| `source_manager.h` | `SourceLocation` (an opaque byte offset, modelled on LLVM's `SMLoc`) and a `SourceManager` that reconstructs `(line, column)` and the source line lazily — only when a diagnostic is printed. Keeps `Token` small and `advance()` branch-free; backs the `logErrorAt` diagnostics shared by parser and sema |
 
 ### `test/shaders/`
 | Subdirectory | Contents |
 |--------------|----------|
-| `test/shaders/*.src` | Unit-test shaders — one feature per file (arrays, builtins, matrix assign, swizzle, texture, uniforms, …) |
+| `test/shaders/compiler_tests/` | Front-end unit shaders — one feature per file (arrays, builtins, matrix assign, swizzle, ternary, struct, texture, uniforms, bitwise, operators, …); compiled to IR and validated by `run_tests.sh` |
+| `test/shaders/codegen_checks/` | Codegen-correctness shaders that pin down specific lowering (vector/argument coercion, matrix multiply, short-circuit, ternary dominance, shift signedness, bool widening, stage-builtin coercion) — checked by `run_ir_checks.sh` |
 | `test/shaders/pipeline/` | VS + FS pairs used by the software pipeline tests (`triangle`, `scene`, `anim`) |
 | `test/shaders/animations/` | All production animation shaders — see table below |
 
@@ -126,6 +138,8 @@ SPIR-V bytecode word-by-word.
 | `cellular_fs.src` | FS | Cellular automata |
 | `earth_fs.src` | FS | Ray-sphere earth with day/night |
 | `scene3d_fs.src` | FS | 3D raymarched scene |
+| `city_fs.src` | FS | Procedural city skyline |
+| `ocean_fs.src` | FS | Animated ocean surface |
 | `diverge_fs.src` | FS | Branch-divergence stress test |
 | `texture_test_fs.src` | FS | Texture sampling (RISC-V) |
 | `texture_test_gpu_fs.src` | FS | Texture sampling (Vulkan) |
@@ -174,7 +188,8 @@ Vulkan host programs — run on the host CPU, drive the GPU via the Vulkan API.
 | File | Role |
 |------|------|
 | `bench_common.sh` | Shared library: color codes, QEMU detection, `parse_avg`, `speedup_label` |
-| `run_tests.sh` | Unit test runner — compiles each test shader with `irgen_riscv` and validates the LLVM IR |
+| `run_tests.sh` | Unit test runner — compiles each `compiler_tests/` shader with `irgen_riscv` and validates the LLVM IR |
+| `run_ir_checks.sh` | Codegen-correctness runner — compiles each `codegen_checks/` shader and greps the emitted IR for the expected lowering (coercions, dominance, signedness, …) |
 | `run_benchmark_fragment.sh` | Main benchmark: all 13 fragment animations, VK vs RV, prints comparison table |
 | `run_benchmark_vertex.sh` | Terrain (vertex shader) benchmark: VS/FS/RV sizes + ms/frame table |
 | `run_benchmark_mesh.sh` | Indexed-mesh benchmark: the textured "boss" OBJ through the full VBO+IBO pipeline, VK vs RV, sizes + ms/frame table |

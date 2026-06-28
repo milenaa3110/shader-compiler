@@ -1,0 +1,18 @@
+# IR regression: explicit `layout(location=N)` on in/out vars must survive into
+# the entry function as `!shader.io.location` metadata, keyed by var name. The
+# SPIR-V emitter reads this to decorate the matching Location (tying a VS out to
+# the FS in of the same slot across separately-compiled modules) instead of
+# numbering positionally. Without the metadata bridge the location is silently
+# dropped and assignment falls back to declaration order.
+
+layout(location=5) in  vec2 vUV;
+layout(location=3) out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    FragColor = vec4(vUV, 0.0, 1.0);
+}
+
+# CHECK: define{{.*}}@fs_main{{.*}}!shader.io.location
+# CHECK-DAG: !{!"vUV", i32 5}
+# CHECK-DAG: !{!"FragColor", i32 3}

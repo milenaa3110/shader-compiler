@@ -1,0 +1,24 @@
+# Feature: inout function parameters (by reference). The parameter is an opaque
+# pointer to the caller's storage; the callee copies in on entry, works on a
+# local alloca, and copies the result back through the pointer before returning.
+# At the call site the argument is passed as the variable's address.
+
+out vec4 FragColor;
+
+fn void inc(inout float x) {
+    x = x + 1.0;
+}
+
+@entry @stage(fragment)
+fn void main() {
+    float y = 5.0;
+    inc(y);
+    FragColor = vec4(y);
+}
+
+# The callee takes a pointer, copies in, and copies out before returning.
+# CHECK: define void @inc(ptr %x)
+# CHECK: load float, ptr %x
+# CHECK: store float %{{.*}}, ptr %x
+# The call passes y's address, and y is reloaded afterwards (sees the new value).
+# CHECK: call void @inc(ptr %y)

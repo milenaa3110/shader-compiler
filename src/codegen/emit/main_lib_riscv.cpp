@@ -31,25 +31,21 @@ int main(int argc, char* argv[]) {
     InitializeModule();
     NamedValues.clear();
 
-    // Slurp the whole shader from stdin; the source string must outlive
-    // ParseProgram (the lexer views into it).
+    // Slurp the whole shader from stdin;
     std::string source((std::istreambuf_iterator<char>(std::cin)),
                         std::istreambuf_iterator<char>());
-    diag::setSource(source);  // enable caret diagnostics for parse/sema/codegen
+    diag::setSource(source);  // enable diagnostics for parse/sema/codegen
 
-    // Per-compilation arena. Owns every AST node + interned string until
-    // it falls out of scope at end of main. Drop after codegen finishes.
+    // Per-compilation arena. Drop after codegen finishes.
     ASTContext astCtx;
     auto nodes = ParseProgram(astCtx, source);
     if (nodes.empty()) { logError("Parse failed or program is empty"); return 1; }
 
-    // Post-parse semantic pass — registers struct decls, detects cyclic
-    // field dependencies, validates every type-name reference.
+    // Post-parse semantic pass
     SemanticAnalyzer sema(astCtx);
     if (sema.run(nodes) != 0) { logError("Semantic analysis failed"); return 1; }
 
     // Forward-declare all structs so codegen can resolve out-of-order
-    // field references (`struct A { B b; }; struct B { ... };`).
     for (auto* n : nodes) {
         if (auto* sd = llvm::dyn_cast_or_null<StructDeclExprAST>(n))
             sd->predeclare();
@@ -66,7 +62,7 @@ int main(int argc, char* argv[]) {
     if (hasStageEntry)
         emitPipelineTrampolines();
 
-    // ── Stamp RISC-V target triple + data layout ────────────────────────────
+    // Stamp RISC-V target triple + data layout
     TheModule->setTargetTriple("riscv64-unknown-linux-gnu");
     TheModule->setDataLayout("e-m:e-p:64:64-i64:64-i128:128-n32:64-S128");
 

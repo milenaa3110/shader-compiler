@@ -17,14 +17,11 @@ std::unique_ptr<llvm::Module> TheModule;
 std::unique_ptr<llvm::IRBuilder<>> Builder;
 std::map<std::string, llvm::AllocaInst*> NamedValues;
 std::unordered_map<std::string, StructInfo> NamedStructTypes;
-// `StructTypes` / `StructDependencies` used to live here as globals
-// shared with the parser. After the parser→sema split, struct-name
-// collection and cycle detection are owned by SemanticAnalyzer
-// (see sema/sema.{h,cpp}); codegen needs neither.
 std::vector<llvm::BasicBlock*> BreakStack;
 std::vector<llvm::BasicBlock*> ContinueStack;
 std::map<std::string, llvm::GlobalVariable*> UniformArrays;
 std::map<std::string, StorageBufferInfo> StorageBufferInfos;
+std::map<std::string, std::vector<uint8_t>> FunctionParamDirs;
 
 using namespace llvm;
 
@@ -33,7 +30,7 @@ llvm::Value* splatIfScalarTo(IRBuilder<>& B, Value* v, Type* dstTy) {
     if (v->getType() == dstTy) return v;
 
     auto* vecTy = dyn_cast<FixedVectorType>(dstTy);
-    // if dstTy is not vector, nothing to do
+
     if (!vecTy) return v;
 
     auto* elemTy = vecTy->getElementType();
@@ -160,7 +157,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
         return B.CreateFAdd(aPart, bPart, "mix");
     }
 
-    // === mod(x,y) ===
+    // mod(x,y)
     if (name == "mod") {
         if (args.size() != 2) {
             logError("builtin mod expects 2 args");
@@ -188,7 +185,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
         return B.CreateFSub(x, mul);
     }
 
-    // === normalize(v) ===
+    // normalize(v)
     if (name == "normalize") {
         if (args.size() != 1) {
             logError("normalize expects 1 arg");
@@ -216,7 +213,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
         Value* denomVec = splatIfScalarTo(B, denom, v->getType());
         return B.CreateFDiv(v, denomVec);
     }
-    // === dot(a, b) ===
+    // dot(a, b)
     if (name == "dot") {
         if (args.size() != 2) {
             logError("dot expects 2 args");
@@ -332,7 +329,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
         return nullptr;
     }
 
-    // === clamp(x, minVal, maxVal) ===
+    //  clamp(x, minVal, maxVal) 
     if (name == "clamp") {
         if (args.size() != 3) {
             logError("clamp requires 3 arguments");
@@ -371,7 +368,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
         Value* minXMax = B.CreateBinaryIntrinsic(Intrinsic::minnum, x, maxVal);
         return B.CreateBinaryIntrinsic(Intrinsic::maxnum, minVal, minXMax);
     }
-    // === cross(a, b) ===
+    //  cross(a, b) 
     if (name == "cross") {
         if (args.size() != 2) { logError("cross expects 2 args"); return nullptr; }
         Value* a = args[0]; Value* b = args[1];
@@ -386,7 +383,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
         res = B.CreateInsertElement(res,cy,(uint64_t)1);
         return B.CreateInsertElement(res,cz,(uint64_t)2,"cross");
     }
-    // === abs(x) ===
+    //  abs(x) 
     if (name == "abs") {
         if (args.size()!=1) { logError("abs expects 1 arg"); return nullptr; }
         Value* x = args[0];
@@ -394,7 +391,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
         Value* neg=B.CreateNeg(x,"neg"); Value* zero=Constant::getNullValue(x->getType());
         return B.CreateSelect(B.CreateICmpSLT(x,zero),neg,x,"abs");
     }
-    // === sign(x) ===
+    //  sign(x) 
     if (name == "sign") {
         if (args.size()!=1) { logError("sign expects 1 arg"); return nullptr; }
         Value* x=args[0]; Type* ty=x->getType();
@@ -418,7 +415,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
     if (name=="exp2")  { if(args.size()!=1)return nullptr; return createUnaryIntrinsic(B,Intrinsic::exp2,args[0]); }
     if (name=="log2")  { if(args.size()!=1)return nullptr; return createUnaryIntrinsic(B,Intrinsic::log2,args[0]); }
     if (name=="tan")   { if(args.size()!=1)return nullptr; return B.CreateFDiv(createUnaryIntrinsic(B,Intrinsic::sin,args[0]),createUnaryIntrinsic(B,Intrinsic::cos,args[0]),"tan"); }
-    // === step(edge, x) ===
+    //  step(edge, x) 
     if (name=="step") {
         if(args.size()!=2){logError("step expects 2 args");return nullptr;}
         Value* edge=splatIfScalarTo(B,args[0],args[1]->getType()); Value* x=args[1]; Type* ty=x->getType();
@@ -426,7 +423,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
         Value* one =ty->isVectorTy()?(Value*)B.CreateVectorSplat(cast<FixedVectorType>(ty)->getNumElements(),ConstantFP::get(ty->getScalarType(),1.0f)):ConstantFP::get(ty,1.0f);
         return B.CreateSelect(B.CreateFCmpOLT(x,edge),zero,one,"step");
     }
-    // === smoothstep(e0, e1, x) ===
+    //  smoothstep(e0, e1, x) 
     if (name=="smoothstep") {
         if(args.size()!=3){logError("smoothstep expects 3 args");return nullptr;}
         Value* e0=args[0],*e1=args[1],*x=args[2]; Type* ty=x->getType();
@@ -440,27 +437,27 @@ Value* codegenBuiltin(IRBuilder<>& B,
         t=createBinaryIntrinsic(B,Intrinsic::minnum,createBinaryIntrinsic(B,Intrinsic::maxnum,t,zv),ov);
         return B.CreateFMul(B.CreateFMul(t,t,"tt"),B.CreateFSub(thv,B.CreateFMul(tv,t)),"smoothstep");
     }
-    // === reflect(I, N) ===
+    //  reflect(I, N) 
     if (name=="reflect") {
         if(args.size()!=2){logError("reflect expects 2 args");return nullptr;}
         Value* I=args[0],*N=args[1];
         Value* scale=B.CreateFMul(ConstantFP::get(dotFloatVector(B,N,I)->getType(),2.0f),dotFloatVector(B,N,I),"rs");
         return B.CreateFSub(I,B.CreateFMul(splatIfScalarTo(B,scale,I->getType()),N),"reflect");
     }
-    // === distance(a, b) ===
+    //  distance(a, b) 
     if (name=="distance") {
         if(args.size()!=2){logError("distance expects 2 args");return nullptr;}
         Value* d=B.CreateFSub(args[0],args[1],"dd");
         return createUnaryIntrinsic(B,Intrinsic::sqrt,dotFloatVector(B,d,d));
     }
-    // === fma(a, b, c) ===
+    //  fma(a, b, c) 
     if (name=="fma") {
         if(args.size()!=3)return nullptr;
         return B.CreateIntrinsic(Intrinsic::fma,{args[0]->getType()},{args[0],args[1],args[2]});
     }
-    // === derivative stubs ===
+    //  derivative stubs 
     if (name=="dFdx"||name=="dFdy"||name=="fwidth") { if(args.size()!=1)return nullptr; return Constant::getNullValue(args[0]->getType()); }
-    // === barrier stubs ===
+    //  barrier stubs 
     if (name=="barrier"||name=="memoryBarrier"||name=="groupMemoryBarrier") {
         std::string fn_name="__"+name;
         Function* fn=M->getFunction(fn_name);
@@ -468,14 +465,8 @@ Value* codegenBuiltin(IRBuilder<>& B,
         B.CreateCall(fn,{});
         return Constant::getNullValue(Type::getInt32Ty(B.getContext()));
     }
-    // === texture(sampler, uv) ===
-    //
-    // Lowered as: alloca <4 x float> → call void __tex2d_sample(ptr,u,v,outptr)
-    //             → load <4 x float>.
-    //
-    // Avoids returning <4 x float> by value, which has incompatible ABIs
-    // between LLVM (with `+v`) and host C++. SPIR-V emitter recognises the
-    // call and emits OpImageSampleImplicitLod + OpStore into the alloca.
+    // Lowers via alloca to resolve ABI mismatches between host C++ and LLVM target.
+    // SPIR-V emitter matches this signature to emit OpImageSampleImplicitLod.
     if (name=="texture") {
         if(args.size()<2){logError("texture expects at least 2 args");return nullptr;}
         auto* vec4Ty=FixedVectorType::get(Type::getFloatTy(B.getContext()),4);
@@ -483,7 +474,6 @@ Value* codegenBuiltin(IRBuilder<>& B,
         auto* f32Ty=Type::getFloatTy(B.getContext());
         auto* voidTy=Type::getVoidTy(B.getContext());
 
-        // Hoist the alloca to the entry block.
         BasicBlock* entryBB = &B.GetInsertBlock()->getParent()->getEntryBlock();
         IRBuilder<> tmpB(entryBB, entryBB->getFirstInsertionPt());
         AllocaInst* outAlloca = tmpB.CreateAlloca(vec4Ty, nullptr, "tex.out");
@@ -507,7 +497,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
                           outAlloca});
         return B.CreateLoad(vec4Ty, outAlloca, "tex");
     }
-    // === textureLod(sampler, uv, lod) ===
+    //  textureLod(sampler, uv, lod) 
     if (name=="textureLod") {
         if(args.size()!=3){logError("textureLod expects 3 args");return nullptr;}
         auto* vec4Ty=FixedVectorType::get(Type::getFloatTy(B.getContext()),4);
@@ -517,7 +507,7 @@ Value* codegenBuiltin(IRBuilder<>& B,
         Value* uv=args[1];
         return B.CreateCall(fn,{args[0],B.CreateExtractElement(uv,(uint64_t)0),B.CreateExtractElement(uv,(uint64_t)1),args[2]},"texlod");
     }
-    // === imageLoad / imageStore ===
+    //  imageLoad / imageStore 
     if (name=="imageLoad") {
         if(args.size()!=2){logError("imageLoad expects 2 args");return nullptr;}
         auto* vec4Ty=FixedVectorType::get(Type::getFloatTy(B.getContext()),4);

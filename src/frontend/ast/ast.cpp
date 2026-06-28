@@ -51,19 +51,16 @@ static Value* toBool(Value* v) {
 
     if (t->isFloatTy() || t->isDoubleTy() || t->isFPOrFPVectorTy()) {
         Value* zero = ConstantFP::get(t, 0.0);
-        // UNE => NaN counts as true (common “nonzero” behavior); use ONE if you want NaN->false
+        // UNE => NaN counts as true;
         return Builder->CreateFCmpUNE(v, zero, "tobool");
     }
-
-    // toBool is a free helper with no AST node in scope — left unlocated.
     logError("Cannot convert to bool");
     return nullptr;
 }
 
-// Lower a *scalar* glsl::Type to its LLVM representation. Keyed on the canonical
-// type the analyzer stamped, so codegen no longer has to assume float. Returns
-// nullptr for types this dispatch doesn't lower directly (vectors, matrices,
-// aggregates) — callers fall back to the legacy, value-shape-driven path.
+// Lowers a canonical scalar glsl::Type to its signless LLVM representation.
+// Returns nullptr for vectors, matrices, or aggregates, signaling the caller 
+// to fall back to the shape-driven legacy lowering path.
 static llvm::Type* lowerScalarType(const glsl::Type* t) {
     if (!t) return nullptr;
     switch (t->kind()) {
@@ -76,10 +73,7 @@ static llvm::Type* lowerScalarType(const glsl::Type* t) {
     }
 }
 
-// Is an integral operand unsigned? Signedness lives in the *operation* (i32 is
-// signless in LLVM), so it's read off the analyzer-stamped type — for a scalar
-// uint or a uint vector (uvec). Absent type info ⇒ signed, preserving the
-// historical behavior on nodes the analyzer left untyped.
+// Is an integral operand unsigned
 static bool isUnsignedOperand(const ExprAST* e) {
     const glsl::Type* t = e ? e->getType() : nullptr;
     if (!t) return false;
@@ -88,18 +82,14 @@ static bool isUnsignedOperand(const ExprAST* e) {
     return false;
 }
 
-// Number literal — Step 4: emit a constant of the analyzer-assigned type.
-// Integer literals become real i32 constants (uint shares the signless i32);
-// float/double become ConstantFP. An untyped literal (no sema run, e.g. a unit
-// test that calls codegen() directly) falls back to the historical float so
-// nothing regresses.
+// Emits an LLVM constant representation of a numeric literal.
 Value* NumberExprAST::codegen() {
     const glsl::Type* ty = getType();
     if (ty) {
         if (ty->isIntegral())
             return ConstantInt::get(Type::getInt32Ty(*Context),
                                     static_cast<uint64_t>(Val),
-                                    /*isSigned=*/!ty->isUint());
+                                    !ty->isUint());
         if (ty->isDouble())
             return ConstantFP::get(Type::getDoubleTy(*Context), Val);
         if (ty->isFloat())
@@ -108,21 +98,17 @@ Value* NumberExprAST::codegen() {
     return ConstantFP::get(Type::getFloatTy(*Context), Val);
 }
 
-// Emit a widening conversion of `v` to LLVM type `dst` — both scalar, or both
-// vectors of equal length (LLVM's cast instructions are elementwise, so the same
-// opcode applies). `zeroExt` selects zext/uitofp (an unsigned or bool source)
-// over sext/sitofp. Falls back to castScalarTo for any scalar pair not matched,
-// else returns `v` unchanged.
+// Emits an elementwise widening conversion for scalar or vector operand pairs
 static Value* emitWiden(Value* v, bool zeroExt, llvm::Type* dst) {
     llvm::Type* src = v->getType();
     if (src == dst) return v;
     llvm::Type* se = src->getScalarType();
     llvm::Type* de = dst->getScalarType();
-    // int/uint/bool → float/double
+    // int/uint/bool -> float/double
     if (se->isIntegerTy() && de->isFloatingPointTy())
         return zeroExt ? Builder->CreateUIToFP(v, dst, "uitofp")
                        : Builder->CreateSIToFP(v, dst, "sitofp");
-    // float → double
+    // float -> double  
     if (se->isFloatTy() && de->isDoubleTy())
         return Builder->CreateFPExt(v, dst, "fpext");
     // integer widening (e.g. i1 → i32)
@@ -135,11 +121,7 @@ static Value* emitWiden(Value* v, bool zeroExt, llvm::Type* dst) {
     return v;
 }
 
-// Step 4/5a: a real widening conversion. The analyzer inserts these for scalar
-// widenings (GLSL §4.1.10) and, since Step 5a, scalar→vector splats and
-// elementwise vector→vector widening. Signedness of an integer source comes from
-// the operand's glsl type (uint/bool ⇒ zext/uitofp). A value already in the
-// target representation, or an untyped target, passes through untouched.
+// Evaluates widening conversions for scalars and vectors
 Value* ImplicitCastExprAST::codegen() {
     if (!Operand) return nullptr;
     Value* v = Operand->codegen();
@@ -149,17 +131,10 @@ Value* ImplicitCastExprAST::codegen() {
     if (!dstTy) return v;
     const glsl::Type* srcTy = Operand->getType();
 
-    // INVARIANT (Step a relies on this): a matrix is never an implicit-cast
-    // target. GLSL has no non-identity implicit matrix conversion (fixed shape,
-    // all float), so coerce()/coerceOperand() never wrap one — see coerce(). If
-    // this fires, a new coercion path is minting a matrix cast and this function
-    // needs a real matrix branch (a matrix target currently falls through to the
-    // scalar path, where lowerScalarType() returns nullptr ⇒ pass-through).
+    // Implicit conversion of Matrix is not possible
     assert(!dstTy->isMatrix() && "implicit cast to a matrix violates invariant");
 
-    // Vector target (Step 5a): a scalar operand widens to the element type then
-    // splats; a vector operand widens elementwise. Materializes what the legacy
-    // makeTypesMatch did at the binary op, now at the operand.
+    // Vector target
     if (dstTy->isVector()) {
         llvm::Type* elemTy = lowerScalarType(dstTy->elementType());
         if (!elemTy) return v;
@@ -224,9 +199,7 @@ Value* UnaryExprAST::codegen() {
     }
 
     if (Op == TokenKind::Not) {
-        // Logical NOT is bool-only (sema rejects non-bool operands up front). On
-        // i1, CreateNot flips the bit. The old `xor v, 1` fallback for wider ints
-        // was a miscompile — `!5` gave 4 (truthy), not 0.
+        // Logical NOT is bool-only
         if (v->getType()->isIntegerTy(1)) {
             return Builder->CreateNot(v, "not");
         }
@@ -236,8 +209,6 @@ Value* UnaryExprAST::codegen() {
 
     // bitwise complement — integer scalars/vectors only
     if (Op == TokenKind::BitwiseNot) {
-        // Fold an integral float *constant* (number literals codegen as
-        // float) to i32 so `~5` works; non-constant floats stay and error.
         if (auto* cf = dyn_cast<ConstantFP>(v)) {
             const APFloat& apf = cf->getValueAPF();
             double d = cf->getType()->isDoubleTy()
@@ -261,13 +232,7 @@ Value* UnaryExprAST::codegen() {
     return nullptr;
 }
 
-// ── Matrix binary-op lowering (codegen half of Step a) ─────────────────────
-// Matrices are column-major `[cols x <rows x float>]` (ArrayType-of-vector) —
-// the same layout tryCodegenMatrixConstructor builds and resolveTypeByName
-// mints. Sema (inferMatrixBinary + checkOperandTypes) has already validated the
-// dimensions, so these only LOWER: column c is `extractvalue M, c` (a
-// <rows x float>); dotFloatVector does the row·column reductions.
-
+// Matrix binary-op lowering
 // mat(CxR) * vecC → vecR.  res = Σ_c column_c * splat(v[c])  (vector FMA per col)
 static Value* matTimesVec(Value* M, Value* V) {
     auto* matTy = cast<ArrayType>(M->getType());
@@ -378,10 +343,6 @@ static Value* codegenMatrixBinary(TokenKind op, Value* L, Value* R,
 
 // Binary operator
 Value* BinaryExprAST::codegen() {
-    // Short-circuit && / || MUST be handled before either operand is evaluated.
-    // The operands carry side effects (calls, i++) and the RHS may legally never
-    // run; the arithmetic path below evaluates both operands eagerly (and the
-    // old code then re-evaluated them a second time here), so this case owns the
     // whole function and returns early — it never falls through to that path.
     if (Op == TokenKind::And || Op == TokenKind::Or) {
         Function* F = Builder->GetInsertBlock()->getParent();
@@ -390,11 +351,6 @@ Value* BinaryExprAST::codegen() {
         if (!L) return nullptr;
 
         BasicBlock* LHSBB = Builder->GetInsertBlock();
-
-        // An operand expression can't legally terminate its block (break/return
-        // are statements, not expressions), so this is an internal invariant —
-        // diagnose rather than fail silently, which would crash codegen with no
-        // clue why.
         if (LHSBB->getTerminator()) {
             logErrorAt(loc, "Internal: logical-operator LHS terminated its block");
             return nullptr;
@@ -447,12 +403,6 @@ Value* BinaryExprAST::codegen() {
     Value* R = RHS->codegen();
     if (!L || !R) return nullptr;
 
-    // Matrix operands ([cols x <rows x float>], an ArrayType-of-vector) — the
-    // type-match guard below has no ArrayType handling, so intercept here. Sema
-    // (inferMatrixBinary + checkOperandTypes) already validated the dimensions,
-    // so this only lowers. The element-is-vector guard keeps a stray non-matrix
-    // array (which sema rejects anyway) out of the matrix path rather than
-    // crashing a cast.
     auto isMatrixVal = [](Value* v) {
         auto* a = dyn_cast<ArrayType>(v->getType());
         return a && a->getElementType()->isVectorTy();
@@ -460,17 +410,6 @@ Value* BinaryExprAST::codegen() {
     if (isMatrixVal(L) || isMatrixVal(R))
         return codegenMatrixBinary(Op, L, R, loc);
 
-    // (The old ConstantFP→i32 fold for bitwise ops is gone: sema's
-    // checkOperandTypes rejects float bitwise operands, and a typed integer
-    // literal already codegens as a ConstantInt — so no float constant reaches a
-    // bitwise op anymore.)
-
-    // The legacy makeTypesMatch net is gone: sema now materializes matching
-    // operands (coerceOperand at the binary site, scalar→vector splat, matrix and
-    // builtin-result typing, stage-builtin binding), so a typed binary op arrives
-    // with L and R already the same LLVM type. If they differ, an operand reached
-    // codegen untyped — diagnose it rather than silently coercing (matrix pairs
-    // were already handled by the ArrayType intercept above).
     if (L->getType() != R->getType()) {
         std::string ls, rs;
         llvm::raw_string_ostream(ls) << *L->getType();
@@ -482,11 +421,6 @@ Value* BinaryExprAST::codegen() {
 
     Type* opType = L->getType();
 
-    // Step 4: signedness for the operations that have a signed/unsigned split
-    // (sdiv/udiv, srem/urem, ashr/lshr, the ordered icmp predicates). Read off
-    // the analyzer-stamped operand types — an i32 is signless on its own. After
-    // coercion both operands share a type, so either being unsigned settles it;
-    // untyped operands fall back to signed (the historical behavior).
     const bool uns = isUnsignedOperand(LHS) || isUnsignedOperand(RHS);
 
     // arithmetic operators
@@ -519,9 +453,6 @@ Value* BinaryExprAST::codegen() {
                        : Builder->CreateSRem(L, R, "remtmp");
     }
 
-    // bitwise operators — integer scalars/vectors only. `>>` is logical (lshr)
-    // for unsigned operands and arithmetic/sign-propagating (ashr) for signed,
-    // chosen from the operand types (`uns`); LLVM i32 itself is signless.
     if (Op == TokenKind::BitwiseAnd || Op == TokenKind::BitwiseOr ||
         Op == TokenKind::BitwiseXor || Op == TokenKind::ShiftLeft ||
         Op == TokenKind::ShiftRight) {
@@ -535,11 +466,7 @@ Value* BinaryExprAST::codegen() {
             case TokenKind::BitwiseXor: return Builder->CreateXor(L, R, "xortmp");
             case TokenKind::ShiftLeft:  return Builder->CreateShl(L, R, "shltmp");
             case TokenKind::ShiftRight:
-                // §5.9: a shift's signedness follows the LHS ONLY (the RHS is
-                // just a count). `uns` is the OR of both operands — correct for
-                // arithmetic/comparison (sema coerces those to a common type),
-                // but wrong here, so read the LHS directly: `int >> uint` must
-                // stay arithmetic (ashr), else a negative value zero-fills.
+        
                 return isUnsignedOperand(LHS) ? Builder->CreateLShr(L, R, "shrtmp")
                                               : Builder->CreateAShr(L, R, "shrtmp");
             default: break;
@@ -614,12 +541,6 @@ Value* TernaryExprAST::codegen() {
 
     Builder->CreateCondBr(condVal, ThenBB, ElseBB);
 
-    // Evaluate each arm in its own block, but DON'T branch to the merge block
-    // yet: if the arms have different types, the unifying cast must be emitted
-    // at the end of that arm's own block so the value dominates the edge feeding
-    // the PHI. The old code unified types in MergeBB, which produced a cast that
-    // didn't dominate its predecessor edge — an "instruction does not dominate
-    // all uses" verifier error waiting on the first arm-type mismatch.
     Builder->SetInsertPoint(ThenBB);
     Value* thenVal = ThenExpr->codegen();
     if (!thenVal) return nullptr;
@@ -630,10 +551,6 @@ Value* TernaryExprAST::codegen() {
     if (!elseVal) return nullptr;
     BasicBlock* elseEnd = Builder->GetInsertBlock();
 
-    // Reconcile differing arm types by widening the narrower arm *in its own
-    // block*. Scalar int<float<double order; a vector/exotic mismatch is a type
-    // error sema is expected to reject, and castScalarTo returns null for it so
-    // we surface a located diagnostic instead of tripping the verifier.
     if (thenVal->getType() != elseVal->getType()) {
         auto rank = [](Type* t) -> int {
             if (t->isDoubleTy())     return 3;
@@ -717,45 +634,58 @@ Value *MemberAccessExprAST::codegen() {
   return nullptr;
 }
 
-// Member assignment - struct field or vector swizzle
+static llvm::Value* lvalueAddr(ExprAST* e, llvm::Type*& outTy);
+
 llvm::Value* MemberAssignmentExprAST::codegen() {
-    // MATRIX column: mat[col].xy = ...
+    Type* objTy = nullptr;
+    Value* objPtr = lvalueAddr(Object, objTy);
+    if (objPtr && objTy->isStructTy()) {
+        auto* st = cast<StructType>(objTy);
+        std::string sName = st->hasName() ? st->getName().str() : "";
+        auto sit = NamedStructTypes.find(sName);
+        if (sit == NamedStructTypes.end()) {
+            logErrorAt(loc, fmt::format("Struct field names not registered for {}", sName));
+            return nullptr;
+        }
+        const auto& names = sit->second.FieldNames;
+        auto fit = std::find(names.begin(), names.end(), Member);
+        if (fit == names.end()) {
+            logErrorAt(loc, fmt::format("Struct {} has no field '{}'", sName, Member));
+            return nullptr;
+        }
+        unsigned idx = static_cast<unsigned>(std::distance(names.begin(), fit));
+        Type* fieldTy = st->getElementType(idx);
+        Value* zero = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+        Value* fidx = ConstantInt::get(Type::getInt32Ty(*Context), idx);
+        Value* fptr = Builder->CreateInBoundsGEP(st, objPtr, {zero, fidx}, Member + ".ptr");
+        Value* rhs = Init->codegen();
+        if (!rhs) return nullptr;
+        if (rhs->getType() != fieldTy) {
+            if (fieldTy->isVectorTy() && !rhs->getType()->isVectorTy()) {
+                Value* sc = castScalarTo(rhs, cast<FixedVectorType>(fieldTy)->getElementType());
+                if (!sc) return nullptr;
+                rhs = splatScalarToVector(sc, cast<FixedVectorType>(fieldTy));
+            } else if (Value* c = castScalarTo(rhs, fieldTy)) {
+                rhs = c;
+            }
+        }
+        Builder->CreateStore(rhs, fptr);
+        return rhs;
+    }
+
+    // MATRIX column swizzle: `mat[col].xy = ...` — mat[col] is a vector column.
     if (auto* matAccess = llvm::dyn_cast<MatrixAccessExprAST>(Object)) {
         MatrixColumnAssigner assigner(matAccess, Member, Init);
         return assigner.codegen();
     }
 
-    // Find variable alloca (struct/vector)
-    AllocaInst* alloca = nullptr;
-    VariableExprAST* baseVar = nullptr;
-    if (auto* varExpr = llvm::dyn_cast<VariableExprAST>(Object)) {
-        auto it = NamedValues.find(varExpr->Name);
-        if (it != NamedValues.end()) {
-            alloca = it->second;
-            baseVar = varExpr;
-        }
-    }
-    
-    if (!alloca) {
-        logErrorAt(loc,"Assignment LHS must be variable (e.g., a.xy = ..., lights[0].prop1 = ...)");
-        return nullptr;
-    }
-    
-    Type* objTy = alloca->getAllocatedType();
-    
-    // STRUCT field: light.pos.x = ...
-    if (objTy->isStructTy()) {
-        StructFieldAssigner assigner(Object, Member, Init);
-        return assigner.codegen();
-    }
-
-    // VECTOR swizzle: pos.xy = ...
-    if (objTy->isVectorTy()) {
+    // VECTOR swizzle on a plain variable: `pos.xy = ...`
+    if (objPtr && objTy->isVectorTy()) {
         VectorSwizzleAssigner assigner(Object, Member, Init);
         return assigner.codegen();
     }
-    
-    logErrorAt(loc,"Unsupported member assignment type");
+
+    logErrorAt(loc,"Assignment LHS must be variable (e.g., a.xy = ..., lights[0].prop1 = ...)");
     return nullptr;
 }
 
@@ -799,6 +729,27 @@ Value* CallExprAST::codegen() {
         return nullptr;
     }
 
+    auto dirIt = FunctionParamDirs.find(Callee);
+    if (dirIt != FunctionParamDirs.end()) {
+        const auto& dirs = dirIt->second;
+        for (size_t k = 0; k < Args.size() && k < dirs.size(); ++k) {
+            if (dirs[k] == 0) continue;  // by value
+            auto* var = llvm::dyn_cast<VariableExprAST>(Args[k]);
+            if (!var) {
+                logErrorAt(loc, fmt::format(
+                    "argument {} of '{}' is 'out'/'inout' and must be a variable",
+                    k, Callee));
+                return nullptr;
+            }
+            auto vit = NamedValues.find(var->Name);
+            if (vit == NamedValues.end()) {
+                logErrorAt(loc, fmt::format("Undefined variable '{}'", var->Name));
+                return nullptr;
+            }
+            ArgsV[k] = vit->second;  // pass the alloca pointer
+        }
+    }
+
     // Cast arguments to expected types
     unsigned i = 0;
     for (auto& argVal : ArgsV) {
@@ -816,7 +767,10 @@ Value* CallExprAST::codegen() {
         ++i;
     }
 
-    return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
+    // A void call must not be given a result name.
+    return Builder->CreateCall(
+        CalleeF, ArgsV,
+        CalleeF->getReturnType()->isVoidTy() ? "" : "calltmp");
 }
 
 llvm::Value* IfExprAST::codegen() {
@@ -848,14 +802,14 @@ llvm::Value* IfExprAST::codegen() {
 
     Builder->CreateCondBr(condVal, thenBB, ElseExpr ? elseBB : mergeBB);
 
-    // ---- THEN ----
+    // THEN 
     Builder->SetInsertPoint(thenBB);
     if (!ThenExpr->codegen()) return nullptr;
 
     BasicBlock* thenEndBB = Builder->GetInsertBlock();
     bool thenTerminated = (thenEndBB->getTerminator() != nullptr);
 
-    // ---- ELSE ----
+    // ELSE 
     BasicBlock* elseEndBB = nullptr;
     bool elseTerminated = false;
 
@@ -942,7 +896,6 @@ llvm::Value* AssignmentExprAST::codegen() {
         return val;
     }
 
-    // EXISTING CODE for declaration with initialization - remains the same!
     Type* Ty = resolveTypeByName(VarType);
     if (!Ty) {
         logErrorAt(loc,fmt::format("Unknown type in assignment: {}", VarType));
@@ -997,69 +950,93 @@ llvm::Value* AssignmentExprAST::codegen() {
     return val;
 }
 
+static Value* lvalueAddr(ExprAST* e, Type*& outTy) {
+    using namespace llvm;
+    if (auto* var = dyn_cast<VariableExprAST>(e)) {
+        auto it = NamedValues.find(var->Name);
+        if (it == NamedValues.end()) return nullptr;
+        outTy = it->second->getAllocatedType();
+        return it->second;
+    }
+    if (auto* mem = dyn_cast<MemberAccessExprAST>(e)) {
+        Type* baseTy = nullptr;
+        Value* basePtr = lvalueAddr(mem->Object, baseTy);
+        if (!basePtr || !baseTy->isStructTy()) return nullptr;
+        auto* st = cast<StructType>(baseTy);
+        std::string sName = st->hasName() ? st->getName().str() : "";
+        auto sit = NamedStructTypes.find(sName);
+        if (sit == NamedStructTypes.end()) return nullptr;
+        const auto& names = sit->second.FieldNames;
+        auto fit = std::find(names.begin(), names.end(), mem->Member);
+        if (fit == names.end()) return nullptr;
+        unsigned idx = static_cast<unsigned>(std::distance(names.begin(), fit));
+        Value* zero = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+        Value* fidx = ConstantInt::get(Type::getInt32Ty(*Context), idx);
+        outTy = st->getElementType(idx);
+        return Builder->CreateInBoundsGEP(st, basePtr, {zero, fidx},
+                                          sName + "." + mem->Member + ".ptr");
+    }
+    if (auto* macc = dyn_cast<MatrixAccessExprAST>(e)) {
+        if (macc->Index2) return nullptr;  // m[i][j] scalar — vector path handles it
+        Type* baseTy = nullptr;
+        Value* basePtr = lvalueAddr(macc->Object, baseTy);
+        if (!basePtr || !baseTy->isArrayTy()) return nullptr;
+        Value* iVal = macc->Index->codegen();
+        if (!iVal) return nullptr;
+        iVal = toI32(iVal);
+        Value* zero = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+        outTy = cast<ArrayType>(baseTy)->getElementType();
+        return Builder->CreateInBoundsGEP(baseTy, basePtr, {zero, iVal},
+                                          "elem.ptr");
+    }
+    return nullptr;
+}
+
 Value *MatrixAccessExprAST::codegen() {
+    // Local variable array or struct array field: `a[i]`, `s.a[i]`, `m[i][j]`.
+    Type* baseTy = nullptr;
+    std::string baseName = "arr";
+    if (Value* basePtr = lvalueAddr(Object, baseTy)) {
+        if (!baseTy->isArrayTy()) {
+            logErrorAt(loc, "Matrix/array access only supported on array types");
+            return nullptr;
+        }
+        auto* arrTy  = cast<ArrayType>(baseTy);
+        Type* elemTy = arrTy->getElementType();
+        if (!Index) {
+            logErrorAt(loc, "Array/matrix access requires first index");
+            return nullptr;
+        }
+        Value* iVal = Index->codegen();
+        if (!iVal) return nullptr;
+        iVal = toI32(iVal);
+        if (!iVal) { logErrorAt(loc, "First index is not convertible to i32"); return nullptr; }
+
+        Value* zero    = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+        Value* elemPtr = Builder->CreateInBoundsGEP(baseTy, basePtr, {zero, iVal},
+                                                    baseName + ".elem.ptr");
+        if (!Index2) {
+            return Builder->CreateLoad(elemTy, elemPtr,
+                                       baseName + (elemTy->isVectorTy() ? ".col" : ".elem"));
+        }
+        if (!elemTy->isVectorTy()) {
+            logErrorAt(loc, "Second index is only valid for matrix (array-of-vector)");
+            return nullptr;
+        }
+        auto* colTy = cast<FixedVectorType>(elemTy);
+        Value* col  = Builder->CreateLoad(colTy, elemPtr, baseName + ".col");
+        Value* jVal = Index2->codegen();
+        if (!jVal) return nullptr;
+        jVal = toI32(jVal);
+        if (!jVal) { logErrorAt(this->loc, "Second index is not convertible to i32"); return nullptr; }
+        return Builder->CreateExtractElement(col, jVal, "m.elem");
+    }
+
+    // SSBO / uniform array — these require a plain named variable.
     auto *lhsVar = llvm::dyn_cast<VariableExprAST>(Object);
     if (!lhsVar) {
         logErrorAt(loc,"Matrix/array access LHS must be a variable (e.g., M[i] or M[i][j])");
         return nullptr;
-    }
-
-    auto it = NamedValues.find(lhsVar->Name);
-    if (it != NamedValues.end()) {
-        AllocaInst *alloca = it->second;
-        Type *baseTy       = alloca->getAllocatedType();
-
-        if (!baseTy->isArrayTy()) {
-            logErrorAt(loc,"Matrix/array access only supported on array types for local vars");
-            return nullptr;
-        }
-
-        auto *arrTy  = cast<ArrayType>(baseTy);
-        Type *elemTy = arrTy->getElementType();
-
-        // first index
-        if (!Index) {
-            logErrorAt(loc,"Array/matrix access requires first index");
-            return nullptr;
-        }
-
-        Value *iVal = Index->codegen();
-        if (!iVal) return nullptr;
-        iVal = toI32(iVal);
-        if (!iVal) {
-            logErrorAt(loc,"First index is not convertible to i32");
-            return nullptr;
-        }
-
-        Value *zero    = ConstantInt::get(Type::getInt32Ty(*Context), 0);
-        Value *elemPtr = Builder->CreateInBoundsGEP(
-            baseTy, alloca, { zero, iVal }, lhsVar->Name + ".elem.ptr"
-        );
-
-        if (!Index2) {
-            if (elemTy->isVectorTy()) {
-                return Builder->CreateLoad(elemTy, elemPtr, lhsVar->Name + ".col");
-            }
-            return Builder->CreateLoad(elemTy, elemPtr, lhsVar->Name + ".elem");
-        }
-
-        if (!elemTy->isVectorTy()) {
-            logErrorAt(loc,"Second index is only valid for matrix (array-of-vector)");
-            return nullptr;
-        }
-
-        auto *colTy  = cast<FixedVectorType>(elemTy);
-        Value *col   = Builder->CreateLoad(colTy, elemPtr, lhsVar->Name + ".col");
-
-        Value *jVal = Index2->codegen();
-        if (!jVal) return nullptr;
-        jVal = toI32(jVal);
-        if (!jVal) {
-            logErrorAt(this->loc,"Second index is not convertible to i32");
-            return nullptr;
-        }
-
-        return Builder->CreateExtractElement(col, jVal, "m.elem");
     }
 
     // Storage buffer (compute shader): @name = external global ptr
@@ -1092,14 +1069,14 @@ Value *MatrixAccessExprAST::codegen() {
     }
 
     auto *gv    = uit->second;
-    Type *baseTy = gv->getValueType();
+    Type *uBaseTy = gv->getValueType();
 
-    if (!baseTy->isArrayTy()) {
+    if (!uBaseTy->isArrayTy()) {
         logErrorAt(loc,fmt::format("Uniform '{}' is not an array type", lhsVar->Name));
         return nullptr;
     }
 
-    auto *arrTy  = cast<ArrayType>(baseTy);
+    auto *arrTy  = cast<ArrayType>(uBaseTy);
     Type *elemTy = arrTy->getElementType();
 
     if (!Index) {
@@ -1117,7 +1094,7 @@ Value *MatrixAccessExprAST::codegen() {
 
     Value *zero    = ConstantInt::get(Type::getInt32Ty(*Context), 0);
     Value *elemPtr = Builder->CreateInBoundsGEP(
-        baseTy, gv, { zero, iVal }, lhsVar->Name + ".u.elem.ptr"
+        uBaseTy, gv, { zero, iVal }, lhsVar->Name + ".u.elem.ptr"
     );
 
     if (!Index2) {
@@ -1149,15 +1126,11 @@ Value *MatrixAccessExprAST::codegen() {
 
 // Matrix / storage-buffer element assignment: a[i] = val  or  a[i][j] = val
 Value* MatrixAssignmentExprAST::codegen() {
+    // Storage buffer write: dst[idx] = val. Requires a plain named variable.
     auto* lhsVar = llvm::dyn_cast<VariableExprAST>(Object);
-    if (!lhsVar) {
-        logErrorAt(loc,"Array assignment LHS must be a named variable");
-        return nullptr;
-    }
-
-    // Storage buffer write: dst[idx] = val
-    auto sit = StorageBufferInfos.find(lhsVar->Name);
-    if (sit != StorageBufferInfos.end()) {
+    auto sit = lhsVar ? StorageBufferInfos.find(lhsVar->Name)
+                      : StorageBufferInfos.end();
+    if (lhsVar && sit != StorageBufferInfos.end()) {
         auto& info = sit->second;
         auto* ptrTy = PointerType::getUnqual(*Context);
         auto* wrPtrLoad = Builder->CreateLoad(ptrTy, info.gv, lhsVar->Name + ".ptr");
@@ -1184,16 +1157,16 @@ Value* MatrixAssignmentExprAST::codegen() {
         return rhs;
     }
 
-    // Local array write: arr[i] = val
-    auto it = NamedValues.find(lhsVar->Name);
-    if (it == NamedValues.end()) {
-        logErrorAt(loc,fmt::format("Unknown variable '{}' in array assignment", lhsVar->Name));
+    // Local array / struct array field write: `arr[i] = v`, `s.a[i] = v`.
+    Type* matTy = nullptr;
+    std::string baseName = "arr";
+    Value* basePtr = lvalueAddr(Object, matTy);
+    if (!basePtr) {
+        logErrorAt(loc, "Array assignment LHS must be a named variable or struct field");
         return nullptr;
     }
-    AllocaInst* alloca = it->second;
-    Type* matTy = alloca->getAllocatedType();
     if (!matTy->isArrayTy()) {
-        logErrorAt(loc,fmt::format("'{}' is not an array type", lhsVar->Name));
+        logErrorAt(loc, fmt::format("'{}' is not an array type", baseName));
         return nullptr;
     }
     auto* arrTy = cast<ArrayType>(matTy);
@@ -1202,8 +1175,8 @@ Value* MatrixAssignmentExprAST::codegen() {
     if (!iVal) return nullptr;
     iVal = toI32(iVal);
     Value* zero   = ConstantInt::get(Type::getInt32Ty(*Context), 0);
-    Value* colPtr = Builder->CreateInBoundsGEP(matTy, alloca, {zero, iVal},
-                                               lhsVar->Name + ".col.ptr");
+    Value* colPtr = Builder->CreateInBoundsGEP(matTy, basePtr, {zero, iVal},
+                                               baseName + ".col.ptr");
     if (!Index2) {
         Value* rhs = RHS->codegen();
         if (!rhs) return nullptr;
@@ -1216,8 +1189,8 @@ Value* MatrixAssignmentExprAST::codegen() {
     Value* jVal = Index2->codegen();
     if (!jVal) return nullptr;
     jVal = toI32(jVal);
-    Value* col  = Builder->CreateLoad(vecColTy, colPtr, lhsVar->Name + ".col");
-    Value* upd  = Builder->CreateInsertElement(col, rhs, jVal, lhsVar->Name + ".upd");
+    Value* col  = Builder->CreateLoad(vecColTy, colPtr, baseName + ".col");
+    Value* upd  = Builder->CreateInsertElement(col, rhs, jVal, baseName + ".upd");
     Builder->CreateStore(upd, colPtr);
     return rhs;
 }
@@ -1237,17 +1210,30 @@ llvm::Value* PrototypeAST::codegen() {
         }
     }
 
-    // make param types
+    // make param types. `out`/`inout` params are passed by reference: their
+    // LLVM type is an opaque pointer to the caller's storage.
     std::vector<Type*> paramTys;
     paramTys.reserve(Args.size());
-    for (auto& [tyName, argName] : Args) {
-        Type* ty = resolveTypeByName(tyName);
-        if (!ty) { 
-            logErrorAt(loc,fmt::format("Unknown param type: {}", tyName));
-            return nullptr; 
+    for (size_t i = 0; i < Args.size(); ++i) {
+        uint8_t dir = i < ArgDir.size() ? ArgDir[i] : 0;
+        if (dir != 0) {
+            // Validate the (pointee) type still resolves, then pass a pointer.
+            if (!resolveTypeByName(Args[i].first)) {
+                logErrorAt(loc, fmt::format("Unknown param type: {}", Args[i].first));
+                return nullptr;
+            }
+            paramTys.push_back(PointerType::getUnqual(*Context));
+            continue;
+        }
+        Type* ty = resolveTypeByName(Args[i].first);
+        if (!ty) {
+            logErrorAt(loc,fmt::format("Unknown param type: {}", Args[i].first));
+            return nullptr;
         }
         paramTys.push_back(ty);
     }
+    if (!ArgDir.empty())
+        FunctionParamDirs[Name] = ArgDir;
 
     // create function type and function
     FunctionType* FT = FunctionType::get(retTy, paramTys, false);
@@ -1331,8 +1317,6 @@ llvm::Value* FunctionAST::codegen() {
             paramTys.push_back(uvec3Ty); paramNames.push_back("gl_NumWorkgroups");
         }
 
-        // ── Create function ───────────────────────────────────────────
-        // Use stable stage-based names so VS+FS modules can be linked without conflicts
         std::string stageFuncName;
         if      (stage == ShaderStage::Vertex)   stageFuncName = "vs_main";
         else if (stage == ShaderStage::Fragment)  stageFuncName = "fs_main";
@@ -1354,7 +1338,6 @@ llvm::Value* FunctionAST::codegen() {
             NamedValues[an] = A;
         }
 
-        // Create output-variable allocas (so body can assign to them)
         if (stage == ShaderStage::Vertex) {
             AllocaInst* A = CreateEntryBlockAlloca(F, "gl_Position", vec4Ty);
             Builder->CreateStore(Constant::getNullValue(vec4Ty), A);
@@ -1372,14 +1355,12 @@ llvm::Value* FunctionAST::codegen() {
             }
         }
 
-        // ── Codegen body ──────────────────────────────────────────────
         if (!Body->codegen()) {
             F->eraseFromParent();
             Builder->restoreIP(savedIP);
             return nullptr;
         }
 
-        // ── Epilogue: store outputs into _out struct ──────────────────
         BasicBlock* cur = Builder->GetInsertBlock();
         if (!cur->getTerminator() && outStructTy) {
             auto outIt = NamedValues.find("_out");
@@ -1399,12 +1380,30 @@ llvm::Value* FunctionAST::codegen() {
         if (!cur->getTerminator())
             Builder->CreateRetVoid();
 
-        // ── Shader metadata ───────────────────────────────────────────
         const char* stageStr = stage == ShaderStage::Vertex   ? "vertex"
                              : stage == ShaderStage::Fragment  ? "fragment"
                                                                : "compute";
         F->setMetadata("shader.stage",
             MDNode::get(*Context, MDString::get(*Context, stageStr)));
+
+        {
+            std::vector<Metadata*> ioLocs;
+            auto addLocs = [&](const std::vector<StageVar>& vars) {
+                for (auto& sv : vars) {
+                    if (sv.location < 0) continue;
+                    Metadata* pair[] = {
+                        MDString::get(*Context, sv.name),
+                        ConstantAsMetadata::get(
+                            ConstantInt::get(i32Ty, sv.location))};
+                    ioLocs.push_back(MDNode::get(*Context, pair));
+                }
+            };
+            addLocs(StageInputVars);
+            addLocs(StageOutputVars);
+            if (!ioLocs.empty())
+                F->setMetadata("shader.io.location",
+                               MDNode::get(*Context, ioLocs));
+        }
 
         if (Attrs.workgroupSize.has_value()) {
             auto& ws = *Attrs.workgroupSize;
@@ -1426,7 +1425,6 @@ llvm::Value* FunctionAST::codegen() {
         return F;
     }
 
-    // ── Regular (non-entry) function ──────────────────────────────────
     Function* F = nullptr;
     if (auto* V = Proto->codegen()) F = cast<Function>(V);
     else return nullptr;
@@ -1435,10 +1433,28 @@ llvm::Value* FunctionAST::codegen() {
     Builder->SetInsertPoint(BB);
 
     NamedValues.clear();
-    for (auto& Arg : F->args()) {
-        AllocaInst* A = CreateEntryBlockAlloca(F, std::string(Arg.getName()), Arg.getType());
-        Builder->CreateStore(&Arg, A);
-        NamedValues[std::string(Arg.getName())] = A;
+    const std::vector<uint8_t>& dirs = Proto->ArgDir;
+    std::vector<std::pair<AllocaInst*, Argument*>> copyOuts;
+    {
+        unsigned i = 0;
+        for (auto& Arg : F->args()) {
+            uint8_t dir = i < dirs.size() ? dirs[i] : 0;
+            std::string an = std::string(Arg.getName());
+            if (dir != 0) {
+                // Pointee (value) type from the declaration spelling.
+                Type* valTy = resolveTypeByName(Proto->Args[i].first);
+                AllocaInst* A = CreateEntryBlockAlloca(F, an, valTy);
+                if (dir == 2)  // inout: copy in the caller's current value
+                    Builder->CreateStore(Builder->CreateLoad(valTy, &Arg, an + ".in"), A);
+                NamedValues[an] = A;
+                copyOuts.emplace_back(A, &Arg);
+            } else {
+                AllocaInst* A = CreateEntryBlockAlloca(F, an, Arg.getType());
+                Builder->CreateStore(&Arg, A);
+                NamedValues[an] = A;
+            }
+            ++i;
+        }
     }
 
     Value* RetVal = Body->codegen();
@@ -1461,6 +1477,17 @@ llvm::Value* FunctionAST::codegen() {
                 Builder->restoreIP(savedIP);
                 return nullptr;
             }
+        }
+    }
+
+    if (!copyOuts.empty()) {
+        for (auto& bb : *F) {
+            auto* ret = llvm::dyn_cast_or_null<ReturnInst>(bb.getTerminator());
+            if (!ret) continue;
+            Builder->SetInsertPoint(ret);
+            for (auto& [a, p] : copyOuts)
+                Builder->CreateStore(
+                    Builder->CreateLoad(a->getAllocatedType(), a, "co.ld"), p);
         }
     }
 
@@ -1549,9 +1576,10 @@ Value* DiscardStmtAST::codegen() {
 Value* WhileExprAST::codegen() {
     Function* F = Builder->GetInsertBlock()->getParent();
 
-    BasicBlock* CondBB  = BasicBlock::Create(*Context, "while.cond", F);
-    BasicBlock* BodyBB  = BasicBlock::Create(*Context, "while.body", F);
-    BasicBlock* AfterBB = BasicBlock::Create(*Context, "while.end",  F);
+    BasicBlock* CondBB  = BasicBlock::Create(*Context, "while.cond",  F);
+    BasicBlock* BodyBB  = BasicBlock::Create(*Context, "while.body",  F);
+    BasicBlock* LatchBB = BasicBlock::Create(*Context, "while.latch", F);
+    BasicBlock* AfterBB = BasicBlock::Create(*Context, "while.end",   F);
 
     // while jumps to condition first
     Builder->CreateBr(CondBB);
@@ -1565,7 +1593,7 @@ Value* WhileExprAST::codegen() {
     // body
     Builder->SetInsertPoint(BodyBB);
     BreakStack.push_back(AfterBB);
-    ContinueStack.push_back(CondBB);
+    ContinueStack.push_back(LatchBB);  // `continue` re-tests via the latch
 
     if (!Body->codegen()) {
         BreakStack.pop_back();
@@ -1573,13 +1601,18 @@ Value* WhileExprAST::codegen() {
         return nullptr;
     }
 
-    // Only loop back if body did not already terminate (break/return)
+    // Only fall through to the latch if the body did not already terminate
+    // (break/return).
     if (!Builder->GetInsertBlock()->getTerminator()) {
-        Builder->CreateBr(CondBB);
+        Builder->CreateBr(LatchBB);
     }
 
     BreakStack.pop_back();
     ContinueStack.pop_back();
+
+    // latch: unconditional back-edge to the condition
+    Builder->SetInsertPoint(LatchBB);
+    Builder->CreateBr(CondBB);
 
     // continue after loop
     Builder->SetInsertPoint(AfterBB);
@@ -1640,20 +1673,13 @@ Value* ForExprAST::codegen() {
     return ConstantFP::get(Type::getFloatTy(*Context), 0.0f);
 }
 
-
-// STRUCT DECLARATION
-
-// Register an opaque StructType under `Name`. Idempotent: if predeclare()
-// is called twice (or once before codegen()), the second call is a no-op.
-// Enables forward struct references — `struct A { B b; }` declared before
-// `struct B { ... }`.
+// Handle non-body forward declaration tracking for structs to bypass circular tracking loops
 void StructDeclExprAST::predeclare() {
     using namespace llvm;
     if (NamedStructTypes.find(Name) != NamedStructTypes.end()) return;
     StructType* ST = StructType::create(*Context, Name);
     StructInfo info;
     info.Type = ST;
-    // FieldNames stays empty until codegen() fills it.
     NamedStructTypes[Name] = std::move(info);
 }
 
@@ -1662,8 +1688,6 @@ llvm::Value* StructDeclExprAST::codegen() {
     auto it = NamedStructTypes.find(Name);
     StructType* ST = nullptr;
     if (it != NamedStructTypes.end()) {
-        // Predeclared: complete the opaque body. Reject only if a body was
-        // already set (i.e. duplicate decl, not the predeclare placeholder).
         if (it->second.Type->isOpaque()) {
             ST = it->second.Type;
         } else {
@@ -1704,7 +1728,7 @@ Value* StageVarDeclAST::codegen() {
     sv.name = Name;
     sv.typeName = TypeName;
     sv.isInput = isInput;
-    sv.binding = binding;
+    sv.location = location;
     if (isInput)
         StageInputVars.push_back(sv);
     else
@@ -1724,9 +1748,6 @@ Value* UniformDeclExprAST::codegen() {
     GlobalVariable* G = TheModule->getGlobalVariable(Name);
     if (!G) {
         auto *init = Constant::getNullValue(t);
-        // LinkOnceODR so the same uniform declared in both VS and FS modules
-        // merges cleanly when llvm-link joins them. ExternalLinkage would
-        // error on duplicate definition; LinkOnceODR keeps one copy.
         G = new GlobalVariable(
             *TheModule,
             t,
@@ -1741,6 +1762,10 @@ Value* UniformDeclExprAST::codegen() {
             return nullptr;
         }
     }
+    if (binding >= 0)
+        G->setMetadata("shader.binding",
+            MDNode::get(*Context, ConstantAsMetadata::get(
+                ConstantInt::get(Type::getInt32Ty(*Context), binding))));
     return Constant::getNullValue(t);
 }
 
@@ -1861,13 +1886,13 @@ Value* ArrayDeclExprAST::codegen() {
     return alloca;
 }
 
+// Declare global uniform structures interfaces for explicit array structures layout parameters
 Value* UniformArrayDeclExprAST::codegen() {
     Type* elemType = resolveTypeByName(TypeName);
     if (!elemType) {
         logErrorAt(loc,fmt::format("Unknown type for uniform array: {}", TypeName));
         return nullptr;
     }
-    // Create array type
     ArrayType* arrayType = ArrayType::get(elemType, Size);
     GlobalVariable* G = TheModule->getGlobalVariable(Name);
     if (!G) {
@@ -1886,20 +1911,21 @@ Value* UniformArrayDeclExprAST::codegen() {
             return nullptr;
         }
     }
+    if (binding >= 0)
+        G->setMetadata("shader.binding",
+            MDNode::get(*Context, ConstantAsMetadata::get(
+                ConstantInt::get(Type::getInt32Ty(*Context), binding))));
     UniformArrays[Name] = G;
     return G;
 }
 
-// Storage buffer declaration (compute shaders)
-// Declares an external global pointer: e.g. @src = external global ptr
+// Register explicit external pointer boundaries layouts for SSBO definitions structures
 Value* StorageBufferDeclAST::codegen() {
     Type* elemTy = resolveTypeByName(ElemType);
     if (!elemTy) {
         logErrorAt(loc,fmt::format("Unknown element type for storage buffer: {}", ElemType));
         return nullptr;
     }
-    // Declare as an external opaque pointer global.
-    // The host sets this pointer before calling cs_invoke().
     auto* ptrTy = PointerType::getUnqual(*Context);
     GlobalVariable* G = TheModule->getGlobalVariable(Name);
     if (!G) {
@@ -1912,59 +1938,67 @@ Value* StorageBufferDeclAST::codegen() {
             Name
         );
     }
+    if (binding >= 0)
+        G->setMetadata("shader.binding",
+            MDNode::get(*Context, ConstantAsMetadata::get(
+                ConstantInt::get(Type::getInt32Ty(*Context), binding))));
     StorageBufferInfos[Name] = {G, elemTy, isReadOnly};
     return G;
 }
 
-// Postfix x++ / x--:
-//   old = load x
-//   new = old ± 1   (typed: int → i32, float → fp)
-//   store new, x
-//   return old
-//
-// The crucial bit is returning `old`, not `new`. The parser is responsible
-// for placing this node in any context where the *value* of `x++` matters
-// (`a[i++]`, `f(i++)`, `j = i++`). For an expression-statement `i++;` the
-// returned value is simply discarded.
-Value* PostfixIncrExprAST::codegen() {
-    auto* var = llvm::dyn_cast<VariableExprAST>(Target);
-    if (!var) {
-        logErrorAt(loc, "Postfix ++/-- target must be a variable");
-        return nullptr;
+// Increment / decrement (++x, x++, --x, x--):
+Value* IncrDecrExprAST::codegen() {
+    AllocaInst* varAlloca = nullptr;
+    Value* oldVal = nullptr;
+    if (auto* var = llvm::dyn_cast<VariableExprAST>(Target)) {
+        auto it = NamedValues.find(var->Name);
+        if (it == NamedValues.end()) {
+            logErrorAt(loc,
+                       fmt::format("Undefined variable in postfix expression: {}",
+                                   var->Name));
+            return nullptr;
+        }
+        varAlloca = it->second;
+        oldVal = Builder->CreateLoad(varAlloca->getAllocatedType(), varAlloca, var->Name + ".old");
+    } else {
+        oldVal = Target->codegen();  // MemberAccess / MatrixAccess load
     }
+    if (!oldVal) return nullptr;
 
-    auto it = NamedValues.find(var->Name);
-    if (it == NamedValues.end()) {
-        logErrorAt(loc,
-                   fmt::format("Undefined variable in postfix expression: {}",
-                               var->Name));
-        return nullptr;
-    }
-    AllocaInst* alloca = it->second;
-    Type* ty = alloca->getAllocatedType();
-
-    Value* oldVal = Builder->CreateLoad(ty, alloca, var->Name + ".old");
-
+    Type* ty = oldVal->getType();
     Value* one = nullptr;
     if (ty->isIntegerTy()) {
         one = ConstantInt::get(ty, 1);
     } else if (ty->isFloatingPointTy()) {
         one = ConstantFP::get(ty, 1.0);
     } else {
-        logErrorAt(loc,
-                   "Postfix ++/-- only supported on int / float scalars");
+        logErrorAt(loc, "Postfix ++/-- only supported on int / float scalars");
         return nullptr;
     }
 
-    Value* newVal = nullptr;
-    if (ty->isIntegerTy()) {
-        newVal = isDecrement ? Builder->CreateSub(oldVal, one, "dec")
-                             : Builder->CreateAdd(oldVal, one, "inc");
-    } else {
-        newVal = isDecrement ? Builder->CreateFSub(oldVal, one, "dec")
-                             : Builder->CreateFAdd(oldVal, one, "inc");
-    }
+    Value* newVal = ty->isIntegerTy()
+        ? (isDecrement ? Builder->CreateSub(oldVal, one, "dec")
+                       : Builder->CreateAdd(oldVal, one, "inc"))
+        : (isDecrement ? Builder->CreateFSub(oldVal, one, "dec")
+                       : Builder->CreateFAdd(oldVal, one, "inc"));
 
-    Builder->CreateStore(newVal, alloca);
-    return oldVal;
+    if (varAlloca) {
+        Builder->CreateStore(newVal, varAlloca);
+    } else if (auto* mem = llvm::dyn_cast<MemberAccessExprAST>(Target)) {
+        RawValueExprAST raw(newVal);
+        MemberAssignmentExprAST store(mem->Object, mem->Member, &raw);
+        store.loc = loc;
+        if (!store.codegen()) return nullptr;
+    } else if (auto* macc = llvm::dyn_cast<MatrixAccessExprAST>(Target)) {
+        RawValueExprAST raw(newVal);
+        MatrixAssignmentExprAST store(macc->Object, macc->Index, macc->Index2,
+                                      &raw);
+        store.loc = loc;
+        if (!store.codegen()) return nullptr;
+    } else {
+        logErrorAt(loc,
+                   "++/-- target must be a variable, member, or index");
+        return nullptr;
+    }
+    return isPrefix ? newVal : oldVal;
 }

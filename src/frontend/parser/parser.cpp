@@ -10,11 +10,6 @@
 #include <vector>
 #include <fmt/core.h>
 
-// The builtin type-keyword list is no longer hand-maintained here: isTypeTok,
-// tokToTypeName, and parsePrimary all expand ../ast/builtin_types.def (the same
-// source the lexer, sema, and codegen use), so the lists can't drift. `void` is
-// not in it (function-return type only) and is handled separately at each site.
-
 class Parser {
 public:
     Parser(ASTContext& ctx, std::string_view source) : Ctx(ctx), Lex(source) {
@@ -35,10 +30,8 @@ public:
     // Kind of the token after cur
     TokenKind peekNext() const { return Next.kind; }
 
-    // Logs a syntax error at the current token position. 
-    // Caps error output at 'kMaxErrors' to prevent terminal spam.
-    // Returns std::nullptr_t so it can be chained directly as 'return error("...");'
-    // in AST parsing functions that return pointers.
+    // Logs a syntax error at Cur.loc. Caps output at 'kMaxErrors' to prevent 
+    // terminal spam, returning std::nullptr_t for direct use as 'return error("...");'.
     std::nullptr_t error(const std::string& msg) {
         if (errorCount_ < kMaxErrors) {
             logErrorAt(Cur.loc, msg);
@@ -51,10 +44,8 @@ public:
         return nullptr;
     }
 
-    // Panic-mode recovery: advance until we hit a token that's likely to
-    // begin a fresh, well-formed construct. Used after a parse failure to
-    // skip the rest of the broken statement / top-level item and resume
-    // parsing — gives the user *all* their errors in one compile.
+    // Panic-mode recovery: discards tokens until a safe synchronization boundary
+    // (; or }) or a fresh construct start (fn, struct, @) is found.
     void synchronize() {
         while (peek() != TokenKind::Eof) {
             if (peek() == TokenKind::Semicolon) { next(); return; }
@@ -72,18 +63,15 @@ public:
     int errorCount() const { return errorCount_; }
 
     // Stamp a freshly-built AST node with a source position and return it.
-    // Takes a raw pointer (the ASTContext owns the storage); a null pointer
-    // passes through unchanged for the "log error, return nullptr" pattern.
     template <class T>
     static T* at(T* n, SourceLocation loc) {
         if (n) n->loc = loc;
         return n;
     }
 
-    // RAII position-stamper. Construct at the start of a parse method to
-    // snapshot the current token's location; call stamp(node) at every return
-    // point to stamp without rewriting `SourceLocation _l = …; … at(node, _l)`
-    // boilerplate. Stays a no-op for null nodes, matching at().
+    // RAII source location snapshot. Constructs at parse method entry to capture 
+    // the current token's position, and stamps it onto the returned AST node via stamp().
+    // Safely acts as a no-op if the passed node pointer is null.
     class ScopedLoc {
      public:
         explicit ScopedLoc(const Parser& p) : loc_(p.Cur.loc) {}
@@ -107,19 +95,26 @@ public:
     ExprAST* parseFor();
     ExprAST* parseReturn();
     ExprAST* parseBreak();
-    ExprAST* parseStageVarDecl(bool isInput, int binding = -1);
+    ExprAST* parseStageVarDecl(bool isInput, int location = -1);
     ExprAST* parseContinue();
     ExprAST* parseDiscard();
     ExprAST* parseUniform(int binding = -1);
     ExprAST* parseStorageBuffer(int binding = -1);
     ExprAST* parseVarDecl();
 
-    // Parse an assignment / compound-assignment / postfix / expression
-    // statement. With `consumeSemi=true` (default, statement context) the
-    // trailing `;` is required and consumed; with `consumeSemi=false`
-    // (used by parseFor for the increment slot, which is terminated by
-    // `)`) no `;` is expected.
+    // Parses assignments, compound-assignments, or standalone expressions.
+    // Stops before the terminator if consumeSemi is false.
     ExprAST* parseAssignmentOrExprStatement(bool consumeSemi = true);
+
+    // A standalone expression statement that does not begin with an identifier
+    // (grouped expr, literal, prefix ++/--, type constructor call). Parses one
+    // expression and requires a terminating ';'.
+    ExprAST* parseExprStatement();
+
+    // Desugars compound assignments and complex lvalue mutations into binary 
+    // operations, reusing member/index store codegen.
+    ExprAST* makeCompoundAssign(ExprAST* target, TokenKind binOp, ExprAST* rhs,
+                                SourceLocation l);
 
     ExprAST* parseExpression();
     ExprAST* parseUnary();
@@ -135,15 +130,10 @@ private:
     Token Cur;        // the token the parser is currently looking at
     Token Next;       // one-token lookahead (token *after* Cur)
 
-    // Cap on emitted diagnostics; further errors are suppressed with one
-    // "too many errors" notice so a broken file can't drown the terminal.
-    static constexpr int kMaxErrors = 20;
+    static constexpr int kMaxErrors = 20; // Diagnostic suppression ceiling.
     int errorCount_ = 0;
 
-    // Which token kinds are builtin types. Expanded from ../ast/builtin_types.def
-    // (the same source the lexer, sema, and codegen use); this switch,
-    // tokToTypeName, and parsePrimary's constructor case all derive from it, so
-    // adding a type is one row in that .def.
+    // Checks if a token is a builtin type using the centralized X-Macro file.
     static bool isTypeTok(TokenKind tok) {
         switch (tok) {
 #define BTYPE(Tok, _Spelling) case TokenKind::Tok:
@@ -153,9 +143,7 @@ private:
         }
     }
 
-    // get precedence of binary operators (higher binds tighter).
-    // Bitwise levels follow C ordering: | < ^ < & < equality, and the
-    // shifts sit between additive and relational.
+    // Returns operator precedence (higher binds tighter; non-binary returns -1).
     static int precedence(TokenKind tok) {
         switch (tok) {
             case TokenKind::Or:
@@ -190,9 +178,7 @@ private:
         }
     }
 
-    // Map a type-keyword token to its spelling (from builtin_types.def). Void is
-    // the one type keyword not in the .def (return-only, not a value type), so it
-    // gets its own case.
+    // Map a type-keyword token to its spelling (from builtin_types.def) + Void
     static std::string_view tokToTypeName(TokenKind tok) {
         switch (tok) {
 #define BTYPE(Tok, Spelling) case TokenKind::Tok: return Spelling;
@@ -207,13 +193,7 @@ private:
         return tokenKindName(tok);
     }
 
-    // ── Type validation moved to SemanticAnalyzer ─────────────────────────
-    // The parser no longer owns `isUserTypeName` / struct-cycle detection.
-    // It accepts any `Identifier` where a type is expected; SemanticAnalyzer
-    // walks the AST after parsing and reports unknown types / recursive
-    // struct definitions against the *complete* program.
-
-    // parse index expression inside brackets: '[' expression ']' - helper function
+    // Parses an index expression inside brackets: '[' expression ']'
     ExprAST* parseBracketIndex() {
         if (peek() != TokenKind::Lbracket) {
             error("Expected '[' for index expression");
@@ -233,13 +213,15 @@ private:
         return idx;
     }
 
-    // Parse a positive integer literal in `[1, 65536]`. The parser is
-    // positioned at the size token; consumes it and returns the value, or
-    // -1 with an error already emitted. Shared by parseVarDecl and
-    // parseUniform's array suffixes.
+    // Parses a compile-time constant array size in [1, 65536].
+    // Shared by var and uniform declarations; returns parsed size or -1 on error.
     int parseArraySize() {
         if (peek() != TokenKind::Number) {
             error("Expected array size");
+            return -1;
+        }
+        if (!Cur.isInt) {
+            error(fmt::format("Array size must be an integer, got {}", Cur.num));
             return -1;
         }
         if (Cur.num < 1.0 || Cur.num > 65536.0) {
@@ -251,27 +233,34 @@ private:
         next();
         return sz;
     }
+
+    bool parseArraySuffixInto(std::string& typeName) {
+        if (peek() != TokenKind::Lbracket) return true;
+        next();  // '['
+        int sz = parseArraySize();
+        if (sz < 0) return false;
+        if (peek() != TokenKind::Rbracket) {
+            error("Expected ']' in array declaration");
+            return false;
+        }
+        next();  // ']'
+        typeName += "[" + std::to_string(sz) + "]";
+        return true;
+    }
+
 };
 
 // Parse program.
 //
-// Contextual-keyword convention (intentional split):
-//   * Annotation-style attributes — `@entry`, `@stage`, `@compute`,
-//     `@vertex`, `@fragment` — are real lexer tokens because they form a
-//     closed, parser-relevant set.
-//   * Descriptor-set qualifiers — `layout`, `binding`, `std430`,
-//     `workgroup_size` — are matched as identifier *text*. The set is
-//     open-ended (any future qualifier slots in without a lexer change)
-//     and ignoring an unknown qualifier is benign.
-// Don't unify the two without first auditing every `Cur.text == "..."`
-// site below.
+// Contextual Keywords split:
+//  * Attributes (@entry, @stage...) are explicit tokens (closed, fixed set).
+//  * Qualifiers (layout, binding...) are matched as raw identifier text (open-ended set; safely ignores unknown qualifiers).
+// DO NOT unify without auditing literal `Cur.text == "..."` matches below.
 std::vector<ExprAST*> Parser::ParseProgram() {
     std::vector<ExprAST*> program;
     std::unordered_map<ShaderStage, std::string> entryByStage;
     while (peek() != TokenKind::Eof) {
-        // Swallow stray `}` left over from synchronize() inside a broken
-        // function body — without this, the recovery cascade emits a
-        // spurious "Unknown token '}'" between every real diagnostic.
+        // Swallow top-level stray '}' left over from function panic-mode recovery.
         if (peek() == TokenKind::Rbrace) { next(); continue; }
 
         ExprAST* stmt = nullptr;
@@ -282,7 +271,7 @@ std::vector<ExprAST*> Parser::ParseProgram() {
         if (peek() == TokenKind::At) {
             auto attrsOpt = parseFunctionAttrs();
             if (!attrsOpt) {
-                next(); // skip invalid attributes
+                synchronize();
                 continue;
             }
             if (peek() != TokenKind::Fn) {
@@ -299,13 +288,14 @@ std::vector<ExprAST*> Parser::ParseProgram() {
             stmt = fn;
             if (auto *F = llvm::dyn_cast_or_null<FunctionAST>(stmt)) {
                 if (F->Attrs.isEntry) {
-                    ShaderStage st = *F->Attrs.stage;
-                    if (entryByStage.count(st)) {
+                    if (!entryByStage.empty()) {
                         error(fmt::format(
-                            "Multiple entry points for stage. Already: {}, new: {}",
-                            entryByStage[st], F->Proto->Name));
+                            "Only one @entry is allowed per file (already have "
+                            "'{}', now '{}'); compile each shader stage as a "
+                            "separate file",
+                            entryByStage.begin()->second, F->Proto->Name));
                     } else {
-                        entryByStage[st] = F->Proto->Name;
+                        entryByStage[*F->Attrs.stage] = F->Proto->Name;
                     }
                 }
             }
@@ -316,8 +306,12 @@ std::vector<ExprAST*> Parser::ParseProgram() {
         } else if (peek() == TokenKind::Out) {
             stmt = parseStageVarDecl(false);
         } else if (peek() == TokenKind::Identifier && Cur.text == "layout") {
-            // layout(binding=N, ...) uniform/in/out ...
+            // layout(binding=N, ...) uniform/buffer; layout(location=N) in/out.
+            // `binding` names a resource slot (uniform/SSBO); `location` names
+            // an interstage IO slot. We track both and hand the relevant one to
+            // the matching declaration parser below.
             int binding = -1;
+            int location = -1;
             next(); // 'layout'
             if (peek() == TokenKind::Lparen) {
                 next(); // '('
@@ -325,17 +319,31 @@ std::vector<ExprAST*> Parser::ParseProgram() {
                     if (peek() == TokenKind::Identifier && Cur.text == "binding") {
                         next();
                         if (peek() == TokenKind::Assign) { next(); if (peek() == TokenKind::Number) { binding = (int)Cur.num; next(); } }
+                    } else if (peek() == TokenKind::Identifier && Cur.text == "location") {
+                        next();
+                        if (peek() == TokenKind::Assign) { next(); if (peek() == TokenKind::Number) { location = (int)Cur.num; next(); } }
+                    } else if (peek() == TokenKind::Identifier &&
+                               (Cur.text == "std430" || Cur.text == "std140")) {
+                        next();  // memory layout qualifier — valid, no value
                     } else if (peek() == TokenKind::Identifier) {
-                        next(); // skip unknown key
+                        // Reject (rather than silently ignore) an unrecognized
+                        // qualifier so typos like `layout(bindign=0)` surface.
+                        error(fmt::format("Unknown layout qualifier '{}'",
+                                          std::string(Cur.text)));
+                        next();  // consume to make progress; the error fails the parse
                         if (peek() == TokenKind::Assign) { next(); if (peek() == TokenKind::Number) next(); }
                     } else if (peek() == TokenKind::Comma) { next(); }
-                    else { next(); }
+                    else {
+                        error(fmt::format("Unexpected token in layout(...): {}",
+                                          getTokName(peek())));
+                        next();
+                    }
                 }
                 if (peek() == TokenKind::Rparen) next();
             }
             if (peek() == TokenKind::Uniform)      stmt = parseUniform(binding);
-            else if (peek() == TokenKind::In)      stmt = parseStageVarDecl(true, binding);
-            else if (peek() == TokenKind::Out)     stmt = parseStageVarDecl(false, binding);
+            else if (peek() == TokenKind::In)      stmt = parseStageVarDecl(true, location);
+            else if (peek() == TokenKind::Out)     stmt = parseStageVarDecl(false, location);
             else if (peek() == TokenKind::Readonly || peek() == TokenKind::Writeonly || peek() == TokenKind::Buffer)
                                                    stmt = parseStorageBuffer(binding);
             else {
@@ -408,6 +416,8 @@ ExprAST* Parser::parseStruct() {
             return nullptr;
         }
         next(); // field name
+        // Optional array field: `float a[3];`
+        if (!parseArraySuffixInto(fieldType)) return nullptr;
         if (peek() != TokenKind::Semicolon) {
             error("Expected ';' after struct field");
             return nullptr;
@@ -426,14 +436,13 @@ ExprAST* Parser::parseStruct() {
     }
     next(); // ';'
 
-    // Struct registration + recursive-definition checking happen in the
-    // semantic pass, against the whole program — so forward references
-    // and out-of-order declarations both Just Work.
+    // Struct registration and recursive-definition checks are deferred to the 
+    // semantic pass, enabling out-of-order declarations and forward references.
     return Ctx.create<StructDeclExprAST>(structName, std::move(fields));
 }
 
 // Uniform declaration
-ExprAST* Parser::parseUniform(int /*binding*/) {
+ExprAST* Parser::parseUniform(int binding) {
     next(); // 'uniform'
     std::string type;
 
@@ -483,13 +492,13 @@ ExprAST* Parser::parseUniform(int /*binding*/) {
     next(); // ';'
 
     if (isArray) {
-        return Ctx.create<UniformArrayDeclExprAST>(type, name, arraySize);
+        return Ctx.create<UniformArrayDeclExprAST>(type, name, arraySize, binding);
     }
-    return Ctx.create<UniformDeclExprAST>(type, name);
+    return Ctx.create<UniformDeclExprAST>(type, name, binding);
 }
 
-// Storage buffer declaration (compute shaders)
-// Syntax: layout(std430, binding=N) readonly buffer ElemType name[];
+// Parses a storage buffer (SSBO) declaration with an optional access modifier.
+// Syntax: layout(std430, binding=N) [readonly|writeonly] buffer ElemType name[];
 ExprAST* Parser::parseStorageBuffer(int binding) {
     bool isReadOnly = true;
     if (peek() == TokenKind::Readonly) {
@@ -580,15 +589,21 @@ ExprAST* Parser::parseFunction() {
     }
     next(); // '('
     std::vector<std::pair<std::string, std::string>> params;
+    std::vector<uint8_t> dirs;  // 0=in (default), 1=out, 2=inout
     if (peek() != TokenKind::Rparen) {
         while (true) {
             std::string pty;
 
-            // === Optional qualifier: in, out, inout ===
-            if (peek() == TokenKind::In || peek() == TokenKind::Out || peek() == TokenKind::Inout)
-                next(); // consume (semantics reserved for future inout pointer passing)
+            // Parameter direction qualifier. `in` (default) passes by value;
+            // `out`/`inout` pass by reference (the callee writes back to the
+            // caller's lvalue). Recorded per-param for codegen.
+            uint8_t dir = 0;
+            if (peek() == TokenKind::In) { next(); }
+            else if (peek() == TokenKind::Out) { dir = 1; next(); }
+            else if (peek() == TokenKind::Inout) { dir = 2; next(); }
+            dirs.push_back(dir);
 
-            // === PARAM TYPE: built-in or user-defined struct ===
+            // PARAM TYPE: built-in or user-defined struct
             if (isTypeTok(peek())) {
                 pty = std::string(tokToTypeName(peek()));
                 next();          // e.g. vec3
@@ -627,6 +642,7 @@ ExprAST* Parser::parseFunction() {
     if (!body) return nullptr;
 
     auto proto = Ctx.create<PrototypeAST>(name, std::move(params), ret);
+    proto->ArgDir = std::move(dirs);
     return Ctx.create<FunctionAST>(std::move(proto), std::move(body));
 }
 
@@ -688,13 +704,15 @@ std::optional<FunctionAttrs> Parser::parseFunctionAttrs() {
             next(); // 'workgroup_size'
             if (peek() != TokenKind::Lparen) { error("Expected '(' after @workgroup_size"); return std::nullopt; }
             next(); // '('
-            // Range-check each dimension before narrowing — Cur.num is a
-            // double, so a silent `(uint32_t)Cur.num` would wrap on values
-            // outside [0, 2^32). Match the array-size pattern; a workgroup
-            // dimension of 0 is also nonsensical so the lower bound is 1.
-            // Callers always gate on peek() == Number, so the lambda can
-            // assume Cur is a Number.
+            // Each dimension must be an integer literal in [1, 2^32) — reject a
+            // missing/non-integer arg rather than silently defaulting it to 1
+            // (Cur.num is a double, so guard against wrap-around/narrowing too).
             auto parseDim = [&](uint32_t& out, const char* role) -> bool {
+                if (peek() != TokenKind::Number || !Cur.isInt) {
+                    error(fmt::format("@workgroup_size {} must be an integer literal",
+                                      role));
+                    return false;
+                }
                 if (Cur.num < 1.0 || Cur.num > 4294967295.0) {
                     error(fmt::format("@workgroup_size {} must be in [1, 2^32), got {}",
                                       role, (long long)Cur.num));
@@ -705,9 +723,9 @@ std::optional<FunctionAttrs> Parser::parseFunctionAttrs() {
                 return true;
             };
             uint32_t x = 1, y = 1, z = 1;
-            if (peek() == TokenKind::Number && !parseDim(x, "x")) return std::nullopt;
-            if (peek() == TokenKind::Comma)  { next(); if (peek() == TokenKind::Number && !parseDim(y, "y")) return std::nullopt; }
-            if (peek() == TokenKind::Comma)  { next(); if (peek() == TokenKind::Number && !parseDim(z, "z")) return std::nullopt; }
+            if (!parseDim(x, "x")) return std::nullopt;  // x is mandatory
+            if (peek() == TokenKind::Comma)  { next(); if (!parseDim(y, "y")) return std::nullopt; }
+            if (peek() == TokenKind::Comma)  { next(); if (!parseDim(z, "z")) return std::nullopt; }
             if (peek() != TokenKind::Rparen) { error("Expected ')' after @workgroup_size(...)"); return std::nullopt; }
             next(); // ')'
             attrs.workgroupSize = std::array<uint32_t,3>{x, y, z};
@@ -728,10 +746,7 @@ std::optional<FunctionAttrs> Parser::parseFunctionAttrs() {
 
 // Parse statement
 ExprAST* Parser::parseStatement() {
-    // parseStatement is a pure dispatcher: the parser is positioned at the
-    // statement's first token on entry, so a single ScopedLoc here +
-    // loc.stamp() on every return stamps every statement node — the
-    // sub-parsers need no stamping of their own.
+    // Pure dispatcher: stamped centrally via ScopedLoc on return.
     ScopedLoc loc(*this);
     switch (peek()) {
         case TokenKind::Struct:    return loc.stamp(parseStruct());
@@ -746,29 +761,32 @@ ExprAST* Parser::parseStatement() {
         case TokenKind::Lbrace:    return loc.stamp(parseBlockExpr());
         case TokenKind::Const:
             // Don't consume here — parseVarDecl skips an optional `const`
-            // so its own ScopedLoc captures at the `const` token, keeping
-            // the top node *and* synthetic children at the same position.
             return loc.stamp(parseVarDecl());
+        // prefix ++/-- as a standalone statement (e.g. "++x;")
         case TokenKind::Increment:
-        case TokenKind::Decrement: {
-            // prefix ++/-- as a standalone statement (e.g. "++x;")
-            auto expr = parseExpression();
-            if (!expr) return nullptr;
-            if (peek() == TokenKind::Semicolon) next();
-            return loc.stamp(std::move(expr));
-        }
+        case TokenKind::Decrement:
+        // Expression statements that don't start with an identifier: a grouped
+        // expression, a literal, etc. (`(a + b);`, `5;`, `true;`).
+        case TokenKind::Lparen:
+        case TokenKind::Number:
+        case TokenKind::True:
+        case TokenKind::False:
+            return loc.stamp(parseExprStatement());
         case TokenKind::Identifier:
-            // `Foo bar` (two identifiers) is always a declaration; anything
-            // else (`a = …`, `a.b`, `a()`, `a[i]`, `a + b`, `a++;`, …) is
-            // an assignment or expression statement. The one-token
-            // lookahead picks the path; SemanticAnalyzer validates that
-            // `Foo` actually names a struct.
+            // LL(2) resolution: Two consecutive identifiers ('Foo bar') signal a variable
+            // declaration. Anything else is an expression/assignment.
+            // Struct name validity is checked later by SemanticAnalyzer.
             if (peekNext() == TokenKind::Identifier) {
                 return loc.stamp(parseVarDecl());
             }
             return loc.stamp(parseAssignmentOrExprStatement());
         default:
+            // A builtin type token starts either a variable declaration
+            // (`vec3 v ...`) or a constructor-call expression statement
+            // (`vec3(1.0);`), disambiguated by what follows the type name.
             if (isTypeTok(peek())) {
+                if (peekNext() == TokenKind::Lparen)
+                    return loc.stamp(parseExprStatement());
                 return loc.stamp(parseVarDecl());
             }
             error(fmt::format("Unknown token at start of statement {}", getTokName(peek())));
@@ -883,10 +901,8 @@ ExprAST* Parser::parseFor() {
         return nullptr;
     }
     next(); // ';'
-    // Increment. The for-header terminator is `)`, not `;`, so we ask
-    // parseAssignmentOrExprStatement not to consume a `;`. It already
-    // handles `i = i + 1`, `i += 1`, `i++`, `i--`, function calls, and
-    // bare expressions — no duplicate dispatch needed here.
+    // Parses the optional for-loop increment slot. Uses consumeSemi=false 
+    // since the header is terminated by ')' rather than ';'.
     ExprAST* inc = nullptr;
     if (peek() != TokenKind::Rparen) {
         if (peek() == TokenKind::Identifier) {
@@ -932,7 +948,7 @@ ExprAST* Parser::parseReturn() {
 
 // Break statement
 // Stage variable declaration: in/out type name;
-ExprAST* Parser::parseStageVarDecl(bool isInput, int binding) {
+ExprAST* Parser::parseStageVarDecl(bool isInput, int location) {
     next(); // consume 'in' or 'out'
     std::string type;
     if (isTypeTok(peek())) {
@@ -949,9 +965,11 @@ ExprAST* Parser::parseStageVarDecl(bool isInput, int binding) {
     if (peek() != TokenKind::Identifier) { error("Expected name in in/out declaration"); return nullptr; }
     std::string name(Cur.text);
     next();
+    // Optional arrayed interface var: `in vec2 v[2];`
+    if (!parseArraySuffixInto(type)) return nullptr;
     if (peek() != TokenKind::Semicolon) { error("Expected ';' after in/out declaration"); return nullptr; }
     next();
-    return Ctx.create<StageVarDeclAST>(isInput, type, name, binding);
+    return Ctx.create<StageVarDeclAST>(isInput, type, name, location);
 }
 
 // Continue statement
@@ -986,17 +1004,11 @@ ExprAST* Parser::parseBreak() {
 
 // Variable declaration
 ExprAST* Parser::parseVarDecl() {
-    // Position of the declaration's first token — used to stamp the synthetic
-    // default-value / array-initializer nodes built below. The returned
-    // top-level node is stamped by parseStatement's dispatcher. Capture
-    // BEFORE consuming an optional `const` so all nodes built here share
-    // the same source position.
     ScopedLoc loc(*this);
 
-    // Optional `const` qualifier. Currently parsed but not stored on the
-    // AST (codegen treats every declaration uniformly); kept for forward
-    // compat with a future const-correctness pass.
-    if (peek() == TokenKind::Const) next();
+    // Optional `const` qualifier
+    bool isConst = false;
+    if (peek() == TokenKind::Const) { next(); isConst = true; }
 
     // Parse type (builtin or user-defined struct)
     std::string type;
@@ -1045,7 +1057,7 @@ ExprAST* Parser::parseVarDecl() {
 
         if (isArray) {
             // local array without initialization
-            return Ctx.create<ArrayDeclExprAST>(type, name, arraySize, nullptr);
+            return Ctx.create<ArrayDeclExprAST>(type, name, arraySize, nullptr, isConst);
         }
 
         // scalars/vectors/matrices get default value
@@ -1065,9 +1077,6 @@ ExprAST* Parser::parseVarDecl() {
                    type == "mat2x3" || type == "mat2x4" ||
                    type == "mat3x2" || type == "mat3x4" ||
                    type == "mat4x2" || type == "mat4x3") {
-            // tokToTypeName never produces "matNxN" — Mat2 → "mat2", not
-            // "mat2x2" — so listing the square forms here would be dead.
-            // empty constructor for matrices
             std::vector<ExprAST*> args;
             defaultValue = loc.stamp(Ctx.create<CallExprAST>(type, std::move(args)));
         } else {
@@ -1077,7 +1086,7 @@ ExprAST* Parser::parseVarDecl() {
             defaultValue = loc.stamp(Ctx.create<CallExprAST>(type, std::move(args)));
         }
 
-        return loc.stamp(Ctx.create<AssignmentExprAST>(type, name, std::move(defaultValue)));
+        return loc.stamp(Ctx.create<AssignmentExprAST>(type, name, std::move(defaultValue), isConst));
     }
 
     // With initialization: '='
@@ -1126,10 +1135,10 @@ ExprAST* Parser::parseVarDecl() {
             next(); // ';'
 
             auto init = loc.stamp(Ctx.create<ArrayInitExprAST>(std::move(elements)));
-            return loc.stamp(Ctx.create<ArrayDeclExprAST>(type, name, arraySize, std::move(init)));
+            return loc.stamp(Ctx.create<ArrayDeclExprAST>(type, name, arraySize, std::move(init), isConst));
         }
 
-        // 5b) regular variable: type name = expr;
+        // regular variable: type name = expr;
         auto value = parseExpression();
         if (!value) return nullptr;
 
@@ -1139,11 +1148,51 @@ ExprAST* Parser::parseVarDecl() {
         }
         next(); // ';'
 
-        return Ctx.create<AssignmentExprAST>(type, name, std::move(value));
+        return Ctx.create<AssignmentExprAST>(type, name, std::move(value), isConst);
     }
 
     error("Expected '=' or ';' after variable name in declaration");
     return nullptr;
+}
+
+ExprAST* Parser::makeCompoundAssign(ExprAST* target, TokenKind binOp,
+                                    ExprAST* rhs, SourceLocation l) {
+    // simple variable: a OP= b → a = a OP b. A fresh read copy avoids aliasing
+    // the same node as both the assignment target and the binary's operand.
+    if (auto* var = llvm::dyn_cast<VariableExprAST>(target)) {
+        auto* readCopy = at(Ctx.create<VariableExprAST>(var->Name), l);
+        auto* bin = at(Ctx.create<BinaryExprAST>(binOp, readCopy, rhs), l);
+        return at(Ctx.create<AssignmentExprAST>("", var->Name, bin), l);
+    }
+    // struct field / vector swizzle: v.xyz OP= b → v.xyz = v.xyz OP b. `target`
+    // is reused as the read operand; the write reuses its Object/Member.
+    if (auto* mem = llvm::dyn_cast<MemberAccessExprAST>(target)) {
+        auto* bin = at(Ctx.create<BinaryExprAST>(binOp, target, rhs), l);
+        return at(Ctx.create<MemberAssignmentExprAST>(mem->Object, mem->Member,
+                                                      bin),
+                  l);
+    }
+    // array / matrix element: a[i] OP= b, m[i][j] OP= b.
+    if (auto* macc = llvm::dyn_cast<MatrixAccessExprAST>(target)) {
+        auto* bin = at(Ctx.create<BinaryExprAST>(binOp, target, rhs), l);
+        return at(Ctx.create<MatrixAssignmentExprAST>(macc->Object, macc->Index,
+                                                      macc->Index2, bin),
+                  l);
+    }
+    error("Compound/increment assignment requires an assignable lvalue "
+          "(variable, member, or index)");
+    return nullptr;
+}
+
+ExprAST* Parser::parseExprStatement() {
+    auto* e = parseExpression();
+    if (!e) return nullptr;
+    if (peek() != TokenKind::Semicolon) {
+        error("Expected ';' after expression");
+        return nullptr;
+    }
+    next();  // ';'
+    return e;
 }
 
 ExprAST* Parser::parseAssignmentOrExprStatement(bool consumeSemi) {
@@ -1174,20 +1223,12 @@ ExprAST* Parser::parseAssignmentOrExprStatement(bool consumeSemi) {
             case TokenKind::DivAssign:   binOp = TokenKind::Divide;   break;
             default:                     binOp = TokenKind::Percent;  break;  // ModAssign
         }
-        if (auto* var = llvm::dyn_cast<VariableExprAST>(lhs)) {
-            // Desugar `a += b` → `a = a + b`; the synthetic nodes inherit the
-            // lvalue's source position.
-            SourceLocation l = lhs->loc;
-            auto* lhsCopy = at(Ctx.create<VariableExprAST>(var->Name), l);
-            auto* binExpr = at(Ctx.create<BinaryExprAST>(binOp, lhsCopy, rhs), l);
-            return at(Ctx.create<AssignmentExprAST>("", var->Name, binExpr), l);
-        }
-        error("Compound assignment only supported for simple variables");
-        return nullptr;
+        // Desugar `a OP= b` → `a = a OP b` for a variable, member, or index
+        // lvalue (the synthetic nodes inherit the lvalue's source position).
+        return makeCompoundAssign(lhs, binOp, rhs, lhs->loc);
     }
 
     // assignment statement - example : a = 5;
-    // ReSharper disable once CppDFAConstantConditions
     if (peek() == TokenKind::Assign) {
         next(); // '='
         auto rhs = parseExpression();
@@ -1202,8 +1243,6 @@ ExprAST* Parser::parseAssignmentOrExprStatement(bool consumeSemi) {
         }
 
         // matrix assignment: a[i] = col_vec  or  a[i][j] = scalar.
-        // Since lhs is a raw pointer into the arena now, llvm::dyn_cast
-        // is enough — the rewrap-into-the-new-node is just pointer copies.
         if (auto* macc = llvm::dyn_cast<MatrixAccessExprAST>(lhs)) {
             return Ctx.create<MatrixAssignmentExprAST>(
                 macc->Object, macc->Index, macc->Index2, rhs);
@@ -1226,6 +1265,18 @@ ExprAST* Parser::parseAssignmentOrExprStatement(bool consumeSemi) {
     // expression statement - example : a + 1;
     auto* expr = parseBinOpRHS(0, lhs);
     if (!expr) return nullptr;
+    // Trailing ternary, so an identifier-led statement like `c ? f() : g();`
+    // parses (parseBinOpRHS alone stops before '?'). Mirrors parseExpression.
+    if (peek() == TokenKind::Question) {
+        next();  // '?'
+        auto thenE = parseExpression();
+        if (!thenE) return nullptr;
+        if (peek() != TokenKind::Colon) { error("Expected ':' in ternary operator"); return nullptr; }
+        next();  // ':'
+        auto elseE = parseExpression();
+        if (!elseE) return nullptr;
+        expr = Ctx.create<TernaryExprAST>(std::move(expr), std::move(thenE), std::move(elseE));
+    }
     if (consumeSemi) {
         if (peek() != TokenKind::Semicolon) {
             error("Expected ';' after expression");
@@ -1246,7 +1297,7 @@ ExprAST* Parser::parseExpression() {
 
     // Ternary: expr ? thenExpr : elseExpr. Right-associative because the
     // `then` branch recurses through parseExpression — `a ? b : c ? d : e`
-    // parses as `a ? b : (c ? d : e)`, matching C/GLSL.
+    // parses as `a ? b : (c ? d : e)`
     if (peek() == TokenKind::Question) {
         next(); // '?'
         auto thenExpr = parseExpression();
@@ -1267,23 +1318,17 @@ ExprAST* Parser::parseUnary() {
     ScopedLoc loc(*this);
     // prefix ++ / --
     if (peek() == TokenKind::Increment || peek() == TokenKind::Decrement) {
-        bool isInc = (peek() == TokenKind::Increment);
+        bool isDec = (peek() == TokenKind::Decrement);
         next();
         auto operand = parseUnary();
         if (!operand) return nullptr;
-        // Prefix ++/-- correctly returns the *new* value via the desugar
-        // `x = x ± 1`. Postfix ++/-- gets its own dedicated AST node — see
-        // parsePostfixAfterIdent — so it can return the *old* value.
-        if (auto* var = llvm::dyn_cast<VariableExprAST>(operand)) {
-            auto one     = loc.stamp(Ctx.create<NumberExprAST>(1.0));
-            auto varCopy = loc.stamp(Ctx.create<VariableExprAST>(var->Name));
-            TokenKind binOp = isInc ? TokenKind::Plus : TokenKind::Minus;
-            auto binExpr = loc.stamp(Ctx.create<BinaryExprAST>(
-                binOp, std::move(varCopy), std::move(one)));
-            return loc.stamp(Ctx.create<AssignmentExprAST>(
-                "", var->Name, std::move(binExpr)));
+        if (llvm::isa<VariableExprAST>(operand) ||
+            llvm::isa<MemberAccessExprAST>(operand) ||
+            llvm::isa<MatrixAccessExprAST>(operand)) {
+            return loc.stamp(Ctx.create<IncrDecrExprAST>(
+                operand, isDec, /*isPrefix=*/true));
         }
-        error("Prefix ++/-- only supported on simple variables");
+        error("Prefix ++/-- requires a variable, member, or index");
         return nullptr;
     }
 
@@ -1298,15 +1343,13 @@ ExprAST* Parser::parseUnary() {
     return parsePrimary();  // parsePrimary stamps its own result
 }
 
-// parse primary expressions
-// example: identifier, number, (expression), constructor call, member access, swizzle,
+// Parses atomic primary expressions (identifiers, numbers, grouped expressions, booleans).
+// Centralizes builtin type tokens via X-Macros to handle inline constructor calls.
+// Stamps the base node position and immediately chains trailing postfix operators (. or []).
 ExprAST* Parser::parsePrimary() {
     ScopedLoc loc(*this);
     ExprAST* expr = nullptr;
     switch (peek()) {
-        // Identifier and every builtin type keyword dispatch to the same path
-        // (a type keyword here begins a constructor call like `vec3(...)`). The
-        // case list expands builtin_types.def, in sync with isTypeTok.
         case TokenKind::Identifier:
 #define BTYPE(Tok, _Spelling) case TokenKind::Tok:
 #include "../ast/builtin_types.def"
@@ -1339,8 +1382,6 @@ ExprAST* Parser::parsePrimary() {
             return nullptr;
     }
     if (!expr) return nullptr;
-    // Stamp the primary at its first token, then let parsePostfixAfterIdent
-    // stamp any member-access / index nodes it layers on top.
     expr = loc.stamp(std::move(expr));
     expr = parsePostfixAfterIdent(std::move(expr));
     return expr;
@@ -1400,11 +1441,11 @@ ExprAST* Parser::parseIdentifierOrCtorExpr() {
     return Ctx.create<CallExprAST>(name, std::move(args));
 }
 
+// Parses postfix expressions (member access, vector swizzles, array/matrix indexing, 
+// and trailing ++/--). Postfix nodes inherit the source position of their base operand.
+// Note: Postfix ++/-- uses a dedicated node to preserve old-value semantics (e.g., in a[i++]).
 ExprAST* Parser::parsePostfixAfterIdent(ExprAST* base) {
     while (true) {
-        // member access or swizzle - someVec.x or someVec.xyz
-        // Postfix nodes inherit the source position of their `base` operand
-        // (e.g. `a.b` is located at `a`). Capture before the std::move.
         if (peek() == TokenKind::Dot) {
             next();
             if (peek() != TokenKind::Identifier) {
@@ -1440,29 +1481,27 @@ ExprAST* Parser::parsePostfixAfterIdent(ExprAST* base) {
             }
             continue;
         }
-        // postfix ++ / -- — wraps in a dedicated PostfixIncrExprAST so
-        // codegen can return the *old* value. Desugaring into `x = x ± 1`
-        // (as prefix does) would silently give prefix semantics, breaking
-        // `a[i++]`.
         if (peek() == TokenKind::Increment || peek() == TokenKind::Decrement) {
             bool isDec = (peek() == TokenKind::Decrement);
             next();
-            if (!llvm::isa<VariableExprAST>(base)) {
-                error("Postfix ++/-- only supported on simple variables");
-                return nullptr;
-            }
             SourceLocation l = base->loc;
-            base = at(Ctx.create<PostfixIncrExprAST>(std::move(base), isDec),
-                      l);
-            continue;
+            if (llvm::isa<VariableExprAST>(base) ||
+                llvm::isa<MemberAccessExprAST>(base) ||
+                llvm::isa<MatrixAccessExprAST>(base)) {
+                base = at(Ctx.create<IncrDecrExprAST>(std::move(base), isDec),
+                          l);
+                continue;
+            }
+            error("Postfix ++/-- requires a variable, member, or index");
+            return nullptr;
         }
         break;
     }
     return base;
 }
 
-// binary operators - right-hand side
-// exprPrecedence - minimal precedence for this level, lhs - already parsed left-hand side
+// Parses binary operator right-hand sides using Precedence Climbing (Pratt Parsing).
+// 'exprPrecedence' is the minimum binding power allowed for the current subexpression.
 ExprAST* Parser::parseBinOpRHS(int exprPrecedence, ExprAST* lhs) {
     while (true) {
         // get precedence of current
@@ -1489,5 +1528,7 @@ ExprAST* Parser::parseBinOpRHS(int exprPrecedence, ExprAST* lhs) {
 // Entry point
 std::vector<ExprAST*> ParseProgram(ASTContext& ctx, std::string_view source) {
     Parser parser(ctx, source);
-    return parser.ParseProgram();
+    auto program = parser.ParseProgram();
+    if (parser.errorCount() > 0) return {};
+    return program;
 }

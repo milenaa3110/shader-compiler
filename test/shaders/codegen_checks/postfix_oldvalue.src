@@ -1,0 +1,23 @@
+# IR regression: postfix ++ on an array/matrix element (or struct member) must
+# yield the OLD value while storing old+1 back through the lvalue. Earlier these
+# desugared to an assignment node, which (a) returned the NEW value — a silent
+# miscompile of `y = a[i]++` — and (b) placed an assignment where a value was
+# expected. IncrDecrExprAST now carries member/index targets and loads the
+# old value, increments, stores, and returns the old value.
+
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    float a[2];
+    a[0] = 5.0;
+    float y = a[0]++;
+    FragColor = vec4(y, a[0], 0.0, 1.0);
+}
+
+# The element is loaded once (old), incremented, the NEW value is stored back,
+# and the OLD value is what flows into `y`.
+# CHECK: %[[OLD:[a-z0-9._]+]] = load float, ptr %{{[a-z0-9._]+}}
+# CHECK: %[[NEW:[a-z0-9._]+]] = fadd float %[[OLD]], 1.0
+# CHECK: store float %[[NEW]], ptr %{{[a-z0-9._]+}}
+# CHECK: store float %[[OLD]], ptr %y

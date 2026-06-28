@@ -333,6 +333,51 @@ int main() {
     check(analyzeErrors("uniform sampler2D s;\nfn void f() {}") == 0,
           "sampler2D still resolves");
 
+    // ── in/out Location collisions (checkStageVarLocations) ──────────────────
+    check(analyzeErrors("layout(location=2) in vec2 a;\n"
+                        "layout(location=2) in vec2 b;\nfn void f() {}") > 0,
+          "two inputs on the same explicit location collide");
+    check(analyzeErrors("in vec2 a;\n"
+                        "layout(location=0) in vec2 b;\nfn void f() {}") > 0,
+          "auto-assigned input location collides with an explicit one");
+    check(analyzeErrors("layout(location=3) out vec4 a;\n"
+                        "layout(location=3) out vec4 b;\nfn void f() {}") > 0,
+          "two outputs on the same explicit location collide");
+    check(analyzeErrors("layout(location=0) in vec2 a;\n"
+                        "layout(location=0) out vec4 b;\nfn void f() {}") == 0,
+          "an input and an output may share a location (separate spaces)");
+    check(analyzeErrors("layout(location=0) in vec2 a;\n"
+                        "layout(location=1) in vec2 b;\nfn void f() {}") == 0,
+          "distinct explicit input locations are fine");
+
+    // ── Subscript index must be integral (checkIndexType) ────────────────────
+    check(analyzeErrors("fn void f() { float a[3]; a[1.5] = 2.0; }") > 0,
+          "float literal array index is an error");
+    check(analyzeErrors("fn void f() { float a[3]; float i=1.0; a[i]=2.0; }") > 0,
+          "float-typed array index is an error");
+    check(analyzeErrors("fn void f() { mat3 m; m[1.0][0] = 2.0; }") > 0,
+          "float matrix index is an error");
+    check(analyzeErrors("fn void f() { float a[3]; a[1] = 2.0; }") == 0,
+          "int literal array index is allowed");
+    check(analyzeErrors("fn void f() { float a[3]; int i=1; a[i]=2.0; }") == 0,
+          "int-typed array index is allowed");
+
+    // ── Compound assign / ++/-- on member & index lvalues (parser desugar) ───
+    check(analyzeErrors("struct S { float x; };\n"
+                        "fn void f() { S s; s.x += 2.0; }") == 0,
+          "compound assignment on a struct member is allowed");
+    check(analyzeErrors("fn void f() { float a[3]; a[0] += 1.0; a[1] *= 2.0; }") == 0,
+          "compound assignment on an array element is allowed");
+    check(analyzeErrors("fn void f() { mat3 m; m[0][0] += 2.0; }") == 0,
+          "compound assignment on a matrix element is allowed");
+    check(analyzeErrors("struct S { float x; };\n"
+                        "fn void f() { S s; ++s.x; s.x++; }") == 0,
+          "prefix/postfix ++ on a struct member is allowed");
+    check(analyzeErrors("fn void f() { float a[3]; ++a[0]; a[1]--; }") == 0,
+          "prefix/postfix ++/-- on an array element is allowed");
+    check(analyzeErrors("fn void f() { int i = 0; ++i; i--; }") == 0,
+          "++/-- on an int variable stays int (integer-1 desugar)");
+
     if (failures == 0) {
         std::printf("All sema type-stamp tests passed.\n");
         return 0;

@@ -1,8 +1,5 @@
 // ast/ast_context.cpp — out-of-line destructor that walks the node list.
-//
-// Kept out of the header so the .h can fwd-declare ExprAST instead of
-// including the whole ast.h (~700 lines pulled into every TU). Here, we
-// have the full type and the virtual destructor is callable.
+
 
 #include "ast_context.h"
 
@@ -10,15 +7,13 @@
 
 #include "ast.h"
 
-// This TU does not pull bare `llvm::Type` into scope, so aliasing the semantic
-// type keeps the factory bodies readable without re-introducing the collision.
+// Alias 'glsl::Type' to 'Type' since 'llvm::Type' is not in scope here,
+// keeping factory implementations concise without name collisions.
 using glsl::Type;
 
 ASTContext::ASTContext() : saver_(bump_) {
-    // One-shot invariant check: two intern calls on equal content return
-    // pointer-equal results. Catches a refactor that swaps in the wrong
-    // allocator or accidentally returns the input view. Single assert
-    // per ASTContext construction; effectively free.
+    // One-shot invariant check: verifies that identical content yields 
+    // pointer-equal StringRefs, catching allocator/refactoring bugs.
     llvm::StringRef a = intern("vec2");
     llvm::StringRef b = intern(std::string("vec2"));
     assert(a.data() == b.data() &&
@@ -75,7 +70,7 @@ const Type* ASTContext::getDoubleTy() {
     return slot;
 }
 
-// ── Composite types (keyed by their parameters) ─────────────────────────────
+// Composite types (keyed by their parameters)
 const Type* ASTContext::getVectorTy(const Type* elem, unsigned n) {
     assert(elem && elem->isScalar() && "vector element must be a scalar type");
     assert(n >= 2 && n <= 4 && "vector size out of range");
@@ -129,14 +124,9 @@ const Type* ASTContext::getStructTy(llvm::StringRef name) {
 }
 
 ASTContext::~ASTContext() {
-    // Walk in reverse construction order — children were registered
-    // before their parents (the parser builds bottom-up), so this
-    // destructs leaves first. Not strictly necessary (the BumpPtrAllocator
-    // releases all memory after this loop regardless), but cheaper for
-    // any subclass destructor that touches its own members vs children.
+    // Destruct in reverse construction order (leaves first, then parents).
+    // Prevents use-after-free bugs if a parent dtor accesses heap-allocated children.
     for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
         (*it)->~ExprAST();
     }
-    // bump_ destructor releases every byte allocated through it,
-    // including the saver_'s interned strings.
 }

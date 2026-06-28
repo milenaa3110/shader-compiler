@@ -1,0 +1,20 @@
+# IR regression: prefix ++ yields the NEW value and must stay usable in
+# expression position (`y = ++x`). Earlier prefix desugared to an assignment
+# node, which is not a value expression — `int y = ++i` failed to compile. It is
+# now a dedicated value node (shared with postfix, distinguished by isPrefix):
+# load, increment, store back, and return the NEW value.
+
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    int i = 5;
+    int y = ++i;
+    FragColor = vec4(float(y), float(i), 0.0, 1.0);
+}
+
+# CHECK: %[[OLD:[a-z0-9._]+]] = load i32, ptr %i
+# CHECK: %[[NEW:[a-z0-9._]+]] = add i32 %[[OLD]], 1
+# CHECK: store i32 %[[NEW]], ptr %i
+# The NEW value (not the pre-increment one) is what flows into `y`.
+# CHECK: store i32 %[[NEW]], ptr %y

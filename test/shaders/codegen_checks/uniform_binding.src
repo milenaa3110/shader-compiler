@@ -1,0 +1,18 @@
+# IR regression: explicit layout(binding=N) on a sampler/image uniform must
+# survive into the IR as `!shader.binding` metadata on the global. The SPIR-V
+# emitter reads it to decorate that exact descriptor Binding instead of a
+# positional guess (so a shader's binding numbers match what the host bound).
+# Without the bridge the binding is dropped and assignment falls back to
+# declaration order.
+
+layout(binding=5) uniform sampler2D uTex;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    FragColor = texture(uTex, vUV);
+}
+
+# CHECK: @uTex ={{.*}}!shader.binding ![[MD:[0-9]+]]
+# CHECK: ![[MD]] = !{i32 5}

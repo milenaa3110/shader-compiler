@@ -1,18 +1,12 @@
-// ast/type.h — the language's semantic type system.
+// ast/type.h — Canonical type system modelled on llvm::Type.
 //
-// Modelled on llvm::Type: every distinct type has exactly ONE instance, owned
-// and uniqued by the ASTContext (see ASTContext::get*Ty). That makes type
-// equality a pointer comparison — `a == b` instead of string compares — and
-// lets the rest of the frontend pass `const Type*` around cheaply.
+// Every distinct type has a unique instance owned by ASTContext. Type equality
+// is a trivial pointer comparison (a == b). Types are allocated via the
+// context's arena allocator and are trivially destructible.
 //
-// Types are created only through ASTContext (the constructors are private,
-// ASTContext is a friend). They are allocated in the context's bump pool and
-// are trivially destructible (no owning members — the struct name is an
-// interned StringRef), so they need no destructor registration.
-//
-// Step 1 of the type-system bring-up: this header is purely additive. Nothing
-// reads a Type yet; SemanticAnalyzer will start stamping ExprAST nodes with one
-// (Step 2), after which codegen dispatches on it instead of assuming float.
+// Incomplete struct types are completed in-place by the SemanticAnalyzer once
+// the body is parsed. Struct fields require complete types, preventing cycles.
+
 #ifndef AST_TYPE_H
 #define AST_TYPE_H
 
@@ -22,12 +16,11 @@
 #include <cstdint>
 #include <string>
 
-class ASTContext;        // global fwd — the factory; befriended below.
+class ASTContext;         // global fwd — the factory; befriended below.
 class StructDeclExprAST;  // global fwd — a struct type points back at its decl.
 
-// Scoped as `glsl::Type` so it never collides with `llvm::Type`, which the
-// codegen translation units pull in via `using namespace llvm`. Same split
-// Clang uses (clang::Type vs llvm::Type).
+// Isolated in 'glsl' namespace to prevent collision with 'llvm::Type'
+// in codegen units where 'using namespace llvm' is active (cf. clang::Type).
 namespace glsl {
 
 class Type {
@@ -46,8 +39,7 @@ class Type {
     Struct,   // user-defined aggregate, points at its declaration
   };
 
-  // Generated from builtin_types.def (the single source of truth shared with
-  // the lexer, parser, sema, and codegen, so the type lists can't diverge).
+  // Generated from builtin_types.def
   enum class SamplerKind : uint8_t {
 #define BTYPE_SAMPLER(Tok, Spelling, Kind, Dim, Arrayed, IsImage) Kind,
 #include "builtin_types.def"
@@ -55,7 +47,7 @@ class Type {
 
   Kind kind() const { return kind_; }
 
-  // ── Predicates ─────────────────────────────────────────────────────────────
+  // Predicates
   bool isVoid() const { return kind_ == Kind::Void; }
   bool isBool() const { return kind_ == Kind::Bool; }
   bool isInt() const { return kind_ == Kind::Int; }
@@ -83,7 +75,7 @@ class Type {
     return kind_ == Kind::Float || kind_ == Kind::Double;
   }
 
-  // ── Accessors (assert the kind matches) ────────────────────────────────────
+  // Accessors (assert the kind matches)
   const Type* elementType() const {
     assert(kind_ == Kind::Vector && "elementType() on non-vector");
     return elem_;
@@ -117,19 +109,10 @@ class Type {
     assert(kind_ == Kind::Struct && "structName() on non-struct");
     return name_;
   }
-  // The declaration this struct type was built from, or nullptr if the type is
-  // still incomplete (the name has been seen but the body hasn't been processed
-  // yet — the C "incomplete type" state).
-  //
-  // Completeness is what makes forward references and cycles fall out without a
-  // separate graph DFS, *provided the analyzer follows C's rule*: a struct-
-  // typed field requires a COMPLETE element type at the point of the field
-  // declaration. With that rule,
-  //     struct A { B b; };   // error: 'B' is incomplete here
-  //     struct B { A a; };
-  // is diagnosed on A's first field and the A→B→A cycle can never form. (A
-  // shader language has no pointers/references, so there's no legal indirection
-  // that would allow a cycle — C's rule is the complete answer.)
+  /// Points to the layout declaration, or nullptr if incomplete.
+  /// Strict completeness enforcement prevents recursive struct cycles:
+  /// struct A { B b; }; // Error: 'B' is incomplete here.
+  /// Since GLSL lacks pointers/references, indirection cycles are impossible.
   const ::StructDeclExprAST* structDecl() const {
     assert(kind_ == Kind::Struct && "structDecl() on non-struct");
     return decl_;
@@ -137,19 +120,12 @@ class Type {
   bool isIncompleteStruct() const {
     return kind_ == Kind::Struct && decl_ == nullptr;
   }
-  // Complete an incomplete struct type. The ONE sanctioned mutation of a Type
-  // after creation — called once by SemanticAnalyzer when it processes the
-  // struct body. `decl_` is mutable so this works through the `const Type*`
-  // that the rest of the frontend holds (Clang completes RecordDecls the same
-  // lazy way).
-  //
-  // CONTRACT: the caller MUST check isIncompleteStruct() first. A second
-  // definition (`struct Foo {...}; struct Foo {...};`) is a *user error* the
-  // analyzer diagnoses ("redefinition of 'struct Foo'") — it must not reach
-  // here. The assert below is only a backstop against an analyzer bug, never a
-  // substitute for that diagnostic (in a release build it vanishes and the
-  // redefinition would silently win, which is exactly why the check belongs in
-  // the caller).
+
+  /// Completes an incomplete struct type in-place via 'mutable' mutation.
+  /// Used exactly once by SemanticAnalyzer during body processing (cf. clang::RecordDecl).
+  ///
+  /// CONTRACT: Caller must diagnose duplicate definitions via isIncompleteStruct().
+  /// The assert is a development-only backstop against compiler logic bugs.
   void setStructDecl(const ::StructDeclExprAST* decl) const {
     assert(kind_ == Kind::Struct && "setStructDecl() on non-struct");
     assert(decl_ == nullptr && "struct completed twice — caller must check "

@@ -1,0 +1,16 @@
+# Feature: array fields inside a struct. `s.a[i]` lowers to a GEP that walks the
+# struct member, then indexes the array element — two chained getelementptrs.
+
+out vec4 FragColor;
+struct S { float a[3]; };
+
+@entry @stage(fragment)
+fn void main() {
+    S s;
+    s.a[0] = 1.0;
+    FragColor = vec4(s.a[0], 0.0, 0.0, 1.0);
+}
+
+# CHECK: getelementptr inbounds %S, ptr %s, i32 0, i32 0
+# CHECK: getelementptr inbounds [3 x float], ptr %{{.*}}, i32 0, i32 0
+# CHECK: store float 1.0

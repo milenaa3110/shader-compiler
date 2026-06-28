@@ -2,7 +2,7 @@
 #
 # The crucial cases are `a[i++]` (the GEP must use pre-increment `i`) and
 # `j = i++` (j gets the old i, then i is bumped). A naive desugar to prefix
-# `i = i + 1` would give j the *new* i — that's the bug PostfixIncrExprAST
+# `i = i + 1` would give j the *new* i — that's the bug IncrDecrExprAST
 # fixes. Regression for that fix.
 
 fn vec4 shade(vec2 uv) {
