@@ -1,12 +1,4 @@
-// main_lib_spirv.cpp — irgen_spirv: hand-rolled IR -> SPIR-V binary emitter.
-//
-// Pipeline: .src -> lexer/parser -> AST -> LLVM IR codegen -> emit_spirv_from_ir -> .spv
-//
-// No glslang, no llvm-spirv, no LLVM SPIRV target. The IR codegen is shared
-// with irgen_riscv (ast.cpp); only the final lowering step differs.
-//
-// Usage:
-//   ./irgen_spirv <output.spv> < shader_fs.src
+// main_lib_spirv.cpp — irgen_spirv
 
 #include "../../frontend/parser/parser.h"
 #include "../../frontend/ast/ast.h"

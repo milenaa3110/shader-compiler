@@ -3,21 +3,53 @@
 ## Prerequisites
 
 ```bash
-# CMake 3.20+ and a C++20 compiler
+# ── Core build (always required) ──────────────────────────────────────────────
+# CMake 3.20+ and a C++20 compiler (native g++/binutils → objdump, size)
 sudo apt install cmake build-essential
 
-# LLVM 18 toolchain (LLVM 17 is auto-detected as a fallback)
-sudo apt install llvm-18 clang-18 libfmt-dev
+# LLVM 18 toolchain — opt/llc/llvm-link/llvm-size (LLVM 17 auto-detected fallback)
+sudo apt install llvm-18 clang-18
 
-# RISC-V cross-compiler + QEMU user-mode emulation
-sudo apt install gcc-riscv64-linux-gnu g++-riscv64-linux-gnu qemu-user-static
+# Libraries the build links/includes: fmt, the Vulkan loader+headers, SPIR-V headers
+sudo apt install libfmt-dev libvulkan-dev mesa-vulkan-drivers vulkan-tools spirv-headers
 
-# Vulkan SDK (for GPU tests) + SPIR-V headers
-sudo apt install libvulkan-dev glslang-tools mesa-vulkan-drivers spirv-headers
+# Backend-comparison tooling (SPIR-V opcode counter)
+sudo apt install python3
 
-# ffmpeg (for MP4 animation output)
+# ffmpeg (only for MP4 animation output)
 sudo apt install ffmpeg
 ```
+
+`find_package(Vulkan REQUIRED)` and `spirv-headers` are needed even for the
+non-GPU targets (CMake checks them at configure time); `mesa-vulkan-drivers`
+supplies LavaPipe so GPU targets work without a discrete GPU.
+
+### Cross-compiling for RISC-V from an x86 host (QEMU emulation)
+```bash
+sudo apt install gcc-riscv64-linux-gnu g++-riscv64-linux-gnu qemu-user-static
+```
+Provides `riscv64-linux-gnu-g++` (links `.rv` executables against the
+`/usr/riscv64-linux-gnu` sysroot) and `qemu-riscv64-static` (runs them). **Not
+needed when building on RISC-V hardware.**
+
+### Running natively on RISC-V hardware (e.g. Banana Pi F3 / SpacemiT K1)
+The F3's X60 cores are native RISC-V **with RVV 1.0**, so there is **no QEMU and
+no cross-toolchain** — `g++`, `objdump`, and `size` are the native ones, and the
+build and scripts detect `uname -m == riscv64` automatically (`bench_common.sh`
+and `compare_backends.sh` switch to the native disassembler). Install only the
+**Core build** packages above; on Bianbu / Ubuntu-based images the `apt` names
+match, and if the distro lacks `llvm-18` any LLVM ≥ 17 is auto-detected. The K1
+has no production Vulkan GPU driver, so the SPIR-V/Vulkan hosts fall back to
+LavaPipe — the RISC-V CPU paths and `compare-backends` are unaffected and run
+fully native (and `.rv` binaries execute directly, no QEMU).
+
+What each target needs on the F3:
+- **`compare-backends`** (and the `compare_backends` ctest) — LLVM tools +
+  `python3` + binutils (`objdump`/`size`) + Vulkan headers (configure-time only).
+  No GPU, QEMU, or cross-toolchain.
+- **`cpu-scaling`, `all-rv`, native `.rv` runs** — native `g++` + LLVM; no QEMU.
+  Real RVV executes on the X60 cores, so timings are meaningful (unlike QEMU).
+- **`vk-*` / GPU benchmark side** — the Vulkan loader + a driver (LavaPipe here).
 
 ## Build
 
@@ -63,6 +95,13 @@ cmake --build build --target all-vk          # build every Vulkan shader
 **Goal:** Verify the SPIR-V/Vulkan pipeline works end-to-end. Each shader is a
 self-contained fragment shader running on the GPU via LavaPipe (software Vulkan) or
 real hardware.
+
+**Device selection:** the Vulkan hosts pick a **real GPU** (discrete > integrated >
+virtual) and fall back to the CPU renderer (LavaPipe) only when no GPU is present —
+printing a stderr warning when they do, so software runs aren't mistaken for GPU
+numbers. Override with `VK_DEVICE_INDEX=<n>` to force a specific enumerated device
+(e.g. `VK_DEVICE_INDEX=0` to deliberately benchmark LavaPipe again). For meaningful
+GPU benchmarks, confirm `vulkaninfo` lists your GPU and that it isn't being shadowed.
 
 The terrain mesh demo and the texture-sampling demo are build-only targets in CMake —
 their artifacts (`terrain.vert.spv`, `terrain.frag.spv`, `texture_test.frag.spv`) can be
@@ -264,6 +303,83 @@ Five analyses on RISC-V + OpenMP via QEMU:
      has a fixed iteration count and no cross-iteration FP dependencies. Each vector FP
      instruction processes VLEN/32 floats — 4× at VLEN=128, 8× at VLEN=256, 16× at VLEN=512.
 
+### 10. Backend Representation Comparison (SPIR-V vs RISC-V, static)
+```bash
+cmake --build build --target compare-backends   # builds artifacts, prints table
+bash  test/script/compare_backends.sh            # if artifacts already built
+bash  test/script/compare_backends.sh --csv      # machine-readable CSV
+```
+A **static, hardware-independent** structural comparison of the two backends.
+Both descend from the same LLVM IR, so this is the fairest basis: "from identical
+intermediate code, each backend produces this." No QEMU, hardware, or GPU is
+involved — every number is read off the compiled artifacts.
+
+Per shader it reports, side by side:
+- **SPIR-V** `.spv` bytes / words / opcodes — a portable intermediate the GPU
+  driver lowers *further*. (Opcode count comes from `test/script/spv_count.py`,
+  a dependency-free word-stream parser, since spirv-tools isn't in the build.)
+- **RISC-V** `.text` bytes (`llvm-size` on `<name>_rv.o`, the shader module —
+  *not* the `.rv` executable, which statically links the runtime + libc and so
+  isn't comparable) / instruction count / RVV vector-FP ops (`objdump`, same
+  patterns as section 9C).
+
+These sit at different abstraction levels, so size reflects representation
+*density*, not quality, and one SPIR-V opcode (e.g. `OpExtInst` sin) is a library
+call or expanded sequence in RISC-V — **read trends across the set, not per-row
+equality.** A closing section contrasts the parallelization models (two-level
+CPU: OpenMP threads + RVV/SPMD lanes, vs SIMT delegated to the GPU) and prints
+the one shared measurable axis, the compute **workgroup size** (same
+`shader.workgroup_size` → SPIR-V `LocalSize` / RISC-V `cs_dispatch`). Registered
+as the `compare_backends` ctest (skipped if `python3` is absent).
+
+---
+
+## SPMD Packetizer (Route B): across-element SIMD
+
+The packetizer emits a width-4 SIMD variant of a shader stage — `fs_packet`
+(4 fragments per call) or `vs_packet` (4 vertices per call) — that runs multiple
+shader invocations at once, each mapped to a SIMD lane (the ISPC / "SPMD-on-SIMD"
+model). This is **distinct from the intra-invocation auto-vectorization** in the
+RVV section below: that vectorizes `vec4` math *within one* invocation, whereas
+the packetizer vectorizes *across* invocations (4 pixels / 4 vertices at a time).
+
+`irgen_riscv` emits the packet automatically whenever the shader is within the
+supported subset (arithmetic, swizzles, `if`/`else`, loops, `break`/`continue`,
+`discard`, `texture`, and the common math builtins incl. `sin/cos/step/smoothstep`,
+plus `gl_VertexID`/`gl_FragCoord`). Shaders outside the subset **bail** and the
+runtime transparently falls back to the scalar `fs_invoke`/`vs_invoke` path.
+
+**It is selected at run time by `SHADER_PACKET=1`.** The `rv-*` animation/mesh
+targets and the `benchmark-fragment[-quick]`, `benchmark-vertex`, `benchmark-mesh`,
+`benchmark-diverge` and `cpu-scaling` targets now set this automatically, so they
+exercise the packet path (a shader that bails still runs scalar). The compute
+benchmarks (`benchmark-compute*`) are unaffected — compute does not use the
+packetizer. To force the scalar path for an A/B run, unset the variable:
+
+```bash
+SHADER_PACKET=  cmake --build build --target rv-mandelbrot   # scalar
+                cmake --build build --target rv-mandelbrot   # packet (default now)
+```
+
+> ⚠️ **QEMU caveat.** QEMU emulates each RVV instruction with a scalar helper
+> loop, so the packet path can read *slower* under QEMU even though it executes
+> ~4× fewer instructions. Under QEMU the benchmark wall-clock for the CPU side is
+> therefore **not** representative of real RVV hardware — judge the packet path by
+> instruction count, or by the host measurement below. On a real RISC-V board the
+> packet path is the faster one.
+
+**Correctness + host speedup:**
+
+```bash
+# Regression: emit + per-lane numeric equivalence vs the scalar shader, bail
+# behaviour, and a bit-identical scalar-vs-packet render. Part of ctest.
+bash test/script/run_packet_test.sh
+
+# Measure the real SIMD speedup on the host (x86 SSE/AVX), sidestepping QEMU's
+# RVV emulation penalty. ~3.8× at width 4 for a straight-line fragment shader.
+bash test/script/bench_packet.sh
+```
+
 ---
 
 ## RISC-V Vector Extension (RVV)
@@ -319,7 +435,7 @@ OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu ./build/r
 
 | Aspect | Benefit |
 |--------|---------|
-| **Fragment shaders** | Inner color-computation loops (sin/cos/multiply chains) vectorize over multiple pixels per thread |
+| **Fragment shaders** | `vec4`/matrix math within one invocation lowers to RVV. Across-pixel SIMD (4 fragments per call) comes from the SPMD packetizer above (`SHADER_PACKET=1`), not this auto-vectorization |
 | **Game of Life** | The 8-neighbor sum loop across a row can be vectorized with integer gather/add |
 | **Compute blur** | The 5×5 convolution inner loop is a natural SIMD reduction |
 | **Instruction count** | RVV should reduce instruction count in `rv_instr_count()` output by 2–8× for math-heavy shaders |
@@ -345,6 +461,11 @@ echo "Without:"; riscv64-linux-gnu-objdump -d build/riscv/mandelbrot_scalar.o | 
 
 All commands assume the project root and a configured build dir (`cmake -S . -B build`).
 
+> The `rv-*` and `benchmark-fragment/vertex/mesh/diverge` + `cpu-scaling` targets
+> run the CPU side through the **SPMD packet path** (`SHADER_PACKET=1`, set
+> automatically); shaders outside the supported subset fall back to scalar. See
+> *SPMD Packetizer* above — and its QEMU caveat for benchmark wall-clock.
+
 | Command | What it tests |
 |---------|---------------|
 | `cmake --build build --target check` | Compiler correctness (unit tests) |
@@ -362,6 +483,8 @@ All commands assume the project root and a configured build dir (`cmake -S . -B 
 | `cmake --build build --target benchmark-diverge` | Branch divergence + warp boundary effect |
 | `cmake --build build --target benchmark-compute-blur` | Compute shader (blur): GPU vs CPU throughput |
 | `cmake --build build --target cpu-scaling` | OpenMP thread scaling + Amdahl law fit + RVV width |
+| `bash test/script/run_packet_test.sh` | SPMD packetizer: emit + per-lane numeric equivalence + bit-identical render |
+| `bash test/script/bench_packet.sh` | SPMD packet vs scalar speedup, measured on host SIMD (~3.8×) |
 | `bash test/script/run_benchmark_compute.sh --sweep` | Crossover point: small grid CPU wins |
 | `bash test/script/run_benchmark_compute.sh --animate` | Game of Life MP4 (GPU + CPU) |
 | `bash test/script/run_cpu_scaling.sh --rvv-only` | RVV vector width section only |

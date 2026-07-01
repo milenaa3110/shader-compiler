@@ -1,0 +1,21 @@
+# IR regression: a `double` fragment output must be stored at full 64 bits into
+# the separate double output region (not narrowed into an f32 slot), and
+# `fs_output_doubles` must report it. FS outputs are not interpolated, so double
+# is allowed here (unlike a varying `in`).
+
+in vec2 vUV;
+out vec4 FragColor;
+out double depth;
+
+@entry @stage(fragment)
+fn void main() {
+    FragColor = vec4(vUV, 0.0, 1.0);
+    depth = 3.141592653589793;
+}
+
+# CHECK: @fs_output_floats = constant i32 4
+# CHECK: @fs_output_doubles = constant i32 1
+
+# CHECK: define{{.*}}@fs_invoke
+# the double output is written whole to the f64 region (no fptrunc):
+# CHECK: store double

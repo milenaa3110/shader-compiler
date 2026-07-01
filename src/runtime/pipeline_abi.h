@@ -1,34 +1,34 @@
 #pragma once
-// pipeline_abi.h — stable C ABI between the software rasterizer and a compiled
-// VS+FS pipeline module.  The functions and globals below are emitted by irgen
-// into every stage-entry module.
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Called once per vertex by the rasterizer.
-//   vid        — gl_VertexID
-//   iid        — gl_InstanceID  (usually 0)
-//   flat_in    — input array of vs_input_floats floats (per-vertex attributes
-//                in declaration order). May be NULL when vs_input_floats == 0
-//                (e.g. shaders that synthesize geometry from gl_VertexID).
-//   flat_out   — output array of vs_total_floats floats
-//                  [0..3]  = gl_Position (xyzw clip-space)
-//                  [4..]   = varyings in declaration order
-void vs_invoke(int vid, int iid, float* flat_in, float* flat_out);
+// Interpolated varyings (VS out -> FS in) are f32-only due to rasterizer constraints.
+// Vertex inputs and Fragment outputs allow full 64-bit doubles, handled via a
+// separate double buffer region to prevent alignment padding overhead.
+// Inside each region, scalars are packed sequentially in declaration order.
 
-// Called once per fragment by the rasterizer.
-//   fragcoord  — 4 floats: window-space (x, y, z, 1/w)
-//   varyings   — vs_varying_floats floats (perspective-correct interpolated)
-//   flat_out   — fs_output_floats floats (e.g. RGBA FragColor)
-void fs_invoke(float* fragcoord, float* varyings, float* flat_out);
+// Invoked per vertex by the soft-rasterizer to process geometry data.
+//   flat_in    - vs_input_floats elements (32-bit vertex attributes)
+//   flat_in_d  - vs_input_doubles elements (64-bit vertex attributes)
+//   flat_out   - vs_total_floats elements: [0..3] = gl_Position, [4..] = varyings
+void vs_invoke(int vid, int iid, float* flat_in, double* flat_in_d, float* flat_out);
 
-// Layout constants (emitted as LLVM global i32 constants)
-extern int vs_total_floats;    // gl_Position(4) + all out-vars
-extern int vs_varying_floats;  // all out-vars only (interpolated by rasterizer)
-extern int vs_input_floats;    // per-vertex attribute floats (0 for VS-only/gl_VertexID shaders)
-extern int fs_output_floats;   // floats in FS_Output (e.g. 4 for vec4 FragColor)
+// Invoked per fragment by the soft-rasterizer to calculate pixel shading.
+//   fragcoord  - 4 elements layout: window-space (x, y, z, 1/w)
+//   varyings   - vs_varying_floats elements (perspective-correct interpolated, f32-only)
+//   flat_out   - fs_output_floats elements (e.g. RGBA color output)
+//   flat_out_d - fs_output_doubles elements (64-bit fragment outputs)
+void fs_invoke(float* fragcoord, float* varyings, float* flat_out, double* flat_out_d);
+
+// Pipeline layout metrics emitted as global LLVM i32 constants
+extern int vs_total_floats;    // Size of gl_Position(4) + all f32 varyings
+extern int vs_varying_floats;  // Size of f32 varyings only (interpolated region)
+extern int vs_input_floats;    // 32-bit vertex attribute scalar slots
+extern int vs_input_doubles;   // 64-bit vertex attribute scalar slots
+extern int fs_output_floats;   // 32-bit fragment shader output scalar slots
+extern int fs_output_doubles;  // 64-bit fragment shader output scalar slots
 
 #ifdef __cplusplus
 }

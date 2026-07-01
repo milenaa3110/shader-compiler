@@ -15,6 +15,7 @@
 
 #include <vulkan/vulkan.h>
 #include "../../src/common/error_utils_fmt.h"
+#include "vk_pick_device.h"
 
 #include <vector>
 #include <fstream>
@@ -114,7 +115,7 @@ int main(int argc, char** argv) {
     if (!devCount) { logError("No Vulkan device"); return 1; }
     std::vector<VkPhysicalDevice> physDevs(devCount);
     vkEnumeratePhysicalDevices(instance, &devCount, physDevs.data());
-    VkPhysicalDevice pd = physDevs[0];
+    VkPhysicalDevice pd = vkpick::best(physDevs);
 
     VkPhysicalDeviceProperties pdProps;
     vkGetPhysicalDeviceProperties(pd, &pdProps);

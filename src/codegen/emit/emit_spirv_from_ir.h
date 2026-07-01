@@ -1,13 +1,4 @@
 // emit_spirv_from_ir.h — Walk LLVM IR and emit a SPIR-V binary directly.
-//
-// No glslang, no llvm-spirv, no LLVM SPIRV target. Hand-written 1:1 lowering
-// of the IR our codegen produces (ast.cpp + emit_trampolines.h) to SPIR-V
-// opcodes via the official Khronos SPIR-V Headers.
-//
-// Pipeline replaces:  IR -> emit_glsl_from_ir -> glslangValidator -> .spv
-// With:               IR -> emit_spirv_from_ir -> .spv
-//
-// Coverage targets every fragment / vertex / compute shader the project ships.
 
 #pragma once
 
@@ -43,21 +34,19 @@ using llvm::cast;
 using llvm::dyn_cast;
 using llvm::isa;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Word-stream helpers
-// ─────────────────────────────────────────────────────────────────────────────
-inline void appendOp(std::vector<Word>& dst, SpvOp op,
-                     std::initializer_list<Word> ops) {
-  Word wordCount = 1u + (Word)ops.size();
-  dst.push_back((wordCount << 16) | (Word)op);
-  for (Word w : ops) dst.push_back(w);
+inline void appendOp(std::vector<Word>& dst, SpvOp op, std::initializer_list<Word> ops) {
+    Word wordCount = 1u + (Word)ops.size();
+    dst.push_back((wordCount << 16) | (Word)op);
+    for (Word w : ops)
+        dst.push_back(w);
 }
 
-inline void appendOpV(std::vector<Word>& dst, SpvOp op,
-                      const std::vector<Word>& ops) {
-  Word wordCount = 1u + (Word)ops.size();
-  dst.push_back((wordCount << 16) | (Word)op);
-  for (Word w : ops) dst.push_back(w);
+inline void appendOpV(std::vector<Word>& dst, SpvOp op, const std::vector<Word>& ops) {
+    Word wordCount = 1u + (Word)ops.size();
+    dst.push_back((wordCount << 16) | (Word)op);
+    for (Word w : ops)
+        dst.push_back(w);
 }
 
 // Pack a UTF-8 string into 32-bit little-endian words, NUL-terminated, padded.
@@ -92,9 +81,8 @@ inline void appendOpStr(std::vector<Word>& dst, SpvOp op,
   for (Word w : packed) dst.push_back(w);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Translator
-// ─────────────────────────────────────────────────────────────────────────────
+
 class IRToSPIRV {
  public:
   IRToSPIRV(llvm::Module& mod, ShaderStage st) : M(mod), stage(st) {}
@@ -106,7 +94,7 @@ class IRToSPIRV {
   llvm::Module& M;
   ShaderStage stage;
 
-  // ── ID management ─────────────────────────────────────────────────────────
+  // ID management
   Word nextID = 1;
   Word allocID() { return nextID++; }
 
@@ -118,7 +106,7 @@ class IRToSPIRV {
   llvm::DenseMap<uint64_t, Word> fpConstCache;          // (typeID << 32) | bits
   llvm::DenseMap<llvm::Constant*, Word> aggConstCache;  // composite constants
 
-  // ── Sections (output ordering matters in SPIR-V) ─────────────────────────
+  // Sections (output ordering matters in SPIR-V)
   std::vector<Word> capabilities;
   std::vector<Word> extInstImports;
   std::vector<Word> memoryModel;
@@ -130,7 +118,7 @@ class IRToSPIRV {
   std::vector<Word> typesGlobals;  // OpType*, OpConstant*, OpVariable (global)
   std::vector<Word> functions;     // OpFunction ... OpFunctionEnd
 
-  // ── Cached well-known IDs ─────────────────────────────────────────────────
+  // Cached well-known IDs 
   Word glslExtID = 0;
   Word voidTypeID = 0;
   Word boolTypeID = 0;
@@ -138,14 +126,14 @@ class IRToSPIRV {
   Word int32TypeID = 0;
   Word uint32TypeID = 0;
 
-  // ── Push-constant block ──────────────────────────────────────────────────
+  // Push-constant block
   Word pushConstStructTypeID = 0;
   Word pushConstVarID = 0;
   Word pushConstStructPtrID = 0;  // ptr to struct (PushConstant)
   llvm::DenseMap<llvm::GlobalVariable*, uint32_t>
       uniformMemberIdx;  // global -> member index
 
-  // ── SSBO descriptors (compute storage buffers) ───────────────────────────
+  // SSBO descriptors (compute storage buffers)
   struct SSBOInfo {
     Word varID = 0;          // OpVariable id (Uniform storage class)
     Word elemPtrTypeID = 0;  // OpTypePointer Uniform <elem> (for OpAccessChain)
@@ -156,7 +144,7 @@ class IRToSPIRV {
   // know which SSBO they're indexing into.
   llvm::DenseMap<llvm::Value*, llvm::GlobalVariable*> valueToSSBO;
 
-  // ── Combined image-sampler descriptors (sampler2D uniforms) ──────────────
+  // Combined image-sampler descriptors (sampler2D uniforms)
   // sampler2Ds appear in IR as opaque-pointer externals (`@tex = global ptr`)
   // whose loads are consumed by `__tex2d_sample(ptr, float, float)` calls.
   struct SamplerInfo {
@@ -169,7 +157,7 @@ class IRToSPIRV {
   // `__tex2d_sample(%p, …)` calls know which OpVariable to use.
   llvm::DenseMap<llvm::Value*, llvm::GlobalVariable*> valueToSampler;
 
-  // ── Stage IO ─────────────────────────────────────────────────────────────
+  // Stage IO
   // Map function-arg/alloca → input/output OpVariable id.
   llvm::DenseMap<llvm::Argument*, Word> argInputVarID;
   llvm::DenseMap<llvm::AllocaInst*, Word>
@@ -178,29 +166,24 @@ class IRToSPIRV {
       allocaToInputVar;                   // shadow allocas for inputs
   std::vector<Word> entryPointInterface;  // Input/Output var ids
 
-  // ── Trampoline / dead value tracking ──────────────────────────────────────
+  // Trampoline / dead value tracking 
   std::set<llvm::Value*> deadValues;  // values from `_out` chain — skip stores
 
-  // ── The entry function and its info ──────────────────────────────────────
+  // The entry function and its info
   llvm::Function* entryFn = nullptr;
   Word entryFnID = 0;
 
-  // ── CFG / structurization ─────────────────────────────────────────────────
+  // CFG / structurization
   // header BB -> merge BB id (for OpSelectionMerge / OpLoopMerge)
   llvm::DenseMap<llvm::BasicBlock*, llvm::BasicBlock*> selectionMerge;
   llvm::DenseMap<llvm::BasicBlock*, llvm::BasicBlock*> loopMerge;
   llvm::DenseMap<llvm::BasicBlock*, llvm::BasicBlock*> loopContinue;
 
-  // ─────────────────────────────────────────────────────────────────────────
   // Type / constant builders
-  // ─────────────────────────────────────────────────────────────────────────
   Word typeFor(llvm::Type* t);
   Word ptrTypeFor(llvm::Type* pointee, SpvStorageClass sc);
   Word funcTypeFor(llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params);
   Word funcTypeForIDs(Word retID, llvm::ArrayRef<Word> paramIDs);
-  // SPIR-V type id for a function parameter. An opaque pointer (out/inout
-  // by-reference param) carries no pointee type, so recover it from a load/store
-  // through the parameter inside the function body.
   Word paramTypeID(llvm::Argument& A);
   Word structTypeFor(llvm::ArrayRef<Word> memberTypeIDs);
 
@@ -216,9 +199,7 @@ class IRToSPIRV {
 
   Word valueOf(llvm::Value* v);
 
-  // ─────────────────────────────────────────────────────────────────────────
   // Module setup
-  // ─────────────────────────────────────────────────────────────────────────
   void emitCapabilitiesAndModel();
   void analyzeUniforms();  // build push-constant block
   void analyzeSSBOs();     // emit StorageBuffer descriptors
@@ -226,17 +207,13 @@ class IRToSPIRV {
   void emitStageIO();      // gl_FragCoord, vUV, FragColor, ...
   void emitFunction(llvm::Function& F);
 
-  // ─────────────────────────────────────────────────────────────────────────
   // Function emission
-  // ─────────────────────────────────────────────────────────────────────────
   void analyzeCFG(llvm::Function& F);
   void emitBlockBody(llvm::BasicBlock& BB, std::vector<Word>& out);
   void emitInstruction(llvm::Instruction& I, std::vector<Word>& out);
   void emitTerminator(llvm::BasicBlock& BB, std::vector<Word>& out);
 
-  // ─────────────────────────────────────────────────────────────────────────
   // Helpers
-  // ─────────────────────────────────────────────────────────────────────────
   bool isExtInstFunction(llvm::Function* F, GLSLstd450& outOp);
   bool isTrampolineFunction(llvm::Function& F);
   bool isUniformGlobal(llvm::GlobalVariable& G);
@@ -259,17 +236,10 @@ class IRToSPIRV {
   // Splat / vector helpers
   Word splatToVector(Word scalarID, llvm::Type* dstVecType,
                      std::vector<Word>& out);
-
-  // SPIR-V unsigned ops (OpUMod, OpUDiv, OpULessThan, ...) require their
-  // operands and result to use a Signedness=0 integer type. Our type system
-  // emits all i32 as signed; this helper lazily allocates the matching
-  // unsigned i32 so we can OpBitcast through it.
   Word uintTypeFor();
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Implementation
-// ─────────────────────────────────────────────────────────────────────────────
 inline Word IRToSPIRV::typeFor(llvm::Type* t) {
   auto it = typeIDs.find(t);
   if (it != typeIDs.end()) return it->second;
@@ -512,9 +482,7 @@ inline Word IRToSPIRV::valueOf(llvm::Value* v) {
   return id;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Module setup
-// ─────────────────────────────────────────────────────────────────────────────
 inline void IRToSPIRV::emitCapabilitiesAndModel() {
   appendOp(capabilities, SpvOpCapability, {SpvCapabilityShader});
 
@@ -540,9 +508,6 @@ inline bool IRToSPIRV::isUniformGlobal(llvm::GlobalVariable& G) {
 }
 
 inline bool IRToSPIRV::isSSBOGlobal(llvm::GlobalVariable& G) {
-  // Compute-stage storage buffers come through the IR as opaque pointer
-  // externals (e.g. `@src = external global ptr`). The element type is
-  // recovered from the GEP that consumes `load ptr, ptr @G`.
   if (G.isConstant()) return false;
   if (!G.getValueType()->isPointerTy()) return false;
   llvm::StringRef nm = G.getName();
@@ -550,15 +515,11 @@ inline bool IRToSPIRV::isSSBOGlobal(llvm::GlobalVariable& G) {
   if (nm.contains("_varying_floats")) return false;
   if (nm.contains("_total_floats")) return false;
   if (nm.contains("_layout")) return false;
-  // Sampler2D globals are also opaque pointers — distinguish by checking
-  // whether the global is consumed by a __tex2d_sample call.
   if (isSamplerGlobal(G)) return false;
   return true;
 }
 
 inline bool IRToSPIRV::isSamplerGlobal(llvm::GlobalVariable& G) {
-  // sampler2D uniforms appear as `@tex = global ptr null` in the IR.
-  // Walk users: load ptr → call __tex2d_sample(ptr, ...) means it's a sampler.
   if (G.isConstant()) return false;
   if (!G.getValueType()->isPointerTy()) return false;
   for (auto* U : G.users()) {
@@ -599,18 +560,12 @@ inline void IRToSPIRV::analyzeUniforms() {
 
   appendOp(annotations, SpvOpDecorate,
            {pushConstStructTypeID, SpvDecorationBlock});
-  // SPIR-V 1.0: push-constants do NOT go in OpEntryPoint interface list
-  // (only Input/Output do). Newer versions widen this; we target 1.0.
-
-  // std140/std430-ish offsets, using LLVM type sizes (good enough for our flat
-  // float/vec uniforms — all our shaders use only floats/vec2/vec3/vec4 here).
   auto& DL = M.getDataLayout();
   uint32_t offset = 0;
   for (uint32_t i = 0; i < uniforms.size(); ++i) {
     llvm::Type* ty = uniforms[i]->getValueType();
     uint32_t sz = (uint32_t)DL.getTypeAllocSize(ty);
-    // Align to type size for std430 (vec3 aligned to 16, vec2 to 8, float to
-    // 4).
+    // Align to type size for std430 (vec3 aligned to 16, vec2 to 8, float to 4).
     uint32_t align = sz;
     if (auto* vt = dyn_cast<llvm::FixedVectorType>(ty)) {
       unsigned n = vt->getNumElements();
@@ -945,14 +900,6 @@ inline void IRToSPIRV::analyzeCFG(llvm::Function& F) {
   // Walk all basic blocks; classify by name.
   for (auto& BB : F) {
     llvm::StringRef n = BB.getName();
-
-    // Loop header: for.cond / while.cond, ending in a conditional branch to the
-    // body and the exit. A `while` loop has no separate `.inc` latch — its
-    // back-edge comes straight from the body — so the old for.inc-only search
-    // missed it entirely, leaving the header without an OpLoopMerge and the
-    // back-edge invalid. Find the merge by its `.end` name and the continue
-    // latch via dominance (the in-loop predecessor of the header), which is
-    // correct for `for`, `while`, and nested loops alike.
     if (n.starts_with("for.cond") || n.starts_with("while.cond")) {
       auto* term = BB.getTerminator();
       if (auto* br = dyn_cast<llvm::BranchInst>(term)) {

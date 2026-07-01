@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "../../src/common/error_utils_fmt.h"
+#include "vk_pick_device.h"
 
 static constexpr VkFormat COLOR_FMT = VK_FORMAT_R8G8B8A8_UNORM;
 static constexpr VkFormat TEX_FMT = VK_FORMAT_R8G8B8A8_UNORM;
@@ -115,7 +116,7 @@ int main(int argc, char** argv) {
   }
   std::vector<VkPhysicalDevice> pds(devCount);
   vkEnumeratePhysicalDevices(instance, &devCount, pds.data());
-  VkPhysicalDevice pd = pds[0];
+  VkPhysicalDevice pd = vkpick::best(pds);
 
   VkPhysicalDeviceProperties pdp;
   vkGetPhysicalDeviceProperties(pd, &pdp);

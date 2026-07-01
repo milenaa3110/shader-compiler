@@ -889,6 +889,7 @@ int SemanticAnalyzer::run(
   validateTypeRefs(program);
   leaveScope();
   checkStageVarLocations(program);
+  checkStageVarTypes(program);
   return errorCount_;
 }
 
@@ -915,4 +916,49 @@ void SemanticAnalyzer::checkStageVarLocations(
   };
   checkDir(true);
   checkDir(false);
+}
+
+// True if `t` is a double, or an array/struct that transitively contains one.
+bool SemanticAnalyzer::typeContainsDouble(const glsl::Type* t) {
+  if (!t) return false;
+  if (t->isDouble()) return true;
+  if (t->isArray()) return typeContainsDouble(t->arrayElementType());
+  if (t->isStruct() && t->structDecl()) {
+    // Field type names resolve through the same canonicalization as decls; an
+    // incomplete struct (decl == nullptr) contributes nothing here.
+    for (const auto& [fieldTy, _name] : t->structDecl()->Fields)
+      if (typeContainsDouble(resolveTypeName(fieldTy))) return true;
+  }
+  return false;
+}
+
+// Pass 6:
+// Reject double on interpolated stage I/O. The module's stage comes from its
+// entry point; `in`/`out` then map to attribute/varying/fragment-output roles.
+void SemanticAnalyzer::checkStageVarTypes(
+    const std::vector<ExprAST*>& program) { 
+  std::optional<ShaderStage> stage;
+  for (auto* node : program)
+    if (auto* fn = llvm::dyn_cast_or_null<FunctionAST>(node))
+      if (fn->Attrs.isEntry && fn->Attrs.stage) { stage = fn->Attrs.stage; break; }
+  if (!stage) return;  // library/compute module — no interpolated varyings.
+
+  for (auto* node : program) {
+    auto* s = llvm::dyn_cast_or_null<StageVarDeclAST>(node);
+    if (!s) continue;
+    // Interpolated surfaces: a vertex `out` and a fragment `in` are the two
+    // ends of the same perspective-interpolated varying.
+    const bool interpolated =
+        (*stage == ShaderStage::Vertex && !s->isInput) ||
+        (*stage == ShaderStage::Fragment && s->isInput);
+    if (!interpolated) continue;
+    if (typeContainsDouble(resolveTypeName(s->TypeName))) {
+      logErrorAt(s->loc,
+                 fmt::format("'double' is not allowed on interpolated stage {} "
+                             "'{}' (declare it on a vertex input / fragment "
+                             "output, or use a 32-bit type)",
+                             s->isInput ? "input" : "output", s->Name));
+      ++errorCount_;
+    }
+  }
 }

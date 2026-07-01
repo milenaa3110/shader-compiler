@@ -12,60 +12,186 @@
 
 using namespace llvm;
 
-// Returns the number of float scalars in a type (e.g. <4 x float> -> 4).
+// Number of 32-bit (f32) slots a type occupies in the flat ABI: float/int
+// scalars take one, vector components one each, arrays recurse. Doubles live in
+// the separate 64-bit region (see typeDoubleCount) and contribute 0 here.
 static unsigned typeFloatCount(Type* ty) {
+    if (auto* at = dyn_cast<ArrayType>(ty))
+        return at->getNumElements() * typeFloatCount(at->getElementType());
     if (auto* vt = dyn_cast<FixedVectorType>(ty)) return vt->getNumElements();
-    if (ty->isFloatTy() || ty->isDoubleTy() || ty->isIntegerTy()) return 1;
+    if (ty->isFloatTy() || ty->isIntegerTy()) return 1;
     return 0;
 }
 
-// Flatten one struct field into a flat float* array starting at floatOff.
+// Number of 64-bit (f64) slots a type occupies — only doubles, recursing
+// through arrays. Mirrors typeFloatCount for the double region of the ABI.
+static unsigned typeDoubleCount(Type* ty) {
+    if (auto* at = dyn_cast<ArrayType>(ty))
+        return at->getNumElements() * typeDoubleCount(at->getElementType());
+    if (ty->isDoubleTy()) return 1;
+    return 0;
+}
+
+// Coerce a scalar into a single f32 ABI slot. A double is narrowed with
+// FPTrunc (a double->float *bitcast* is illegal — widths differ), while 32-bit
+// scalars (int/uint/float) are stored bit-for-bit via bitcast.
+static Value* scalarToFlat(Value* v, Type* f32Ty) {
+    Type* vt = v->getType();
+    if (vt == f32Ty) return v;
+    if (vt->isDoubleTy()) return Builder->CreateFPTrunc(v, f32Ty, "narrow");
+    return Builder->CreateBitCast(v, f32Ty, "bc");
+}
+
+// Inverse of scalarToFlat: read one f32 ABI slot and produce a `dstTy` scalar.
+// A double is widened back with FPExt; 32-bit scalars are bit-reinterpreted.
+static Value* scalarFromFlat(Type* dstTy, Value* src, Type* f32Ty) {
+    Value* v = Builder->CreateLoad(f32Ty, src, "e");
+    if (dstTy == f32Ty) return v;
+    if (dstTy->isDoubleTy()) return Builder->CreateFPExt(v, dstTy, "widen");
+    return Builder->CreateBitCast(v, dstTy, "bc");
+}
+
+// Recursively flatten the value of type `ty` at `ptr` into the flat f32 array,
+// returning the next free slot. Handles scalars, vectors, and arrays.
+static unsigned flattenValue(Value* ptr, Type* ty, Value* flatPtr, unsigned floatOff,
+                             Type* f32Ty) {
+    if (auto* at = dyn_cast<ArrayType>(ty)) {
+        for (unsigned i = 0; i < at->getNumElements(); ++i) {
+            Value* elemPtr = Builder->CreateInBoundsGEP(
+                at, ptr, { Builder->getInt32(0), Builder->getInt32(i) }, "arr.elt");
+            floatOff = flattenValue(elemPtr, at->getElementType(), flatPtr, floatOff, f32Ty);
+        }
+        return floatOff;
+    }
+    if (auto* vt = dyn_cast<FixedVectorType>(ty)) {
+        Value* vec = Builder->CreateLoad(vt, ptr, "vec");
+        for (unsigned i = 0; i < vt->getNumElements(); ++i) {
+            Value* elem = Builder->CreateExtractElement(vec, Builder->getInt32(i));
+            Value* dst =
+                Builder->CreateInBoundsGEP(f32Ty, flatPtr, Builder->getInt32(floatOff + i), "dst");
+            Builder->CreateStore(scalarToFlat(elem, f32Ty), dst);
+        }
+        return floatOff + vt->getNumElements();
+    }
+    Value* val = Builder->CreateLoad(ty, ptr, "sc");
+    Value* dst = Builder->CreateInBoundsGEP(f32Ty, flatPtr, Builder->getInt32(floatOff), "dst");
+    Builder->CreateStore(scalarToFlat(val, f32Ty), dst);
+    return floatOff + 1;
+}
+
+// Inverse of flattenValue: reconstruct a value of type `ty` from the flat
+// array, advancing floatOff past the slots consumed.
+static Value* loadValue(Type* ty, Value* flatPtr, unsigned& floatOff, Type* f32Ty) {
+    if (auto* at = dyn_cast<ArrayType>(ty)) {
+        Value* arr = UndefValue::get(at);
+        for (unsigned i = 0; i < at->getNumElements(); ++i) {
+            Value* elem = loadValue(at->getElementType(), flatPtr, floatOff, f32Ty);
+            arr = Builder->CreateInsertValue(arr, elem, { i });
+        }
+        return arr;
+    }
+    if (auto* vt = dyn_cast<FixedVectorType>(ty)) {
+        Value* vec = UndefValue::get(vt);
+        for (unsigned i = 0; i < vt->getNumElements(); ++i) {
+            Value* src =
+                Builder->CreateInBoundsGEP(f32Ty, flatPtr, Builder->getInt32(floatOff + i), "src");
+            vec = Builder->CreateInsertElement(vec, scalarFromFlat(vt->getElementType(), src, f32Ty),
+                                               Builder->getInt32(i));
+        }
+        floatOff += vt->getNumElements();
+        return vec;
+    }
+    Value* src = Builder->CreateInBoundsGEP(f32Ty, flatPtr, Builder->getInt32(floatOff), "src");
+    Value* v = scalarFromFlat(ty, src, f32Ty);
+    ++floatOff;
+    return v;
+}
+
+// Two-region flatten: 32-bit leaves go to the f32 region (`fPtr`/`fOff`)
+static void flattenValueSplit(Value* ptr, Type* ty, Value* fPtr, unsigned& fOff, Value* dPtr,
+                              unsigned& dOff, Type* f32Ty, Type* f64Ty) {
+    if (auto* at = dyn_cast<ArrayType>(ty)) {
+        for (unsigned i = 0; i < at->getNumElements(); ++i) {
+            Value* elemPtr = Builder->CreateInBoundsGEP(
+                at, ptr, { Builder->getInt32(0), Builder->getInt32(i) }, "arr.elt");
+            flattenValueSplit(elemPtr, at->getElementType(), fPtr, fOff, dPtr, dOff, f32Ty, f64Ty);
+        }
+        return;
+    }
+    if (auto* vt = dyn_cast<FixedVectorType>(ty)) {
+        Value* vec = Builder->CreateLoad(vt, ptr, "vec");
+        for (unsigned i = 0; i < vt->getNumElements(); ++i) {
+            Value* elem = Builder->CreateExtractElement(vec, Builder->getInt32(i));
+            Value* dst = Builder->CreateInBoundsGEP(f32Ty, fPtr, Builder->getInt32(fOff), "fdst");
+            Builder->CreateStore(scalarToFlat(elem, f32Ty), dst);
+            ++fOff;
+        }
+        return;
+    }
+    Value* val = Builder->CreateLoad(ty, ptr, "sc");
+    if (ty->isDoubleTy()) {
+        Value* dst = Builder->CreateInBoundsGEP(f64Ty, dPtr, Builder->getInt32(dOff), "ddst");
+        Builder->CreateStore(val, dst);  // full 64-bit, no narrowing
+        ++dOff;
+    } else {
+        Value* dst = Builder->CreateInBoundsGEP(f32Ty, fPtr, Builder->getInt32(fOff), "fdst");
+        Builder->CreateStore(scalarToFlat(val, f32Ty), dst);
+        ++fOff;
+    }
+}
+
+// Inverse of flattenValueSplit: reconstruct a `ty` value, pulling doubles from
+// the f64 region and everything else from the f32 region.
+static Value* loadValueSplit(Type* ty, Value* fPtr, unsigned& fOff, Value* dPtr, unsigned& dOff,
+                             Type* f32Ty, Type* f64Ty) {
+    if (auto* at = dyn_cast<ArrayType>(ty)) {
+        Value* arr = UndefValue::get(at);
+        for (unsigned i = 0; i < at->getNumElements(); ++i) {
+            Value* elem = loadValueSplit(at->getElementType(), fPtr, fOff, dPtr, dOff, f32Ty, f64Ty);
+            arr = Builder->CreateInsertValue(arr, elem, { i });
+        }
+        return arr;
+    }
+    if (auto* vt = dyn_cast<FixedVectorType>(ty)) {
+        Value* vec = UndefValue::get(vt);
+        for (unsigned i = 0; i < vt->getNumElements(); ++i) {
+            Value* src = Builder->CreateInBoundsGEP(f32Ty, fPtr, Builder->getInt32(fOff), "fsrc");
+            vec = Builder->CreateInsertElement(
+                vec, scalarFromFlat(vt->getElementType(), src, f32Ty), Builder->getInt32(i));
+            ++fOff;
+        }
+        return vec;
+    }
+    if (ty->isDoubleTy()) {
+        Value* src = Builder->CreateInBoundsGEP(f64Ty, dPtr, Builder->getInt32(dOff), "dsrc");
+        Value* v = Builder->CreateLoad(f64Ty, src, "dv");  // full 64-bit
+        ++dOff;
+        return v;
+    }
+    Value* src = Builder->CreateInBoundsGEP(f32Ty, fPtr, Builder->getInt32(fOff), "fsrc");
+    Value* v = scalarFromFlat(ty, src, f32Ty);
+    ++fOff;
+    return v;
+}
+
+// Flatten one struct field into the flat f32 array starting at floatOff.
 static unsigned flattenField(Value* srcPtr, Type* fieldTy, unsigned fieldIdx, StructType* stTy,
                              Value* flatPtr, unsigned floatOff, Type* f32Ty) {
     Value* fieldPtr = Builder->CreateStructGEP(stTy, srcPtr, fieldIdx, "fld");
-    unsigned nElems = typeFloatCount(fieldTy);
-    if (auto* vt = dyn_cast<FixedVectorType>(fieldTy)) {
-        Value* vec = Builder->CreateLoad(vt, fieldPtr, "vec");
-        for (unsigned i = 0; i < nElems; ++i) {
-            Value* elem = Builder->CreateExtractElement(vec, Builder->getInt32(i));
-            if (elem->getType() != f32Ty) elem = Builder->CreateBitCast(elem, f32Ty, "bc");
-            Value* dst =
-                Builder->CreateInBoundsGEP(f32Ty, flatPtr, Builder->getInt32(floatOff + i), "dst");
-            Builder->CreateStore(elem, dst);
-        }
-    } else {
-        Value* val = Builder->CreateLoad(fieldTy, fieldPtr, "sc");
-        if (val->getType() != f32Ty) val = Builder->CreateBitCast(val, f32Ty, "bc");
-        Value* dst = Builder->CreateInBoundsGEP(f32Ty, flatPtr, Builder->getInt32(floatOff), "dst");
-        Builder->CreateStore(val, dst);
-    }
-    return floatOff + nElems;
+    return flattenValue(fieldPtr, fieldTy, flatPtr, floatOff, f32Ty);
 }
 
-// Load one struct field from a flat float* array (inverse of flattenField).
+// Load one struct field from the flat f32 array (inverse of flattenField).
 static Value* loadFieldFromFlat(Type* fieldTy, Value* flatPtr, unsigned floatOff, Type* f32Ty) {
-    unsigned nElems = typeFloatCount(fieldTy);
-    if (auto* vt = dyn_cast<FixedVectorType>(fieldTy)) {
-        Value* vec = UndefValue::get(vt);
-        for (unsigned i = 0; i < nElems; ++i) {
-            Value* src =
-                Builder->CreateInBoundsGEP(f32Ty, flatPtr, Builder->getInt32(floatOff + i), "src");
-            Value* elem = Builder->CreateLoad(f32Ty, src, "e");
-            Type* elemTy = vt->getElementType();
-            if (elem->getType() != elemTy) elem = Builder->CreateBitCast(elem, elemTy, "bc");
-            vec = Builder->CreateInsertElement(vec, elem, Builder->getInt32(i));
-        }
-        return vec;
-    } else {
-        Value* src = Builder->CreateInBoundsGEP(f32Ty, flatPtr, Builder->getInt32(floatOff), "src");
-        return Builder->CreateLoad(fieldTy, src, "sv");
-    }
+    unsigned off = floatOff;
+    return loadValue(fieldTy, flatPtr, off, f32Ty);
 }
 
 // Emits pipeline invocation trampolines (vs_invoke, fs_invoke, cs_invoke/dispatch)
 // and exposes layout sizing data via global metadata constants for the host runtime
 static void emitPipelineTrampolines() {
     auto* f32Ty = Type::getFloatTy(*Context);
+    auto* f64Ty = Type::getDoubleTy(*Context);
     auto* i32Ty = Type::getInt32Ty(*Context);
     auto* ptrTy = PointerType::getUnqual(*Context);
     auto* voidTy = Type::getVoidTy(*Context);
@@ -92,15 +218,22 @@ static void emitPipelineTrampolines() {
             FunctionType* vsFT = vsFunc->getFunctionType();
             unsigned numVSParams = vsFT->getNumParams();
 
-            unsigned inputFloats = 0;
-            for (unsigned i = 2; i + 1 < numVSParams; ++i)
-                inputFloats += typeFloatCount(vsFT->getParamType(i));
+            unsigned inputFloats = 0, inputDoubles = 0;
+            for (unsigned i = 2; i + 1 < numVSParams; ++i) {
+                inputFloats  += typeFloatCount(vsFT->getParamType(i));
+                inputDoubles += typeDoubleCount(vsFT->getParamType(i));
+            }
 
             new GlobalVariable(*TheModule, i32Ty, true, GlobalValue::ExternalLinkage,
                                ConstantInt::get(i32Ty, inputFloats), "vs_input_floats");
+            new GlobalVariable(*TheModule, i32Ty, true, GlobalValue::ExternalLinkage,
+                               ConstantInt::get(i32Ty, inputDoubles), "vs_input_doubles");
 
-            // Create vs_invoke(i32 vid, i32 iid, float* flat_in, float* flat_out)
-            auto* invokeTy = FunctionType::get(voidTy, { i32Ty, i32Ty, ptrTy, ptrTy }, false);
+            // vs_invoke(i32 vid, i32 iid, ptr flat_in, ptr flat_in_d, ptr flat_out):
+            // attributes arrive split across a 32-bit region (flat_in) and a
+            // 64-bit double region (flat_in_d); outputs are double-free varyings.
+            auto* invokeTy =
+                FunctionType::get(voidTy, { i32Ty, i32Ty, ptrTy, ptrTy, ptrTy }, false);
             auto* invoke =
                 Function::Create(invokeTy, Function::ExternalLinkage, "vs_invoke", TheModule.get());
             auto args = invoke->arg_begin();
@@ -110,6 +243,8 @@ static void emitPipelineTrampolines() {
             iid->setName("iid");
             Value* flatIn = &*args++;
             flatIn->setName("flat_in");
+            Value* flatInD = &*args++;
+            flatInD->setName("flat_in_d");
             Value* flatOut = &*args;
             flatOut->setName("flat_out");
 
@@ -119,11 +254,11 @@ static void emitPipelineTrampolines() {
             Value* outStruct = Builder->CreateAlloca(outTy, nullptr, "vs_out");
 
             std::vector<Value*> callArgs = { vid, iid };
-            unsigned inOff = 0;
+            unsigned inOffF = 0, inOffD = 0;
             for (unsigned i = 2; i + 1 < numVSParams; ++i) {
                 Type* paramTy = vsFT->getParamType(i);
-                callArgs.push_back(loadFieldFromFlat(paramTy, flatIn, inOff, f32Ty));
-                inOff += typeFloatCount(paramTy);
+                callArgs.push_back(
+                    loadValueSplit(paramTy, flatIn, inOffF, flatInD, inOffD, f32Ty, f64Ty));
             }
             callArgs.push_back(outStruct);
             Builder->CreateCall(vsFunc, callArgs);
@@ -140,17 +275,24 @@ static void emitPipelineTrampolines() {
     if (fsFunc) {
         StructType* outTy = StructType::getTypeByName(*Context, "FS_Output");
         if (outTy) {
-            unsigned outputFloats = 0;
-            for (unsigned i = 0; i < outTy->getNumElements(); ++i)
-                outputFloats += typeFloatCount(outTy->getElementType(i));
+            unsigned outputFloats = 0, outputDoubles = 0;
+            for (unsigned i = 0; i < outTy->getNumElements(); ++i) {
+                outputFloats  += typeFloatCount(outTy->getElementType(i));
+                outputDoubles += typeDoubleCount(outTy->getElementType(i));
+            }
 
             new GlobalVariable(*TheModule, i32Ty, true, GlobalValue::ExternalLinkage,
                                ConstantInt::get(i32Ty, outputFloats), "fs_output_floats");
+            new GlobalVariable(*TheModule, i32Ty, true, GlobalValue::ExternalLinkage,
+                               ConstantInt::get(i32Ty, outputDoubles), "fs_output_doubles");
 
             FunctionType* fsFT = fsFunc->getFunctionType();
             unsigned numFSParams = fsFT->getNumParams();
 
-            auto* invokeTy = FunctionType::get(voidTy, { ptrTy, ptrTy, ptrTy }, false);
+            // fs_invoke(ptr fragcoord, ptr varyings, ptr flat_out, ptr flat_out_d):
+            // varyings are double-free (interpolated), outputs split across a
+            // 32-bit region (flat_out) and a 64-bit double region (flat_out_d).
+            auto* invokeTy = FunctionType::get(voidTy, { ptrTy, ptrTy, ptrTy, ptrTy }, false);
             auto* invoke =
                 Function::Create(invokeTy, Function::ExternalLinkage, "fs_invoke", TheModule.get());
             auto args2 = invoke->arg_begin();
@@ -158,8 +300,10 @@ static void emitPipelineTrampolines() {
             fc->setName("fragcoord");
             Value* varys = &*args2++;
             varys->setName("varyings");
-            Value* flat = &*args2;
+            Value* flat = &*args2++;
             flat->setName("flat_out");
+            Value* flatD = &*args2;
+            flatD->setName("flat_out_d");
 
             auto* BB2 = BasicBlock::Create(*Context, "entry", invoke);
             Builder->SetInsertPoint(BB2);
@@ -179,9 +323,12 @@ static void emitPipelineTrampolines() {
             callArgs.push_back(outStruct);
             Builder->CreateCall(fsFunc, callArgs);
 
-            unsigned off = 0;
-            for (unsigned i = 0; i < outTy->getNumElements(); ++i)
-                off = flattenField(outStruct, outTy->getElementType(i), i, outTy, flat, off, f32Ty);
+            unsigned offF = 0, offD = 0;
+            for (unsigned i = 0; i < outTy->getNumElements(); ++i) {
+                Value* fieldPtr = Builder->CreateStructGEP(outTy, outStruct, i, "fld");
+                flattenValueSplit(fieldPtr, outTy->getElementType(i), flat, offF, flatD, offD, f32Ty,
+                                  f64Ty);
+            }
             Builder->CreateRetVoid();
         }
     }

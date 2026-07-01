@@ -8,6 +8,7 @@
 
 #include <vulkan/vulkan.h>
 #include "../../src/common/error_utils_fmt.h"
+#include "vk_pick_device.h"
 
 #include <vector>
 #include <fstream>
@@ -85,13 +86,13 @@ int main(int argc, char** argv) {
     VkInstance instance;
     VK(vkCreateInstance(&instCI, nullptr, &instance));
 
-    // ── Physical device (pick first — LavaPipe on headless) ───────────────────
+    // ── Physical device (prefer a real GPU; LavaPipe only as fallback) ────────
     uint32_t devCount = 0;
     vkEnumeratePhysicalDevices(instance, &devCount, nullptr);
     if (devCount == 0) { logError("No Vulkan device found"); return 1; }
     std::vector<VkPhysicalDevice> physDevs(devCount);
     vkEnumeratePhysicalDevices(instance, &devCount, physDevs.data());
-    VkPhysicalDevice physDev = physDevs[0];
+    VkPhysicalDevice physDev = vkpick::best(physDevs);
     {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(physDev, &props);

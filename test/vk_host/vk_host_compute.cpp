@@ -12,6 +12,7 @@
 
 #include <vulkan/vulkan.h>
 #include "../../src/common/error_utils_fmt.h"
+#include "vk_pick_device.h"
 
 #include <vector>
 #include <iostream>
@@ -67,7 +68,7 @@ int main(int argc, char** argv) {
     vkEnumeratePhysicalDevices(instance, &devCount, nullptr);
     std::vector<VkPhysicalDevice> physDevs(devCount);
     vkEnumeratePhysicalDevices(instance, &devCount, physDevs.data());
-    VkPhysicalDevice physDev = physDevs[0];
+    VkPhysicalDevice physDev = vkpick::best(physDevs);
     {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(physDev, &p);

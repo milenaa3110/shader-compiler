@@ -50,7 +50,17 @@ class SemanticAnalyzer {
   // Replicate backend input/output slot allocation and detect location aliasing.
   void checkStageVarLocations(const std::vector<ExprAST*>& program);
 
-  // Visit helpers — recursive descent over a single subtree. 
+  // Reject `double` (incl. inside arrays/structs) on interpolated stage I/O —
+  // VS outputs and FS inputs are perspective-interpolated as f32 lanes by the
+  // rasterizer, so a 64-bit double cannot ride that path (cf. GLSL, where a
+  // double varying must be `flat`). Double remains legal on the non-interpolated
+  // surfaces: VS inputs (vertex attributes) and FS outputs.
+  void checkStageVarTypes(const std::vector<ExprAST*>& program);
+
+  // True if `t` is a double, or an array/struct that transitively contains one.
+  bool typeContainsDouble(const glsl::Type* t);
+
+  // Visit helpers — recursive descent over a single subtree.
   // Non-const: it stamps each node's semantic type (setType) as it goes.
   void visit(ExprAST* node);
 

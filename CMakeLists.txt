@@ -150,6 +150,28 @@ else()
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Route B Phase 1: SPMD `fs_packet` packetizer regression (emit + numeric
+# equivalence + bail-to-scalar). Runs the already-built irgen_riscv; the numeric
+# step needs clang-18 and is skipped (not failed) if absent.
+# ─────────────────────────────────────────────────────────────────────────────
+add_test(NAME packet_test
+         COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_packet_test.sh)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Static SPIR-V vs RISC-V backend comparison (test/script/compare_backends.sh).
+# The test drives the `compare-backends` target, which first builds the .spv and
+# _rv.o artifacts it reads, then prints the per-shader table — so it is
+# self-contained. Needs python3 (the SPIR-V opcode counter); skipped if absent.
+# ─────────────────────────────────────────────────────────────────────────────
+find_program(PYTHON3_EXE NAMES python3)
+if(PYTHON3_EXE)
+    add_test(NAME compare_backends
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target compare-backends)
+else()
+    message(STATUS "python3 not found — skipping compare_backends test")
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Parser fuzzer (libFuzzer). Opt-in: requires clang with -fsanitize=fuzzer.
 # Built only when CMAKE_CXX_COMPILER is clang and ENABLE_FUZZER is ON.
 #   cmake -B build -DENABLE_FUZZER=ON -DCMAKE_CXX_COMPILER=clang++-18
@@ -393,7 +415,7 @@ foreach(anim ${ANIMATIONS_PROC})
         VERBATIM)
     if(CROSS_CXX_BIN)
         add_custom_target(rv-${anim}
-            COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}"
+            COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}" "SHADER_PACKET=1"
                     ${RISCV_SIM} ${RISCV_DIR}/${anim}.rv
             DEPENDS ${anim}.rv
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -559,7 +581,7 @@ function(rv_mesh_target target_name spec_name spec_value)
         # (vk-mesh* use nframes=300). Same length keeps cross-backend
         # comparison meaningful.
         add_custom_target(rv-${target_name}
-            COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}"
+            COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}" "SHADER_PACKET=1"
                     ${RISCV_SIM} ${_bin} ${target_name} 300 ${spec_value}
             DEPENDS ${_bin}
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -675,13 +697,15 @@ add_custom_target(check
     USES_TERMINAL)
 
 add_custom_target(benchmark-fragment
-    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_fragment.sh
+    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+            bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_fragment.sh
     DEPENDS irgen_riscv spirv_vulkan_host quad.vert.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
 
 add_custom_target(benchmark-fragment-quick
-    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_fragment.sh --quick
+    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+            bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_fragment.sh --quick
     DEPENDS irgen_riscv spirv_vulkan_host quad.vert.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
@@ -699,25 +723,51 @@ add_custom_target(benchmark-compute-blur
     USES_TERMINAL)
 
 add_custom_target(benchmark-vertex
-    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_vertex.sh
+    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+            bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_vertex.sh
     DEPENDS spirv_vulkan_host terrain.vert.spv terrain.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
 
 add_custom_target(benchmark-mesh
-    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_mesh.sh
+    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+            bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_mesh.sh
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
 
 add_custom_target(benchmark-diverge
-    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_diverge.sh
+    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+            bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_diverge.sh
     DEPENDS spirv_vulkan_host irgen_riscv quad.vert.spv mandelbrot.frag.spv diverge.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
 
 add_custom_target(cpu-scaling
-    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_cpu_scaling.sh
+    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+            bash ${CMAKE_SOURCE_DIR}/test/script/run_cpu_scaling.sh
     DEPENDS irgen_riscv life_cs_rv.o blur_cs_rv.o
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    USES_TERMINAL)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# `compare-backends`: static, hardware-independent structural comparison of the
+# SPIR-V and RISC-V backends (both descend from the same LLVM IR). Builds every
+# .spv and _rv.o the script reads, then prints the per-shader table. No QEMU,
+# hardware, or GPU involved — see test/script/compare_backends.sh.
+# ─────────────────────────────────────────────────────────────────────────────
+set(COMPARE_DEPS irgen_riscv irgen_spirv)
+foreach(anim ${ANIMATIONS_PROC})
+    list(APPEND COMPARE_DEPS ${anim}.frag.spv ${anim}_rv.o)
+endforeach()
+foreach(cs life blur)
+    list(APPEND COMPARE_DEPS ${cs}.comp.spv ${cs}_cs_rv.o)
+endforeach()
+list(APPEND COMPARE_DEPS
+     mesh.vert.spv mesh.frag.spv mesh_rv.o
+     terrain.vert.spv terrain.frag.spv terrain_rv.o)
+add_custom_target(compare-backends
+    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/compare_backends.sh
+    DEPENDS ${COMPARE_DEPS}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)

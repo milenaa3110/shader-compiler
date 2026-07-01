@@ -1,17 +1,14 @@
-// tex_inline.h — shared declarations for the bilinear sampler module that
-// gets bitcode-linked into compiled shaders on the RISC-V side.
-//
-// The CPU runtime (pipeline_runtime.cpp) owns the storage of `g_tex`; the
-// inline sampler (tex_inline.cpp) reads it. Both translation units include
-// this header to agree on layout.
+// tex_inline.h — Shared declarations for the inline bilinear sampler module.
+// Links directly into compiled IR shader modules on the RISC-V target backend.
+
 #pragma once
 
+// Memory layout descriptor for texture buffer allocation metadata
 struct TexSlot {
-    const float* data;
-    int          w;
-    int          h;
+    const float* data;  // Raw pointer to flat floating-point RGBA components
+    int          w;     // Physical allocation width in pixels
+    int          h;     // Physical allocation height in pixels
 };
 
-// Defined in pipeline_runtime.cpp. Eight slots, accessed by `bind_texture`
-// at runtime; the inlined `__tex_lookup` reads from slot 0 by default.
+// Texture slot registers defined in pipeline_runtime.cpp and resolved at JIT link time
 extern TexSlot g_tex[8];

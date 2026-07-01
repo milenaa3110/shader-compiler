@@ -378,6 +378,32 @@ int main() {
     check(analyzeErrors("fn void f() { int i = 0; ++i; i--; }") == 0,
           "++/-- on an int variable stays int (integer-1 desugar)");
 
+    // ── double on stage I/O: rejected only on interpolated varyings ──────────
+    // VS outputs and FS inputs are perspective-interpolated as f32 lanes, so a
+    // 64-bit double cannot ride that path; VS inputs and FS outputs are fine.
+    check(analyzeErrors("out double v;\n"
+                        "@entry @stage(vertex) fn void main() {}") > 0,
+          "double VS output (interpolated varying) is rejected");
+    check(analyzeErrors("in double v;\n"
+                        "@entry @stage(fragment) fn void main() {}") > 0,
+          "double FS input (interpolated varying) is rejected");
+    check(analyzeErrors("out double v[2];\n"
+                        "@entry @stage(vertex) fn void main() {}") > 0,
+          "double array VS output is rejected (recurses through arrays)");
+    check(analyzeErrors("struct S { double d; };\n"
+                        "out S s;\n"
+                        "@entry @stage(vertex) fn void main() {}") > 0,
+          "struct containing a double as a VS output is rejected");
+    check(analyzeErrors("in double v;\n"
+                        "@entry @stage(vertex) fn void main() {}") == 0,
+          "double VS input (vertex attribute) is allowed");
+    check(analyzeErrors("out double v;\n"
+                        "@entry @stage(fragment) fn void main() {}") == 0,
+          "double FS output is allowed");
+    check(analyzeErrors("out float v;\n"
+                        "@entry @stage(vertex) fn void main() {}") == 0,
+          "float VS output (interpolated varying) is allowed");
+
     if (failures == 0) {
         std::printf("All sema type-stamp tests passed.\n");
         return 0;

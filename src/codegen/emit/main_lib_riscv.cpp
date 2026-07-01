@@ -17,6 +17,7 @@
 #include <string>
 
 #include "emit_trampolines.h"
+#include "emit_fs_packet.h"
 
 using namespace llvm;
 
@@ -61,6 +62,21 @@ int main(int argc, char* argv[]) {
         if (F.hasMetadata("shader.stage")) { hasStageEntry = true; break; }
     if (hasStageEntry)
         emitPipelineTrampolines();
+
+    // Route B: emit a width-W SPMD `fs_packet` variant of the fragment shader
+    // when it is within the packetizer's supported subset. Always attempted (the
+    // runtime calls it via a weak symbol when SHADER_PACKET=1, else falls back to
+    // the scalar fs_invoke); the scalar path is untouched whether or not this
+    // fires. SHADER_EMIT_PACKET=verbose just makes the outcome chatty for tests.
+    if (hasStageEntry) {
+        fspacket::PacketEmitter pe;
+        bool ok = pe.run(nodes);
+        if (std::getenv("SHADER_EMIT_PACKET"))
+            std::cout << (ok ? "Emitted packet (SPMD width "
+                             : "packet: bailed (")
+                      << (ok ? std::to_string(fspacket::kW) + ")" : "unsupported constructs)")
+                      << "\n";
+    }
 
     // Stamp RISC-V target triple + data layout
     TheModule->setTargetTriple("riscv64-unknown-linux-gnu");

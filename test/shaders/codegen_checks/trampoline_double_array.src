@@ -1,0 +1,35 @@
+# IR regression: the flat-array pipeline trampoline ABI must (1) flatten
+# array-typed stage I/O element-by-element, and (2) carry `double` at full 64
+# bits on the non-interpolated surfaces via the separate double region.
+#
+# This VS exercises both at once:
+#   - `in double hp`  — a 64-bit vertex attribute. It must be read from the
+#     double input region with a plain `load double` (no fptrunc/fpext), and
+#     `vs_input_doubles` must report 1.
+#   - `out float arr[3]` — a float array varying. It must flatten element-wise
+#     into the f32 region (typeFloatCount used to return 0 for arrays, silently
+#     dropping them).
+#
+# (Interpolated double varyings are rejected by sema — see sema_test.cpp — so
+# the double rides the input attribute path here, not an `out`.)
+
+in double hp;
+out float arr[3];
+
+@entry @stage(vertex)
+fn void main() {
+    float p = float(hp);
+    arr[0] = p;
+    arr[1] = p * 2.0;
+    arr[2] = p * 3.0;
+    gl_Position = vec4(p, 0.0, 0.0, 1.0);
+}
+
+# CHECK: @vs_total_floats = constant i32 7
+# CHECK: @vs_input_doubles = constant i32 1
+
+# CHECK: define{{.*}}@vs_invoke
+# the 64-bit attribute is read whole from the double region (no narrowing):
+# CHECK: load double
+# the array varying is flattened element-wise rather than dropped:
+# CHECK: getelementptr inbounds [3 x float]
