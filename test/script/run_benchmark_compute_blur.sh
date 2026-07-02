@@ -13,17 +13,30 @@ mkdir -p result "$BUILD_DIR"
 # ── Build GPU compute host ────────────────────────────────────────────────────
 echo -e "${CYAN}Building Vulkan compute host…${RESET}"
 build_target spirv_vulkan_compute_host 2>/dev/null | grep -E "^g\+\+|error" || true
-build_target blur.comp.spv 2>/dev/null
+# blur_cs_rv.o is the RISC-V compute kernel the CPU host links against — build it
+# too, else the link below fails.
+build_target blur.comp.spv blur_cs_rv.o 2>/dev/null
 
 # ── Build CPU compute binary (RISC-V + OpenMP) ───────────────────────────────
 echo -e "${CYAN}Building CPU compute binary (RISC-V + OpenMP)…${RESET}"
 
 if [[ "$RISCV_AVAIL" -eq 1 ]]; then
-    $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
-        -DWIDTH=512 -DHEIGHT=512 -DNRUNS="$NRUNS" \
-        test/rv_host/rv_host_compute_blur.cpp \
-        build/riscv/blur_cs_rv.o -o "$BUILD_DIR/blur.rv" 2>/dev/null
-    echo -e "  blur.rv  ${GREEN}OK${RESET}"
+    if [[ ! -f build/riscv/blur_cs_rv.o ]]; then
+        echo -e "  blur.rv  ${YELLOW}SKIP (build/riscv/blur_cs_rv.o missing)${RESET}"
+    else
+        # Guard the compile: with `set -e`, an unguarded failure here aborts the
+        # whole script silently. Run it in an `if` and surface the real reason.
+        blur_err=$(mktemp)
+        if $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
+                -DWIDTH=512 -DHEIGHT=512 -DNRUNS="$NRUNS" \
+                test/rv_host/rv_host_compute_blur.cpp \
+                build/riscv/blur_cs_rv.o -o "$BUILD_DIR/blur.rv" 2>"$blur_err"; then
+            echo -e "  blur.rv  ${GREEN}OK${RESET}"
+        else
+            echo -e "  blur.rv  ${YELLOW}FAIL — $(tail -1 "$blur_err")${RESET}"
+        fi
+        rm -f "$blur_err"
+    fi
 else
     echo -e "  ${YELLOW}SKIP: no RISC-V runtime${RESET}"
 fi
