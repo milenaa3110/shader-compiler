@@ -25,6 +25,12 @@ build_target mesh_rv.o 2>/dev/null && \
     echo -e "  mesh_rv.o  ${GREEN}OK${RESET}" || \
     echo -e "  RISC-V compile  ${YELLOW}SKIP${RESET}"
 
+# The Vulkan host is a separate CMake target the run below depends on; build it
+# here so a fresh checkout isn't reported as "host not built".
+build_target spirv_vulkan_mesh_host 2>/dev/null && \
+    echo -e "  spirv_vulkan_mesh_host  ${GREEN}OK${RESET}" || \
+    echo -e "  Vulkan host build  ${YELLOW}SKIP${RESET}"
+
 # ── static metrics ────────────────────────────────────────────────────────────
 spv_vert_kb="N/A"; spv_frag_kb="N/A"; rv_kb="N/A"; rv_instrs="N/A"
 [[ -f build/spirv/mesh.vert.spv ]] && \
