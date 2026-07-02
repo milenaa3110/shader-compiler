@@ -34,7 +34,9 @@ for arg in "$@"; do
 done
 
 echo -e "${CYAN}Building…${RESET}"
-build_target spirv_vulkan_life_host life.comp.spv 2>/dev/null | \
+# life_cs_rv.o is the RISC-V compute kernel the CPU life host links against; without
+# it the life.rv link below fails and the CPU column silently drops to SKIP.
+build_target spirv_vulkan_life_host life.comp.spv life_cs_rv.o 2>/dev/null | \
     grep -E "^g\+\+|error" || true
 
 mkdir -p result "$BUILD_DIR"
@@ -143,11 +145,20 @@ fi
 # Build main RISC-V binary
 if [[ "$RISCV_AVAIL" -eq 1 ]]; then
     echo -e "${CYAN}Compiling RISC-V life host (${GRID}×${GRID}, ${GENS} gens)…${RESET}"
-    $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
-        -DGRID="${GRID}" -DNGENERATIONS="${GENS}" \
-        test/rv_host/rv_host_compute.cpp \
-        build/riscv/life_cs_rv.o -o "$BUILD_DIR/life.rv" 2>/dev/null && \
-        echo -e "  life.rv  ${GREEN}OK${RESET}" || echo -e "  life.rv  ${YELLOW}FAIL${RESET}"
+    if [[ ! -f build/riscv/life_cs_rv.o ]]; then
+        echo -e "  life.rv  ${YELLOW}SKIP (build/riscv/life_cs_rv.o missing — build it first)${RESET}"
+    else
+        life_err=$(mktemp)
+        if $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
+                -DGRID="${GRID}" -DNGENERATIONS="${GENS}" \
+                test/rv_host/rv_host_compute.cpp \
+                build/riscv/life_cs_rv.o -o "$BUILD_DIR/life.rv" 2>"$life_err"; then
+            echo -e "  life.rv  ${GREEN}OK${RESET}"
+        else
+            echo -e "  life.rv  ${YELLOW}FAIL — $(tail -1 "$life_err")${RESET}"
+        fi
+        rm -f "$life_err"
+    fi
 fi
 
 # ── 32×32 CPU-wins case ───────────────────────────────────────────────────────
