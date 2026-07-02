@@ -1,30 +1,6 @@
 #!/usr/bin/env bash
 # compare_backends.sh — static, hardware-independent structural comparison of the
 # RISC-V and SPIR-V backends.
-#
-# Both outputs descend from the SAME LLVM IR, so this is the fairest possible
-# basis: "from identical intermediate code, each backend produces this." Every
-# metric here is STATIC — it needs no QEMU, no hardware, and no GPU. The numbers
-# describe how each backend REPRESENTS and PARALLELIZES a shader; they say
-# nothing about which is "faster" or "better".
-#
-# Per shader, two groups of columns:
-#   SPIR-V : .spv bytes / words / opcodes  — a portable intermediate that the
-#            driver still lowers further on the target GPU.
-#   RISC-V : .text bytes / instructions / RVV vector-FP ops — FINAL machine code,
-#            with the texture sampler and sin/cos already inlined.
-# These sit at different abstraction levels, so size reflects representation
-# DENSITY, not quality; one SPIR-V opcode (e.g. OpExtInst sin) is a library call
-# or an expanded sequence in RISC-V. Compare TRENDS across the shader set, not
-# absolute per-row equality.
-#
-# RISC-V size is the .text of <name>_rv.o (the shader module itself) via
-# llvm-size, NOT the .rv executable — that statically links the runtime + libc
-# and so isn't comparable to a bare .spv.
-#
-# Usage:
-#   ./test/script/compare_backends.sh           # pretty table + parallelism notes
-#   ./test/script/compare_backends.sh --csv      # machine-readable CSV to stdout
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,7 +33,7 @@ done
 
 BOLD="\033[1m"; DIM="\033[2m"; CYAN="\033[36m"; RST="\033[0m"
 
-# ── SPIR-V metrics: "<bytes> <words> <instr> <lx> <ly> <lz>" ─────────────────
+#  SPIR-V metrics: "<bytes> <words> <instr> <lx> <ly> <lz>" ─
 # Sums multiple .spv files (a graphics pipeline = vert + frag) component-wise.
 spv_metrics() {
     local b=0 w=0 n=0 lx=0 ly=0 lz=0
@@ -71,7 +47,7 @@ spv_metrics() {
     echo "$b $w $n $lx $ly $lz"
 }
 
-# ── RISC-V metrics: "<text_bytes> <instr> <vec_fp> <scalar_fp>" ──────────────
+#  RISC-V metrics: "<text_bytes> <instr> <vec_fp> <scalar_fp>" 
 rv_metrics() {
     local obj="$1"
     [[ -f "$obj" ]] || { echo "MISSING"; return 1; }
@@ -84,7 +60,7 @@ rv_metrics() {
     echo "${text:-0} ${total:-0} ${vfp:-0} ${sfp:-0}"
 }
 
-# ── shader sets ──────────────────────────────────────────────────────────────
+#  shader sets 
 # Fragment shaders whose <name>_rv.o is the fragment alone (1:1 with .frag.spv).
 FRAG=(cellular city diverge earth fire galaxy julia mandelbrot ocean
       reaction ripple scene3d tunnel voronoi waves)
@@ -121,7 +97,7 @@ emit_one() {  # name stage  obj  spvfile...
     row "$name" "$stage" "$sb" "$sw" "$si" "$rt" "$ri" "$rv" "$rs"
 }
 
-# ── table ─────────────────────────────────────────────────────────────────────
+#  table ─
 if [[ "$CSV" -eq 0 ]]; then
     echo -e "${BOLD}━━━ Backend representation: same LLVM IR → SPIR-V vs RISC-V (static) ━━━${RST}"
     echo -e "${DIM}SPIR-V = portable intermediate (driver lowers further); RISC-V = final"
@@ -152,7 +128,7 @@ echo -e "${BOLD}└─────────────┴──────�
 echo -e "${DIM}totals across set:  SPIR-V opcodes=${SPV_INSTR_TOTAL}   RISC-V insns=${RV_INSTR_TOTAL}   RVV vector-FP ops=${RV_VEC_TOTAL}${RST}"
 echo ""
 
-# ── parallelization model (architectural, not a single number) ───────────────
+#  parallelization model (architectural, not a single number) ─
 echo -e "${BOLD}━━━ Parallelization model ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"
 echo -e "${CYAN}RISC-V (CPU), two levels:${RST}"
 echo    "  • OpenMP over tiles/rows  — thread scaling; this is TIME, measured on"
