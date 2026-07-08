@@ -124,76 +124,21 @@ The sincos pass fuses `sin(x) + cos(x)` pairs into a single `sincosf(x, &s, &c)`
 
 ## CMake targets
 
-All targets are invoked via `cmake --build build --target <name>`.
+All targets are invoked via `cmake --build build --target <name>`. The naming pattern:
 
-### Compiler unit tests
-```bash
-cmake --build build --target check     # compile all test shaders, validate IR with llvm-as
-```
+- **`vk-<shader>` / `rv-<shader>`** — render one animation on the GPU (Vulkan) or
+  CPU (RISC-V via QEMU) → `result/<shader>.mp4`. `all-vk` / `all-rv` build every one.
+- **`vk-mesh*` / `rv-mesh*`** — the indexed-mesh demo (procedural icosphere or a
+  Wavefront OBJ: bunny, jeep, teddy, boss). Same `mesh_vs.src` + `mesh_fs.src` for
+  both backends; textured OBJs draw one `usemtl` range at a time with the matching
+  `map_Kd` bound, sampled through the `llvm-link`'d bilinear sampler in
+  `tex_inline.cpp`. The RISC-V rasterizer is two-pass tile-based, so it scales to
+  the 1.5M-tri teddy without a per-triangle barrier. Renders 768×768.
+- **`benchmark-*` / `cpu-scaling`** — GPU-vs-CPU benchmarks (fragment, vertex,
+  mesh, compute, compute-blur, diverge) and the OpenMP/RVV scaling analysis.
+- **`check`** — compiler unit tests (compile all test shaders, validate IR with `llvm-as`).
 
-### Single-shader Vulkan animations
-```bash
-cmake --build build --target vk-mandelbrot   # renders 60 frames → result/mandelbrot.mp4
-cmake --build build --target vk-julia
-cmake --build build --target vk-voronoi
-cmake --build build --target vk-waves
-cmake --build build --target vk-tunnel
-cmake --build build --target vk-fire
-cmake --build build --target vk-galaxy
-cmake --build build --target vk-ripple
-cmake --build build --target vk-reaction
-cmake --build build --target vk-cellular
-cmake --build build --target vk-earth
-cmake --build build --target vk-scene3d
-cmake --build build --target vk-city
-cmake --build build --target vk-ocean
-cmake --build build --target all-vk         # compile every Vulkan animation
-```
-
-### Single-shader RISC-V animations
-```bash
-cmake --build build --target rv-mandelbrot  # renders 60 frames via QEMU → result/mandelbrot_rv.mp4
-cmake --build build --target all-rv         # build every RISC-V animation
-```
-
-### Indexed-mesh demo
-Same shader source (`mesh_vs.src` + `mesh_fs.src`) compiles to both backends;
-pick a procedural icosphere or load a Wavefront OBJ:
-```bash
-cmake --build build --target vk-mesh         # GPU,  icosphere subs=3 (1280 tris)
-cmake --build build --target vk-mesh-hi      # GPU,  icosphere subs=5 (20480 tris)
-cmake --build build --target vk-mesh-bunny   # GPU,  Stanford bunny (4968 tris)
-cmake --build build --target vk-mesh-jeep    # GPU,  textured jeep (4728 tris)
-cmake --build build --target vk-mesh-teddy   # GPU,  high-poly teddy (1.5M tris)
-cmake --build build --target vk-mesh-boss    # GPU,  textured Mixamo character (10220 tris)
-cmake --build build --target rv-mesh         # CPU,  icosphere subs=3
-cmake --build build --target rv-mesh_hi      # CPU,  icosphere subs=5
-cmake --build build --target rv-bunny        # CPU,  Stanford bunny
-cmake --build build --target rv-jeep         # CPU,  textured jeep
-cmake --build build --target rv-teddy        # CPU,  high-poly teddy (slow — minutes under QEMU)
-cmake --build build --target rv-boss         # CPU,  textured Mixamo character
-```
-The host is a thin wrapper around the Vulkan VBO/IBO + viewport setup or the
-software rasterizer's indexed-draw path. Textured OBJs are drawn one
-`usemtl` range at a time with the matching `map_Kd` bound; the CPU side samples
-through the `llvm-link`'d bilinear sampler in `tex_inline.cpp`. The RISC-V
-rasterizer is two-pass tile-based, so it scales to the 1.5M-tri teddy without a
-per-triangle barrier. Both backends render 768×768 and write `result/<name>.mp4`
-plus a mid-animation `result/<name>.ppm` for diffing.
-
-### Benchmarks
-| Target | What it measures |
-|--------|-----------------|
-| `benchmark-fragment` | GPU vs CPU across all 14 fragment shaders |
-| `benchmark-fragment-quick` | Same, fewer frames |
-| `benchmark-vertex` | Terrain vertex shader: GPU vs CPU |
-| `benchmark-mesh` | Textured indexed-mesh pipeline (boss model): GPU vs CPU |
-| `benchmark-compute` | Game of Life: GPU dispatch overhead at small grids |
-| `benchmark-compute-blur` | Gaussian blur: GPU compute vs CPU throughput |
-| `benchmark-diverge` | Branch divergence + warp boundary effect |
-| `cpu-scaling` | OpenMP thread scaling + Amdahl fit + RVV instruction count |
-
-Each is invoked the same way: `cmake --build build --target <name>`.
+See **[TESTING.md](TESTING.md)** for the full target list, benchmark options, and what each measures.
 
 ---
 
@@ -276,7 +221,7 @@ OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu ./mandelb
 
 ### SPIR-V path
 
-The SPIR-V path is a single C++ translation unit ([main/emit_spirv_from_ir.h](main/emit_spirv_from_ir.h)) that walks the LLVM IR and writes SPIR-V opcodes directly using the Khronos `spirv-headers`. No glslang, no `llvm-spirv`, no LLVM SPIR-V backend target — just a hand-rolled module-walker (~750 lines) that maps:
+The SPIR-V path is a single C++ translation unit ([emit_spirv_from_ir.h](src/codegen/emit/emit_spirv_from_ir.h)) that walks the LLVM IR and writes SPIR-V opcodes directly using the Khronos `spirv-headers`. No glslang, no `llvm-spirv`, no LLVM SPIR-V backend target — just a hand-rolled module-walker (~750 lines) that maps:
 
 - `fadd/fsub/fmul/fdiv` → `OpFAdd / OpFSub / OpFMul / OpFDiv`
 - `fcmp/icmp/select` → `OpFOrd* / OpS* / OpSelect`
@@ -305,7 +250,7 @@ spirv-val shader.frag.spv
 
 ## Error handling
 
-All errors are routed through the helpers in [error_utils.h](error_utils.h) (basic logger, no fmt dependency — safe for cross-compiled riscv64 sources) and [error_utils_fmt.h](error_utils_fmt.h) (adds `logErrorFmt` / `logErrorContext`, requires `fmt::fmt` to be linked). Every error message is written to `stderr` with a `[ERROR]` prefix; `stdout` carries normal program output and benchmark results.
+All errors are routed through the helpers in [error_utils.h](src/common/error_utils.h) (basic logger, no fmt dependency — safe for cross-compiled riscv64 sources) and [error_utils_fmt.h](src/common/error_utils_fmt.h) (adds `logErrorFmt` / `logErrorContext`, requires `fmt::fmt` to be linked). Every error message is written to `stderr` with a `[ERROR]` prefix; `stdout` carries normal program output and benchmark results.
 
 Caught categories include:
 - Syntax errors, type mismatches

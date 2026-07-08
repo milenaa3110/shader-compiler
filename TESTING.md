@@ -81,7 +81,7 @@ OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu build/ris
 
 ### 4. GPU vs CPU fragment benchmark
 ```bash
-cmake --build build --target benchmark-fragment        # all 12 shaders
+cmake --build build --target benchmark-fragment        # all 14 shaders
 cmake --build build --target benchmark-fragment-quick  # fewer frames
 
 bash test/script/run_benchmark_fragment.sh [--quick|--rv-only|--vk-only]
@@ -180,7 +180,7 @@ cmake --build build --target vk-mandelbrot             # single GPU animation
 cmake --build build --target rv-mandelbrot             # same shader on RISC-V
 cmake --build build --target all-vk                    # build every Vulkan shader
 cmake --build build --target all-rv                    # build every RISC-V shader
-cmake --build build --target benchmark-fragment-quick  # GPU vs CPU, 12 fragment shaders
+cmake --build build --target benchmark-fragment-quick  # GPU vs CPU, 14 fragment shaders
 cmake --build build --target benchmark-vertex          # terrain vertex shader: GPU vs CPU
 cmake --build build --target benchmark-mesh            # textured indexed-mesh: GPU vs CPU
 cmake --build build --target vk-mesh                   # indexed icosphere (1280 tris), GPU
