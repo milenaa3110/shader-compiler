@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # run_benchmark_mesh.sh — build, run, and compare the indexed-mesh pipeline
 # (VS skinning-free transform + textured FS) for the "boss" model on GPU vs RV.
+#
+# Goal: GPU (Vulkan) vs CPU (RISC-V + OpenMP) for the full indexed-mesh path —
+# vertex buffers, index buffers, per-material textured draws, depth testing — on
+# the textured "boss" model (10220 tris / 30660 verts, 768×768, 60 frames).
+# Reports ms/frame, SPIR-V VS/FS sizes, RISC-V object size, and instruction
+# count. Under QEMU the CPU runs ~40× slower: emulation overhead plus
+# software-rasterising a textured mesh against a hardware triangle pipeline.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"

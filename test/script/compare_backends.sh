@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 # compare_backends.sh — static, hardware-independent structural comparison of the
 # RISC-V and SPIR-V backends.
+#
+# Both descend from the same LLVM IR, so this is the fairest basis: "from
+# identical intermediate code, each backend produces this." No QEMU, hardware, or
+# GPU involved — every number is read off the compiled artifacts. Per shader it
+# reports, side by side:
+#   - SPIR-V: .spv bytes / words / opcodes (opcodes from spv_count.py, a
+#     dependency-free word-stream parser, since spirv-tools isn't in the build).
+#     A portable intermediate the GPU driver lowers *further*.
+#   - RISC-V: .text bytes (llvm-size on <name>_rv.o, the shader module — NOT the
+#     .rv executable, which statically links runtime + libc and so isn't
+#     comparable) / instruction count / RVV vector-FP ops (objdump).
+# These sit at different abstraction levels, so size reflects representation
+# *density*, not quality: one SPIR-V opcode (e.g. OpExtInst sin) is a library
+# call or expanded sequence in RISC-V — read trends across the set, not per-row
+# equality. A closing section contrasts the parallelization models (two-level
+# CPU: OpenMP threads + RVV/SPMD lanes, vs SIMT delegated to the GPU) and prints
+# the shared measurable axis, the compute workgroup size. Registered as the
+# compare_backends ctest (skipped if python3 is absent).
+#   Usage: bash test/script/compare_backends.sh [--csv]   (--csv = machine-readable)
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

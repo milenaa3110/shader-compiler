@@ -128,21 +128,29 @@ for A in "${ANIMATIONS[@]}"; do
             RV_MS[$A]="N/A"; RV_MP4[$A]="-"
             echo -e "  CPU (RISC-V) : ${YELLOW}SKIP (no RISC-V runtime — install qemu-user-static or run on RISC-V hardware)${RESET}"
         elif [[ -f "build/riscv/${A}_rv.o" ]]; then
-            # Build rv binary with OpenMP
-            $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Isrc/runtime \
-                -DANIM_NAME="\"${A}\"" -DNFRAMES="${VK_FRAMES}" -DFPS=30 \
-                -DWIDTH="${RV_WIDTH}" -DHEIGHT="${RV_HEIGHT}" \
-                test/rv_host/rv_host_fragment.cpp \
-                src/runtime/pipeline_runtime.cpp \
-                "build/riscv/${A}_rv.o" -o "build/riscv/${A}_bench.rv" 2>/dev/null
-
-            echo -n "  CPU (RISC-V) : running on ${SIM_NAME} (${RV_WIDTH}x${RV_HEIGHT}, ${VK_FRAMES} frame(s))…"
-            rv_out=$(OMP_NUM_THREADS="${NTHREADS}" $SIM_RENDER "./build/riscv/${A}_bench.rv" 2>/dev/null || true)
-            rv_avg=$(parse_avg "$rv_out")
-            RV_MS[$A]="$rv_avg"
-            rv_mp4="result/${A}_rv.mp4"
-            RV_MP4[$A]="$([[ -f "$rv_mp4" ]] && echo "$rv_mp4" || echo "-")"
-            echo -e "  ${YELLOW}${rv_avg} ms/frame${RESET}  →  ${RV_MP4[$A]}"
+            # Build rv binary with OpenMP. Guard the compile: with `set -e`, an
+            # unguarded failure here (e.g. no static libgomp on the board) aborts
+            # the whole script silently mid-loop.
+            rv_err=$(mktemp)
+            if $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Isrc/runtime \
+                    -DANIM_NAME="\"${A}\"" -DNFRAMES="${VK_FRAMES}" -DFPS=30 \
+                    -DWIDTH="${RV_WIDTH}" -DHEIGHT="${RV_HEIGHT}" \
+                    test/rv_host/rv_host_fragment.cpp \
+                    src/runtime/pipeline_runtime.cpp \
+                    "build/riscv/${A}_rv.o" -o "build/riscv/${A}_bench.rv" 2>"$rv_err"; then
+                rm -f "$rv_err"
+                echo -n "  CPU (RISC-V) : running on ${SIM_NAME} (${RV_WIDTH}x${RV_HEIGHT}, ${VK_FRAMES} frame(s))…"
+                rv_out=$(OMP_NUM_THREADS="${NTHREADS}" $SIM_RENDER "./build/riscv/${A}_bench.rv" 2>/dev/null || true)
+                rv_avg=$(parse_avg "$rv_out")
+                RV_MS[$A]="$rv_avg"
+                rv_mp4="result/${A}_rv.mp4"
+                RV_MP4[$A]="$([[ -f "$rv_mp4" ]] && echo "$rv_mp4" || echo "-")"
+                echo -e "  ${YELLOW}${rv_avg} ms/frame${RESET}  →  ${RV_MP4[$A]}"
+            else
+                RV_MS[$A]="N/A"; RV_MP4[$A]="-"
+                echo -e "  CPU (RISC-V) : ${YELLOW}build failed — $(tail -1 "$rv_err")${RESET}"
+                rm -f "$rv_err"
+            fi
         else
             RV_MS[$A]="N/A"; RV_MP4[$A]="-"
             echo -e "  CPU (RISC-V) : ${YELLOW}SKIP (no build/riscv/${A}_rv.o)${RESET}"

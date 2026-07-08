@@ -57,12 +57,15 @@ build_frag() {
     local tmp_rt="$BUILD_DIR/_tmp_rt_${sched}.cpp"
     sed "s/schedule(dynamic, 1)/schedule(${sched}, 1)/" \
         src/runtime/pipeline_runtime.cpp > "$tmp_rt"
+    # `|| echo …>&2` keeps a failed compile from aborting the whole script under
+    # `set -e`; run_rv then reports N/A for the missing binary.
     $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Isrc/runtime \
         -DANIM_NAME="\"${anim}\"" -DNFRAMES="$FRAG_FRAMES" \
         -DWIDTH="$FRAG_W" -DHEIGHT="$FRAG_H" \
         test/rv_host/rv_host_fragment.cpp \
         "$tmp_rt" \
-        "build/riscv/${anim}_rv.o" -o "$out" >/dev/null 2>&1
+        "build/riscv/${anim}_rv.o" -o "$out" >/dev/null 2>&1 || \
+        echo -e "  ${YELLOW}build_frag failed for ${anim} → $out${RESET}" >&2
     rm -f "$tmp_rt"
 }
 
@@ -72,7 +75,8 @@ build_life() {
     $CROSS_CXX -std=c++20 -O3 -static -fopenmp \
         -DGRID="$grid" -DNGENERATIONS="$LIFE_GENS" \
         test/rv_host/rv_host_compute.cpp \
-        build/riscv/life_cs_rv.o -o "$out" >/dev/null 2>&1
+        build/riscv/life_cs_rv.o -o "$out" >/dev/null 2>&1 || \
+        echo -e "  ${YELLOW}build_life failed (grid ${grid}) → $out${RESET}" >&2
 }
 
 # ── helper: run binary with T threads, return avg ms ─────────────────────────

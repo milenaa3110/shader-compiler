@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # run_benchmark_vertex.sh — build, run, and compare terrain animation (vertex+fragment, VK vs RV)
+#
+# Goal: GPU (Vulkan) vs CPU (RISC-V + OpenMP) on a vertex-heavy workload — a
+# 32×32 animated terrain mesh (6144 vertices, all positions computed from
+# gl_VertexID, no vertex buffer). Reports ms/frame, VS/FS binary sizes, and
+# RISC-V object size. The two vertex shaders differ only in NDC conventions:
+# terrain_vs.src for RISC-V (standard Y), terrain_vs_vk.src for Vulkan
+# (Y negated, z in [0,1]).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
