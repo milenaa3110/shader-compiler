@@ -5,9 +5,11 @@
 #
 # 1. BRANCH DIVERGENCE
 #    Compares diverge.frag vs mandelbrot.frag (uniform heavy workload).
-#    Diverge shader: left half = 4 trig ops, right half = 96-iter Mandelbrot.
+#    Diverge shader: left half = 4 trig ops, right half = 80-iter Mandelbrot.
+#    The heavy path runs the same 80 iterations as the mandelbrot baseline, so
+#    the 50% ideal below is exact rather than approximate.
 #    Ideal (no divergence penalty): diverge ≈ 50% of mandelbrot time.
-#    GPU reality:  warps straddling x=0.5 execute ALL 96 iterations for all lanes
+#    GPU reality:  warps straddling x=0.5 execute ALL 80 iterations for all lanes
 #                  → diverge ≈ mandelbrot time → efficiency ~50%
 #    CPU reality:  each thread runs its own branch independently
 #                  → diverge ≈ 50% of mandelbrot time → efficiency ~100%
@@ -89,8 +91,8 @@ mkdir -p result
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${BOLD}━━━ 1. Branch Divergence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "  Baseline: mandelbrot (all pixels run 96-iter loop — uniform workload)"
-echo -e "  Test:     diverge    (left half: 4 ops, right half: 96-iter Mandelbrot)"
+echo -e "  Baseline: mandelbrot (all pixels run 80-iter loop — uniform workload)"
+echo -e "  Test:     diverge    (left half: 4 ops, right half: 80-iter Mandelbrot)"
 echo -e "  Ideal efficiency: diverge ≈ 50%% of mandelbrot time (only half pixels heavy)"
 echo ""
 

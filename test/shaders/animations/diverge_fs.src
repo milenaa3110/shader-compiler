@@ -1,16 +1,19 @@
 # diverge_fs.src — SIMD divergence benchmark (CPU/RISC-V side)
-# Counterpart to test/shaders/spirv_vulkan/diverge.frag.
 #
 # Left half  (x < 0.5): trivial 4-op sine wave.
-# Right half (x >= 0.5): 96-iteration Mandelbrot.
+# Right half (x >= 0.5): 80-iteration Mandelbrot.
+#
+# The iteration count must stay equal to mandelbrot_fs.src's, since that shader
+# is the uniform baseline this one is measured against. Only then does "half the
+# pixels do the heavy path" translate into an exact 50% ideal time ratio.
 #
 # CPU ADVANTAGE: each RISC-V thread takes exactly its own branch.
 # There is no SIMD register group — threads are truly independent.
-# A pixel on the left executes 4 instructions; one on the right executes ~768.
+# A pixel on the left executes 4 instructions; one on the right executes ~640.
 # With OpenMP, all CPU cores run their own pixels with no cross-thread stalling.
 #
 # GPU PENALTY: warp lanes on the left must idle while right-side lanes iterate.
-# The boundary region (warps spanning x=0.5) pays full 96-iteration cost for all lanes.
+# The boundary region (warps spanning x=0.5) pays full 80-iteration cost for all lanes.
 # This narrows the GPU speedup compared to uniform shaders.
 
 uniform float uTime;
@@ -27,7 +30,7 @@ fn void main() {
         val = sin(u * 31.4159 + uTime * 1.7) * 0.5 + 0.5;
         val = val * (cos(vUV.y * 25.1327 + uTime * 0.9) * 0.5 + 0.5);
     } else {
-        # ── Heavy path: 96-iteration Mandelbrot ────────────────────────────────
+        # ── Heavy path: 80-iteration Mandelbrot ────────────────────────────────
         float u = (vUV.x - 0.5) * 2.0;
         float zoom = exp(-uTime * 0.08 + 0.5);
         float cx = (u - 0.5) * 3.5 * zoom - 0.7436;
@@ -35,7 +38,7 @@ fn void main() {
         float zx = 0.0;
         float zy = 0.0;
         float iter = 0.0;
-        for (float i = 0.0; i < 96.0; i = i + 1.0) {
+        for (float i = 0.0; i < 80.0; i = i + 1.0) {
             if (zx * zx + zy * zy < 4.0) {
                 float nx = zx * zx - zy * zy + cx;
                 zy = 2.0 * zx * zy + cy;
@@ -43,7 +46,7 @@ fn void main() {
                 iter = i + 1.0;
             }
         }
-        val = iter / 96.0;
+        val = iter / 80.0;
     }
 
     float t = val + uTime * 0.1;
