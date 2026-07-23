@@ -2,30 +2,7 @@
 # run_benchmark_diverge.sh — Branch divergence + dispatch overhead benchmarks
 #
 # THREE focused measurements:
-#
-# 1. BRANCH DIVERGENCE
-#    Compares diverge.frag vs mandelbrot.frag (uniform heavy workload).
-#    Diverge shader: left half = 4 trig ops, right half = 80-iter Mandelbrot.
-#    The heavy path runs the same 80 iterations as the mandelbrot baseline, so
-#    the 50% ideal below is exact rather than approximate.
-#    Ideal (no divergence penalty): diverge ≈ 50% of mandelbrot time.
-#    GPU reality:  warps straddling x=0.5 execute ALL 80 iterations for all lanes
-#                  → diverge ≈ mandelbrot time → efficiency ~50%
-#    CPU reality:  each thread runs its own branch independently
-#                  → diverge ≈ 50% of mandelbrot time → efficiency ~100%
-#
-# 2. DISPATCH OVERHEAD ISOLATION
-#    Renders a 1×1 pixel frame — compute time is negligible.
-#    Any measured latency is pure vkQueueSubmit + pipeline overhead.
-#    CPU has no equivalent cost; loop iteration overhead is nanoseconds.
-#
-# 3. WARP BOUNDARY EFFECT
-#    Renders diverge at three resolutions: 64, 256, 512.
-#    At 64px the boundary region (warps straddling x=0.5) is proportionally
-#    larger → penalty is worse. At 512px the boundary shrinks relative to
-#    the total pixel count → penalty softens.
-#
-# Usage: bash test/script/run_benchmark_diverge.sh [--quick]
+
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
@@ -54,25 +31,52 @@ gpu_ms_for() {
     echo "$out" | grep 'Vulkan avg:' | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "N/A"
 }
 
-# ── helper: build + run one RISC-V animation, return avg ms/frame ─────────────
-rv_ms_for() {
+# ── helper: build one RISC-V animation, echo the binary path ("" on failure) ──
+# The same binary serves both execution modes — the runtime picks the fragment
+# dispatch path at run time (weak fs_packet symbol + SHADER_PACKET), so there is
+# no reason to link twice.
+rv_build() {
     local anim="$1" frames="$2" w="$3" h="$4"
     local bin="$BUILD_DIR/_bench_${anim}_${w}.rv"
-    [[ "$RISCV_AVAIL" -eq 0 ]] && { echo "N/A"; return; }
+    [[ "$RISCV_AVAIL" -eq 0 ]] && { echo ""; return; }
 
-    build_target "${anim}_rv.o" >/dev/null 2>&1 || { echo "N/A"; return; }
+    build_target "${anim}_rv.o" >/dev/null 2>&1 || { echo ""; return; }
 
     $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Isrc/runtime \
         -DANIM_NAME="\"${anim}\"" -DNFRAMES="$frames" \
         -DWIDTH="$w" -DHEIGHT="$h" \
         test/rv_host/rv_host_fragment.cpp \
         src/runtime/pipeline_runtime.cpp \
-        "build/riscv/${anim}_rv.o" -o "$bin" >/dev/null 2>&1 || { echo "N/A"; return; }
+        "build/riscv/${anim}_rv.o" -o "$bin" >/dev/null 2>&1 || { echo ""; return; }
+
+    echo "$bin"
+}
+
+# ── helper: run a built binary, return avg ms/frame ──────────────────────────
+# mode = packet → SHADER_PACKET=1, width-4 SPMD fs_packet (4 pixels per call,
+#                 one execution mask shared by all 4 lanes)
+# mode = scalar → SHADER_PACKET unset, per-pixel fs_invoke (each pixel owns its
+#                 own control flow). Unset explicitly: the benchmark-diverge
+#                 CMake target exports SHADER_PACKET=1 for the whole script.
+rv_run() {
+    local bin="$1" mode="$2"
+    [[ -z "$bin" ]] && { echo "N/A"; return; }
 
     local out
-    out=$(OMP_NUM_THREADS="$NTHREADS" $RISCV_SIM "./$bin" 2>/dev/null || true)
-    rm -f "$bin"
+    if [[ "$mode" == "scalar" ]]; then
+        out=$(env -u SHADER_PACKET OMP_NUM_THREADS="$NTHREADS" $RISCV_SIM "./$bin" 2>/dev/null || true)
+    else
+        out=$(env SHADER_PACKET=1 OMP_NUM_THREADS="$NTHREADS" $RISCV_SIM "./$bin" 2>/dev/null || true)
+    fi
     echo "$out" | grep 'RISC-V avg:' | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "N/A"
+}
+
+# ── helper: did the shader actually packetize? ───────────────────────────────
+# If the packetizer bailed (construct outside its subset) no @fs_packet is
+# emitted, the runtime silently uses the scalar path, and the two CPU columns
+# would be the same number measured twice.
+rv_packetized() {
+    grep -q '@fs_packet' "build/riscv/${1}_rv.ll" 2>/dev/null && echo "yes" || echo "no"
 }
 
 # ── helper: divergence efficiency (%) ────────────────────────────────────────
@@ -91,36 +95,74 @@ mkdir -p result
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${BOLD}━━━ 1. Branch Divergence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "  Baseline: mandelbrot (all pixels run 80-iter loop — uniform workload)"
-echo -e "  Test:     diverge    (left half: 4 ops, right half: 80-iter Mandelbrot)"
-echo -e "  Ideal efficiency: diverge ≈ 50%% of mandelbrot time (only half pixels heavy)"
+echo -e "  Baseline: mandelbrot (all pixels run 96-iter loop — uniform workload)"
+echo -e "  Test: diverge    (left half: 4 ops, right half: 96-iter Mandelbrot)"
+echo -e "  Ideal efficiency: diverge ≈ 50% of mandelbrot time (only half pixels heavy)"
+echo -e "  CPU is measured twice: width-4 packet (SHADER_PACKET=1) and scalar per-pixel."
 echo ""
 
 echo -e "${CYAN}Running GPU…${RESET}"
 GPU_MANDEL=$(gpu_ms_for mandelbrot.frag.spv mandelbrot "$VK_FRAMES")
 GPU_DIVERGE=$(gpu_ms_for diverge.frag.spv   diverge    "$VK_FRAMES")
 
-echo -e "${CYAN}Running CPU (RISC-V + OpenMP)…${RESET}"
-CPU_MANDEL=$(rv_ms_for mandelbrot "$RV_FRAMES" "$RV_W" "$RV_H")
-CPU_DIVERGE=$(rv_ms_for diverge   "$RV_FRAMES" "$RV_W" "$RV_H")
+echo -e "${CYAN}Linking CPU (RISC-V) binaries…${RESET}"
+BIN_MANDEL=$(rv_build mandelbrot "$RV_FRAMES" "$RV_W" "$RV_H")
+BIN_DIVERGE=$(rv_build diverge   "$RV_FRAMES" "$RV_W" "$RV_H")
 
-GPU_EFF=$(div_efficiency "$GPU_DIVERGE" "$GPU_MANDEL")
-CPU_EFF=$(div_efficiency "$CPU_DIVERGE" "$CPU_MANDEL")
+echo -e "${CYAN}Running CPU packet (width-4 SPMD + OpenMP)…${RESET}"
+CPU_MANDEL=$(rv_run "$BIN_MANDEL"  packet)
+CPU_DIVERGE=$(rv_run "$BIN_DIVERGE" packet)
+
+echo -e "${CYAN}Running CPU scalar (per-pixel fs_invoke + OpenMP)…${RESET}"
+CPU_MANDEL_S=$(rv_run "$BIN_MANDEL"  scalar)
+CPU_DIVERGE_S=$(rv_run "$BIN_DIVERGE" scalar)
+
+rm -f "$BIN_MANDEL" "$BIN_DIVERGE" 2>/dev/null || true
+
+GPU_EFF=$(div_efficiency "$GPU_DIVERGE"   "$GPU_MANDEL")
+CPU_EFF=$(div_efficiency "$CPU_DIVERGE"   "$CPU_MANDEL")
+CPU_EFF_S=$(div_efficiency "$CPU_DIVERGE_S" "$CPU_MANDEL_S")
 GPU_SPD_MANDEL=$(speedup_label "$GPU_MANDEL"  "$CPU_MANDEL")
 GPU_SPD_DIVERGE=$(speedup_label "$GPU_DIVERGE" "$CPU_DIVERGE")
+# scalar ÷ packet: what the width-4 packetizer bought on this shader
+PKT_GAIN_MANDEL=$(speedup_label "$CPU_MANDEL"  "$CPU_MANDEL_S")
+PKT_GAIN_DIVERGE=$(speedup_label "$CPU_DIVERGE" "$CPU_DIVERGE_S")
+
+EFF_LINE=$(printf "  GPU: %-8s CPU packet: %-8s CPU scalar: %-8s" \
+    "${GPU_EFF}" "${CPU_EFF}" "${CPU_EFF_S}")
 
 echo ""
-echo -e "${BOLD}┌──────────────┬─────────────┬─────────────┬──────────────┐${RESET}"
-echo -e "${BOLD}│ Shader       │ GPU ms/f    │ CPU ms/f    │ GPU speedup  │${RESET}"
-echo -e "${BOLD}├──────────────┼─────────────┼─────────────┼──────────────┤${RESET}"
-printf "│ %-12s │ %11s │ %11s │ %12s │\n" \
-    "mandelbrot" "${GPU_MANDEL}ms" "${CPU_MANDEL}ms" "${GPU_SPD_MANDEL}"
-printf "│ %-12s │ %11s │ %11s │ %12s │\n" \
-    "diverge" "${GPU_DIVERGE}ms" "${CPU_DIVERGE}ms" "${GPU_SPD_DIVERGE}"
-echo -e "${BOLD}├──────────────┴─────────────┴─────────────┴──────────────┤${RESET}"
-printf "│ %-56s │\n" "Divergence efficiency (ideal = 50%% of mandelbrot time)"
-printf "│   GPU: %s   CPU: %s%-30s │\n" "${GPU_EFF}" "${CPU_EFF}" ""
-echo -e "${BOLD}└──────────────────────────────────────────────────────────┘${RESET}"
+echo -e "${BOLD}┌──────────────┬─────────────┬─────────────┬─────────────┬───────────┬─────────────┐${RESET}"
+echo -e "${BOLD}│ Shader       │ GPU ms/f    │ CPU pkt ms/f│ CPU scl ms/f│ pkt gain  │ GPU speedup │${RESET}"
+echo -e "${BOLD}├──────────────┼─────────────┼─────────────┼─────────────┼───────────┼─────────────┤${RESET}"
+printf "│ %-12s │ %11s │ %11s │ %11s │ %9s │ %11s │\n" \
+    "mandelbrot" "${GPU_MANDEL}ms" "${CPU_MANDEL}ms" "${CPU_MANDEL_S}ms" \
+    "${PKT_GAIN_MANDEL}" "${GPU_SPD_MANDEL}"
+printf "│ %-12s │ %11s │ %11s │ %11s │ %9s │ %11s │\n" \
+    "diverge" "${GPU_DIVERGE}ms" "${CPU_DIVERGE}ms" "${CPU_DIVERGE_S}ms" \
+    "${PKT_GAIN_DIVERGE}" "${GPU_SPD_DIVERGE}"
+echo -e "${BOLD}├──────────────┴─────────────┴─────────────┴─────────────┴───────────┴─────────────┤${RESET}"
+printf "│ %-80s │\n" "Divergence efficiency (ideal = 50% of mandelbrot time)"
+printf "│ %-80s │\n" "$EFF_LINE"
+# NOTE: bash printf pads to a byte count, so keep every %-80s cell ASCII-only.
+printf "│ %-80s │\n" "  packet: 4 pixels share one execution mask - a split packet runs both sides"
+printf "│ %-80s │\n" "  scalar: each pixel branches on its own - the gap to 100% is fixed frame cost"
+echo -e "${BOLD}└──────────────────────────────────────────────────────────────────────────────────┘${RESET}"
+
+# A shader outside the packetizer's subset emits no @fs_packet: the runtime
+# falls back to fs_invoke and both CPU columns measure the same path.
+for a in mandelbrot diverge; do
+    if [[ "$(rv_packetized "$a")" == "no" ]]; then
+        echo -e "  ${YELLOW}note:${RESET} $a did not packetize — its two CPU columns are the same path"
+    fi
+done
+
+# QEMU expands each RVV instruction into a scalar loop, so the packet path pays
+# for its SoA gather/scatter without getting any vector width back.
+if [[ "$RISCV_AVAIL" -eq 1 && "$NATIVE_RISCV" -eq 0 ]]; then
+    echo -e "  ${YELLOW}note:${RESET} CPU runs under QEMU — a 'pkt gain' below 1.0x is an emulation"
+    echo -e "        artifact, not the packetizer. See TESTING.md / bench_packet.sh."
+fi
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -144,15 +186,15 @@ echo -e "${BOLD}┌────────────────────�
 echo -e "${BOLD}│ Measurement          │ ms/frame     │ Notes                           │${RESET}"
 echo -e "${BOLD}├──────────────────────┼──────────────┼─────────────────────────────────┤${RESET}"
 printf "│ %-20s │ %12s │ %-31s │\n" \
-    "Dispatch overhead" "${OVERHEAD_MS}ms" "1×1 px: compute ≈ 0"
+    "Dispatch overhead" "${OVERHEAD_MS}ms" "1x1 px: compute ~ 0"
 printf "│ %-20s │ %12s │ %-31s │\n" \
-    "Mandelbrot 512×512" "${FULL_MS}ms" "real workload"
+    "Mandelbrot 512x512" "${FULL_MS}ms" "real workload"
 
 if [[ "$OVERHEAD_MS" != "N/A" && "$FULL_MS" != "N/A" ]]; then
     OVERHEAD_PCT=$(awk "BEGIN { printf \"%.1f%%\", $OVERHEAD_MS / $FULL_MS * 100 }")
     COMPUTE_MS=$(awk "BEGIN { printf \"%.4f\", $FULL_MS - $OVERHEAD_MS }")
     printf "│ %-20s │ %12s │ %-31s │\n" \
-        "Pure compute" "${COMPUTE_MS}ms" "= full − overhead"
+        "Pure compute" "${COMPUTE_MS}ms" "= full - overhead"
     printf "│ %-20s │ %12s │ %-31s │\n" \
         "Overhead fraction" "" "${OVERHEAD_PCT} of total frame time"
 fi
@@ -181,18 +223,18 @@ MAN_256=$(gpu_ms_for mandelbrot.frag.spv man256 "$BOUNDARY_FRAMES" 256 256)
 MAN_512=$(gpu_ms_for mandelbrot.frag.spv man512 "$BOUNDARY_FRAMES" 512 512)
 
 echo ""
-echo -e "${BOLD}┌────────┬────────────────────┬────────────────────┬────────────┬──────────────────────┐${RESET}"
-echo -e "${BOLD}│ Res    │ diverge ms/f       │ mandelbrot ms/f    │ Efficiency │ Boundary pixels      │${RESET}"
-echo -e "${BOLD}├────────┼────────────────────┼────────────────────┼────────────┼──────────────────────┤${RESET}"
+echo -e "${BOLD}┌─────────┬────────────────────┬────────────────────┬────────────┬──────────────────────┐${RESET}"
+echo -e "${BOLD}│ Res     │ diverge ms/f       │ mandelbrot ms/f    │ Efficiency │ Boundary pixels      │${RESET}"
+echo -e "${BOLD}├─────────┼────────────────────┼────────────────────┼────────────┼──────────────────────┤${RESET}"
 
 for res in 64 256 512; do
     eval "div_ms=\$DIV_${res}"; eval "man_ms=\$MAN_${res}"
     eff=$(div_efficiency "$div_ms" "$man_ms")
     # boundary ≈ warp_width (32) columns × height pixels, as % of total
     boundary_pct=$(awk "BEGIN { printf \"~%.1f%%\", 32.0 / $res * 100 }")
-    printf "│ %6s │ %18s │ %18s │ %10s │ %-20s │\n" \
-        "${res}×${res}" "${div_ms}ms" "${man_ms}ms" "$eff" "$boundary_pct of pixels"
+    printf "│ %7s │ %18s │ %18s │ %10s │ %-20s │\n" \
+        "${res}x${res}" "${div_ms}ms" "${man_ms}ms" "$eff" "$boundary_pct of pixels"
 done
 
-echo -e "${BOLD}└────────┴────────────────────┴────────────────────┴────────────┴──────────────────────┘${RESET}"
+echo -e "${BOLD}└─────────┴────────────────────┴────────────────────┴────────────┴──────────────────────┘${RESET}"
 
