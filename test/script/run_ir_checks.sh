@@ -6,7 +6,7 @@ set -euo pipefail
 # Resolve absolute paths relative to the script location.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$SCRIPT_DIR/../.."
-IRGEN="$ROOT/build/riscv/irgen_riscv"
+IRGEN="${IRGEN:-$ROOT/build/riscv/irgen_riscv}"
 CHECK_DIR="$ROOT/test/shaders/codegen_checks"
 FILECHECK="${FILECHECK:-FileCheck-18}"
 TMP_DIR="$(mktemp -d)"

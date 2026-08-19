@@ -1,0 +1,111 @@
+# volume_cs.src — compute variant of volume_fs.src: the same volumetric
+# ray-march, but dispatched per pixel and written through imageStore instead of
+# rasterized to a colour attachment.
+#
+# This is the shape volumetrics actually take in production (froxel/fog volumes
+# are built by compute writing into a texture), and it is the only place in the
+# tree where a sampler3D is read from a compute stage — texlayer_fs covers
+# sampler3D in fragment, imagestore_cs covers imageStore without sampling, and
+# nothing covered the two together.
+#
+# Kept deliberately identical to volume_fs.src from the camera down, so the two
+# can be diffed: any difference in output is the stage, not the algorithm.
+
+layout(binding=0) uniform sampler3D uVol;
+layout(binding=1) uniform image2D uOut;
+uniform float uTime;
+uniform uint uW;
+uniform uint uH;
+
+@entry @stage(compute) @workgroup_size(16, 16, 1)
+fn void main() {
+    uint gx = gl_GlobalInvocationID.x;
+    uint gy = gl_GlobalInvocationID.y;
+    if (gx >= uW || gy >= uH) return;
+
+    # Pixel centre. Y is inverted so the image matches the fragment variant:
+    # there vUV comes from quad_vs, which negates gl_Position.y for Vulkan's NDC
+    # while leaving vUV alone, so framebuffer row 0 carries vUV.y == 1. A compute
+    # dispatch has no NDC to invert, so the flip has to be explicit here.
+    float uvx = (float(gx) + 0.5) / float(uW);
+    float uvy = 1.0 - (float(gy) + 0.5) / float(uH);
+
+    # ── Camera: orbits the cloud, bobbing slightly ───────────────────────────
+    float ang  = uTime * 0.45;
+    float camX = sin(ang) * 1.75;
+    float camY = 0.35 + sin(uTime * 0.31) * 0.30;
+    float camZ = cos(ang) * 1.75;
+
+    float fLen = sqrt(camX*camX + camY*camY + camZ*camZ);
+    float fwdX = -camX / fLen;
+    float fwdY = -camY / fLen;
+    float fwdZ = -camZ / fLen;
+
+    float rgtX = fwdZ;
+    float rgtZ = -fwdX;
+    float rLen = sqrt(rgtX*rgtX + rgtZ*rgtZ) + 0.0001;
+    rgtX = rgtX / rLen;
+    rgtZ = rgtZ / rLen;
+
+    float upX = 0.0 - rgtZ * fwdY;
+    float upY = rgtZ * fwdX - rgtX * fwdZ;
+    float upZ = rgtX * fwdY;
+
+    # ── Ray through this pixel ───────────────────────────────────────────────
+    float su = (uvx - 0.5) * 0.90;
+    float sv = (uvy - 0.5) * 0.90;
+    float rdX = fwdX + su * rgtX + sv * upX;
+    float rdY = fwdY + sv * upY;
+    float rdZ = fwdZ + su * rgtZ + sv * upZ;
+    float rdLen = sqrt(rdX*rdX + rdY*rdY + rdZ*rdZ);
+    rdX = rdX / rdLen;
+    rdY = rdY / rdLen;
+    rdZ = rdZ / rdLen;
+
+    # ── March the slab that brackets the cloud sphere ────────────────────────
+    float dt = 1.5 / 64.0;
+    float t  = fLen - 0.75;
+
+    float dx = uTime * 0.035;
+    float dz = uTime * -0.022;
+    float dy = uTime * 0.011;
+
+    float trans = 1.0;
+    float cr = 0.0;
+    float cg = 0.0;
+    float cb = 0.0;
+
+    for (float i = 0.0; i < 64.0; i = i + 1.0) {
+        float px = camX + rdX * t;
+        float py = camY + rdY * t;
+        float pz = camZ + rdZ * t;
+
+        float rr   = sqrt(px*px + py*py + pz*pz);
+        float fall = clamp(1.0 - rr / 0.68, 0.0, 1.0);
+        fall = fall * fall;
+
+        # textureLod, not texture: a compute stage has no derivatives, so an
+        # implicit-LOD sample is invalid there (SPIR-V rejects
+        # OpImageSampleImplicitLod outside fragment). Only one level is bound,
+        # so LOD 0 is what the fragment variant effectively samples too.
+        vec4 s = textureLod(uVol, vec3(px * 0.8 + 0.5 + dx,
+                                       py * 0.8 + 0.5 + dy,
+                                       pz * 0.8 + 0.5 + dz), 0.0);
+
+        float a = clamp(s.w * fall * 1.45, 0.0, 1.0);
+
+        cr = cr + trans * a * s.x;
+        cg = cg + trans * a * s.y;
+        cb = cb + trans * a * s.z;
+        trans = trans * (1.0 - a);
+
+        t = t + dt;
+    }
+
+    float bg = 0.04 + 0.14 * uvy;
+    imageStore(uOut, ivec2(int(gx), int(gy)),
+               vec4(clamp(cr + trans * bg * 0.7, 0.0, 1.0),
+                    clamp(cg + trans * bg * 0.9, 0.0, 1.0),
+                    clamp(cb + trans * bg * 1.4, 0.0, 1.0),
+                    1.0));
+}

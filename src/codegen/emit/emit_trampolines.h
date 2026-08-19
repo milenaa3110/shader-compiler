@@ -4,6 +4,10 @@
 #pragma once
 
 #include "../codegen_state/codegen_state.h"
+#include "../../common/error_utils_fmt.h"
+#include "../../runtime/pipeline_abi.h"
+
+#include <fmt/format.h>
 
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/GlobalVariable.h>
@@ -18,6 +22,13 @@ using namespace llvm;
 static unsigned typeFloatCount(Type* ty) {
     if (auto* at = dyn_cast<ArrayType>(ty))
         return at->getNumElements() * typeFloatCount(at->getElementType());
+    // A matrix is %glsl.matCxR = { [C x <R x float>] }; structs also appear as
+    // varyings. Sum the members either way.
+    if (auto* st = dyn_cast<StructType>(ty)) {
+        unsigned n = 0;
+        for (Type* m : st->elements()) n += typeFloatCount(m);
+        return n;
+    }
     if (auto* vt = dyn_cast<FixedVectorType>(ty)) return vt->getNumElements();
     if (ty->isFloatTy() || ty->isIntegerTy()) return 1;
     return 0;
@@ -28,6 +39,11 @@ static unsigned typeFloatCount(Type* ty) {
 static unsigned typeDoubleCount(Type* ty) {
     if (auto* at = dyn_cast<ArrayType>(ty))
         return at->getNumElements() * typeDoubleCount(at->getElementType());
+    if (auto* st = dyn_cast<StructType>(ty)) {
+        unsigned n = 0;
+        for (Type* m : st->elements()) n += typeDoubleCount(m);
+        return n;
+    }
     if (ty->isDoubleTy()) return 1;
     return 0;
 }
@@ -63,6 +79,14 @@ static unsigned flattenValue(Value* ptr, Type* ty, Value* flatPtr, unsigned floa
         }
         return floatOff;
     }
+    if (auto* st = dyn_cast<StructType>(ty)) {  // matrix wrapper or struct varying
+        for (unsigned i = 0; i < st->getNumElements(); ++i) {
+            Value* memPtr = Builder->CreateInBoundsGEP(
+                st, ptr, { Builder->getInt32(0), Builder->getInt32(i) }, "st.mem");
+            floatOff = flattenValue(memPtr, st->getElementType(i), flatPtr, floatOff, f32Ty);
+        }
+        return floatOff;
+    }
     if (auto* vt = dyn_cast<FixedVectorType>(ty)) {
         Value* vec = Builder->CreateLoad(vt, ptr, "vec");
         for (unsigned i = 0; i < vt->getNumElements(); ++i) {
@@ -90,6 +114,14 @@ static Value* loadValue(Type* ty, Value* flatPtr, unsigned& floatOff, Type* f32T
         }
         return arr;
     }
+    if (auto* st = dyn_cast<StructType>(ty)) {  // matrix wrapper or struct varying
+        Value* agg = UndefValue::get(st);
+        for (unsigned i = 0; i < st->getNumElements(); ++i) {
+            Value* mem = loadValue(st->getElementType(i), flatPtr, floatOff, f32Ty);
+            agg = Builder->CreateInsertValue(agg, mem, { i });
+        }
+        return agg;
+    }
     if (auto* vt = dyn_cast<FixedVectorType>(ty)) {
         Value* vec = UndefValue::get(vt);
         for (unsigned i = 0; i < vt->getNumElements(); ++i) {
@@ -115,6 +147,14 @@ static void flattenValueSplit(Value* ptr, Type* ty, Value* fPtr, unsigned& fOff,
             Value* elemPtr = Builder->CreateInBoundsGEP(
                 at, ptr, { Builder->getInt32(0), Builder->getInt32(i) }, "arr.elt");
             flattenValueSplit(elemPtr, at->getElementType(), fPtr, fOff, dPtr, dOff, f32Ty, f64Ty);
+        }
+        return;
+    }
+    if (auto* st = dyn_cast<StructType>(ty)) {  // matrix wrapper or struct varying
+        for (unsigned i = 0; i < st->getNumElements(); ++i) {
+            Value* memPtr = Builder->CreateInBoundsGEP(
+                st, ptr, { Builder->getInt32(0), Builder->getInt32(i) }, "st.mem");
+            flattenValueSplit(memPtr, st->getElementType(i), fPtr, fOff, dPtr, dOff, f32Ty, f64Ty);
         }
         return;
     }
@@ -151,6 +191,14 @@ static Value* loadValueSplit(Type* ty, Value* fPtr, unsigned& fOff, Value* dPtr,
             arr = Builder->CreateInsertValue(arr, elem, { i });
         }
         return arr;
+    }
+    if (auto* st = dyn_cast<StructType>(ty)) {  // matrix wrapper or struct varying
+        Value* agg = UndefValue::get(st);
+        for (unsigned i = 0; i < st->getNumElements(); ++i) {
+            Value* mem = loadValueSplit(st->getElementType(i), fPtr, fOff, dPtr, dOff, f32Ty, f64Ty);
+            agg = Builder->CreateInsertValue(agg, mem, { i });
+        }
+        return agg;
     }
     if (auto* vt = dyn_cast<FixedVectorType>(ty)) {
         Value* vec = UndefValue::get(vt);
@@ -189,7 +237,10 @@ static Value* loadFieldFromFlat(Type* fieldTy, Value* flatPtr, unsigned floatOff
 
 // Emits pipeline invocation trampolines (vs_invoke, fs_invoke, cs_invoke/dispatch)
 // and exposes layout sizing data via global metadata constants for the host runtime
-static void emitPipelineTrampolines() {
+// Returns false if the shader's stage layout exceeds a fixed pipeline capacity;
+// the driver turns that into a non-zero exit rather than emitting a module the
+// rasterizer would overrun.
+static bool emitPipelineTrampolines() {
     auto* f32Ty = Type::getFloatTy(*Context);
     auto* f64Ty = Type::getDoubleTy(*Context);
     auto* i32Ty = Type::getInt32Ty(*Context);
@@ -207,6 +258,18 @@ static void emitPipelineTrampolines() {
                 unsigned n = typeFloatCount(outTy->getElementType(i));
                 totalFloats += n;
                 if (i > 0) varyingFloats += n;
+            }
+
+            // The rasterizer interpolates into fixed-size per-thread scratch
+            // arrays bounded by these counts, so an overflow here is a stack
+            // smash at render time, not a link error. One `out mat4` is 16
+            // floats by itself, which exactly saturates the budget.
+            if (varyingFloats > PIPELINE_MAX_VARYINGS) {
+                logError(fmt::format(
+                    "shader declares {} varying floats, but the pipeline supports "
+                    "at most {} (a mat4 varying alone costs 16)",
+                    varyingFloats, PIPELINE_MAX_VARYINGS));
+                return false;
             }
 
             new GlobalVariable(*TheModule, i32Ty, true, GlobalValue::ExternalLinkage,
@@ -399,4 +462,5 @@ static void emitPipelineTrampolines() {
             Builder->CreateRetVoid();
         }
     }
+    return true;
 }

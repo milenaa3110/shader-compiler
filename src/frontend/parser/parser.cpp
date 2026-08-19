@@ -30,8 +30,8 @@ public:
     // Kind of the token after cur
     TokenKind peekNext() const { return Next.kind; }
 
-    // Logs a syntax error at Cur.loc. Caps output at 'kMaxErrors' to prevent 
-    // terminal spam, returning std::nullptr_t for direct use as 'return error("...");'.
+    // Logs a syntax error at Cur.loc and suppresses errors after kMaxErrors.
+    // Returns nullptr so it can be used directly in return statements.
     std::nullptr_t error(const std::string& msg) {
         if (errorCount_ < kMaxErrors) {
             logErrorAt(Cur.loc, msg);
@@ -69,9 +69,8 @@ public:
         return n;
     }
 
-    // RAII source location snapshot. Constructs at parse method entry to capture 
-    // the current token's position, and stamps it onto the returned AST node via stamp().
-    // Safely acts as a no-op if the passed node pointer is null.
+    // Snapshot of the current token's source location, taken at parse method
+    // entry. stamp() writes it onto the returned AST node via Parser::at().
     class ScopedLoc {
      public:
         explicit ScopedLoc(const Parser& p) : loc_(p.Cur.loc) {}
@@ -84,10 +83,11 @@ public:
 
     std::vector<ExprAST*> ParseProgram();
 
+    static std::optional<ShaderStage> stageFromTok(TokenKind tok);
+
     ExprAST* parseStruct();
     ExprAST* parseFunction();
     std::optional<FunctionAttrs> parseFunctionAttrs();
-    static std::optional<ShaderStage> stageFromTok(TokenKind tok);
     ExprAST* parseStatement();
     ExprAST* parseBlockExpr();
     ExprAST* parseIfExpr();
@@ -103,18 +103,16 @@ public:
     ExprAST* parseVarDecl();
 
     // Parses assignments, compound-assignments, or standalone expressions.
-    // Stops before the terminator if consumeSemi is false.
+    // If consumeSemi is true, consumes the terminating ';'.
     ExprAST* parseAssignmentOrExprStatement(bool consumeSemi = true);
 
     // A standalone expression statement that does not begin with an identifier
-    // (grouped expr, literal, prefix ++/--, type constructor call). Parses one
-    // expression and requires a terminating ';'.
+    // (grouped expr, literal, prefix ++/--, type constructor call)
     ExprAST* parseExprStatement();
 
-    // Desugars compound assignments and complex lvalue mutations into binary 
+    // Converts compound assignments and complex lvalue mutations into binary
     // operations, reusing member/index store codegen.
-    ExprAST* makeCompoundAssign(ExprAST* target, TokenKind binOp, ExprAST* rhs,
-                                SourceLocation l);
+    ExprAST* makeCompoundAssign(ExprAST* target, TokenKind binOp, ExprAST* rhs, SourceLocation l);
 
     ExprAST* parseExpression();
     ExprAST* parseUnary();
@@ -247,15 +245,13 @@ private:
         typeName += "[" + std::to_string(sz) + "]";
         return true;
     }
-
 };
 
 // Parse program.
 //
 // Contextual Keywords split:
 //  * Attributes (@entry, @stage...) are explicit tokens (closed, fixed set).
-//  * Qualifiers (layout, binding...) are matched as raw identifier text (open-ended set; safely ignores unknown qualifiers).
-// DO NOT unify without auditing literal `Cur.text == "..."` matches below.
+//  * Qualifiers (layout, binding...) are matched as raw identifier text.
 std::vector<ExprAST*> Parser::ParseProgram() {
     std::vector<ExprAST*> program;
     std::unordered_map<ShaderStage, std::string> entryByStage;
@@ -308,8 +304,8 @@ std::vector<ExprAST*> Parser::ParseProgram() {
         } else if (peek() == TokenKind::Identifier && Cur.text == "layout") {
             // layout(binding=N, ...) uniform/buffer; layout(location=N) in/out.
             // `binding` names a resource slot (uniform/SSBO); `location` names
-            // an interstage IO slot. We track both and hand the relevant one to
-            // the matching declaration parser below.
+            // an interstage IO slot. Both are tracked here; the relevant one is
+            // handed to the matching declaration parser below.
             int binding = -1;
             int location = -1;
             next(); // 'layout'
@@ -1443,7 +1439,7 @@ ExprAST* Parser::parseIdentifierOrCtorExpr() {
 
 // Parses postfix expressions (member access, vector swizzles, array/matrix indexing, 
 // and trailing ++/--). Postfix nodes inherit the source position of their base operand.
-// Note: Postfix ++/-- uses a dedicated node to preserve old-value semantics (e.g., in a[i++]).
+// Postfix ++/-- uses a dedicated node to preserve old-value semantics (e.g., in a[i++]).
 ExprAST* Parser::parsePostfixAfterIdent(ExprAST* base) {
     while (true) {
         if (peek() == TokenKind::Dot) {
@@ -1506,7 +1502,7 @@ ExprAST* Parser::parseBinOpRHS(int exprPrecedence, ExprAST* lhs) {
     while (true) {
         // get precedence of current
         int tokPrecedence = precedence(peek());
-        // if this operator is lower precedence than what we are allowed, return lhs
+        // an operator below the minimum binding power ends this subexpression
         if (tokPrecedence < exprPrecedence) return lhs;
         // this is a binary operator
         TokenKind op = peek();

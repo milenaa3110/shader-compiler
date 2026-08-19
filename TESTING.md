@@ -43,8 +43,61 @@ From inside `build/`, plain `make <target>` also works.
 
 ### 1. Compiler unit tests
 ```bash
-cmake --build build --target check
+cmake --build build --target check          # compile every compiler_tests/*.src + llvm-as
+ctest --test-dir build                      # run every correctness gate below
 ```
+
+The correctness gates (each is a CTest case; run one directly with its script):
+
+| Gate | Script | What it checks |
+|------|--------|----------------|
+| `lexer_test` | `build/lexer_test` | Unit test of the buffer-backed lexer |
+| `sema_test` | `build/sema_test` | Type-system rules: result types + rejected constructs (no codegen) |
+| `ir_checks` | `test/script/run_ir_checks.sh` | FileCheck over emitted IR shape (needs FileCheck-18) |
+| `reject_tests` | `test/script/run_reject_tests.sh` | Shaders that must fail with an exact diagnostic; a crash is a failure |
+| `matrix_numeric` | `test/script/run_matrix_numeric.sh` | Links emitted IR to a hand-computed C++ driver and compares column-major results (needs clang-18) |
+| `sampler_numeric` | `test/script/run_sampler_numeric.sh` | Binds real per-face/slice/layer/texel data and checks sampled values on the RISC-V path (needs clang-18) |
+| `packet_test` | `test/script/run_packet_test.sh` | Emits `@fs_packet` and greps for the width-agnostic vectorized IR shape (select/if-else/discard/loop) |
+| `packet_runtime` | `test/script/run_packet_runtime.sh` | Runs a packet build under QEMU: VLEN banner smoke + build-width guard (marker≠runtime → loud abort) (needs cross-cc + QEMU) |
+| `texlayer_rv` | `test/rv_host/rv_host_texlayer.cpp` | Renders a cube/3D/array/2D + image2D shader under QEMU, binding via `bind_texture_layered`/`bind_texture`/`bind_image`; checks the pixel + image round-trip (needs cross-cc + QEMU) |
+| `compare_backends` | `test/script/compare_backends.sh` | Descriptive SPIR-V-vs-RISC-V static metrics table (bytes/opcodes/insns); no pass/fail (needs python3) |
+| `spirv_validate` | `test/script/run_spirv_val.sh` | `spirv-val` over every emitted `.spv` (needs spirv-val) |
+
+Matrix support is covered end-to-end across these: `sema_test` stamps the matrix
+type rules, `matrix_numeric` verifies arithmetic / component-wise ops / builtins
+(`transpose`, `inverse`, `determinant`, `matrixCompMult`, `outerProduct`) /
+assignment / `mat++`, `reject_tests` pins the diagnostics, and `spirv_validate`
+runs `matdemo.vert.spv` — the one shader that exercises the real `OpTypeMatrix`
+path (ColMajor/MatrixStride uniforms, column indexing incl. a *direct* index on a
+uniform matrix `uMVP[i]`, `mat == mat` in a bool context, and a matrix varying).
+
+Sampler/image support spans all types on both backends: `sampler2D/3D/Cube/2DArray`
++ `texture`/`textureLod`, and `image2D`/`imageBuffer` + `imageLoad`/`imageStore`.
+The SPIR-V backend dispatches per dimension (real `OpTypeImage` Cube/3D/2D-arrayed,
+`OpImageSampleExplicitLod`, `OpImageRead`/`OpImageWrite`), covered by
+`cubemap.frag.spv` and `imagestore.comp.spv` under `spirv_validate`; an unlowered
+sampler/image intrinsic now fails the build loudly instead of writing an invalid
+module. The RISC-V runtime (`src/runtime/tex_inline.cpp`) implements each intrinsic against
+real bound data — cube-face selection, 3D trilinear, array-layer select, and
+storage load/store, indexed by the sampler's binding slot. The `sampler_numeric`
+CTest binds real per-face/slice/layer/texel data and checks the sampled values
+(incl. an `imageStore`→`imageLoad` round-trip and that `textureLod` clamps to the
+base level). The `texlayer_rv` CTest closes the render-pipeline loop: it binds a
+cube/3D/array/2D texture and a read/write image2D via `bind_texture_layered`/
+`bind_texture`/`bind_image` and renders `texlayer_fs` under QEMU, checking the
+output pixel and the image round-trip end-to-end.
+
+> **Known limitation — layered render shaders use reduced opt.** `opt -O3`
+> miscompiles cube/3D/array/image sampling on the RISC-V backend: inlining the
+> `always_inline` sampler bodies (which write `float* out`, read back as
+> `<4 x float>` under `vscale_range`) into the shader yields a NULL-deref / wrong
+> pixel (LLVM-18 backend bug, reproduces at `llc -O0`, scalar and vector). The
+> runtime is correct — `sampler_numeric` and the x86 path pass, and a
+> **non-inlining** opt pipeline renders bit-exactly. So the `texlayer_rv` shader
+> object is built with a curated pipeline (mem2reg/sroa/gvn/dse/… — no inliner) +
+> `llc -O3` (see the CMake comment). 2D-only render shaders keep the aggressive
+> `-O3`; they don't hit the bug. Remaining follow-up: mip pyramids (`textureLod`
+> clamps to the base level) and root-causing the `-O3` inliner miscompile upstream.
 
 ### 2. Vulkan GPU animations (single shader)
 ```bash
@@ -129,6 +182,11 @@ bash test/script/run_benchmark_compute.sh --grid 128 --gens 500
 cmake --build build --target benchmark-diverge
 bash test/script/run_benchmark_diverge.sh [--quick]
 ```
+Section 1 times the CPU twice from the same binary — width-4 packet
+(`SHADER_PACKET=1`) and scalar per-pixel (`SHADER_PACKET` unset) — so the
+divergence efficiency of the two dispatch paths sits side by side with the GPU's.
+`pkt gain` is scalar ÷ packet; under QEMU it drops below 1.0× (see the RVV note
+in §11), so judge the packetizer with `bench_packet.sh` instead.
 
 ### 8. Compute shader benchmark (Gaussian blur)
 ```bash
@@ -148,11 +206,18 @@ cmake --build build --target compare-backends    # builds artifacts, prints tabl
 bash test/script/compare_backends.sh [--csv]     # if artifacts already built
 ```
 
-### 11. SPMD packetizer (width-4 SIMD)
+### 11. SPMD packetizer (VLEN-adaptive SIMD)
 ```bash
-bash test/script/run_packet_test.sh   # emit + per-lane equivalence + bit-identical render
-bash test/script/bench_packet.sh      # real SIMD speedup on host (~3.8×), sidesteps QEMU
+bash test/script/run_packet_test.sh     # emit-only: width-agnostic vectorized IR shape (select/if-else/discard/loop)
+bash test/script/run_packet_runtime.sh  # under QEMU: VLEN banner + build-width guard (mismatch → loud abort)
+bash test/script/bench_packet.sh        # real SIMD speedup on host (~3.8×), sidesteps QEMU
 ```
+The packet width is a single source of truth (`SHADER_PACKET_WIDTH`, default 4,
+`src/common/packet_width.h`) baked into both `irgen_riscv` (`kW`) and the runtime
+(`PACKET_W`). `irgen_riscv` stamps a `__shader_packet_width` marker into the shader
+`.rv`; the runtime aborts loudly on a mismatch (the SoA stride would otherwise
+silently corrupt every pixel). `-DSHADER_PACKET_WIDTH=auto` probes `vlenb` on a
+native RISC-V build (`VLEN/32` f32 lanes); cross/QEMU builds default to 4.
 Selected at runtime with `SHADER_PACKET=1` — set automatically by the `rv-*`
 animation/mesh targets and the `benchmark-fragment/vertex/mesh/diverge` +
 `cpu-scaling` targets (shaders outside the supported subset fall back to scalar).

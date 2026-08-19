@@ -12,6 +12,7 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/Utils/ModuleUtils.h>
 #include <iostream>
 #include <iterator>
 #include <string>
@@ -60,8 +61,10 @@ int main(int argc, char* argv[]) {
     bool hasStageEntry = false;
     for (auto& F : *TheModule)
         if (F.hasMetadata("shader.stage")) { hasStageEntry = true; break; }
-    if (hasStageEntry)
-        emitPipelineTrampolines();
+    if (hasStageEntry && !emitPipelineTrampolines()) {
+        logError("Pipeline trampoline emission failed");
+        return 1;
+    }
 
     // Route B: emit a width-W SPMD `fs_packet` variant of the fragment shader
     // when it is within the packetizer's supported subset. Always attempted (the
@@ -76,6 +79,21 @@ int main(int argc, char* argv[]) {
                              : "packet: bailed (")
                       << (ok ? std::to_string(fspacket::kW) + ")" : "unsupported constructs)")
                       << "\n";
+    }
+
+    // Build-width marker: the runtime checks this against its PACKET_W. A width
+    // mismatch would silently corrupt the SoA stride, so make it a loud failure.
+    // LinkOnceODR so vs+fs modules llvm-link'd into one .rv object merge cleanly
+    // (all built with the same kW → same value). It has no in-module users, so
+    // append it to llvm.used — otherwise `opt -O3` (GlobalDCE) strips it before
+    // llc and the runtime's strong reference fails to link.
+    if (!TheModule->getGlobalVariable("__shader_packet_width")) {
+        auto* i32Ty = Type::getInt32Ty(*Context);
+        auto* marker = new GlobalVariable(*TheModule, i32Ty, /*isConstant=*/true,
+                           GlobalValue::LinkOnceODRLinkage,
+                           ConstantInt::get(i32Ty, fspacket::kW),
+                           "__shader_packet_width");
+        llvm::appendToUsed(*TheModule, {marker});
     }
 
     // Stamp RISC-V target triple + data layout

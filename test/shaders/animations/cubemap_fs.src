@@ -1,0 +1,20 @@
+# cubemap_fs.src — makes spirv-val exercise the non-2D sampler paths: cube, 3D,
+# and 2D-array sampling plus explicit-LOD. One texture of each so analyzeSamplers
+# emits OpTypeImage Cube / 3D / 2D-arrayed and the sampling ops validate.
+
+uniform samplerCube uCube;
+uniform sampler3D uVol;
+uniform sampler2DArray uArr;
+uniform sampler2D uTex;
+
+in vec3 vDir;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    vec4 c = texture(uCube, vDir);
+    c = c + texture(uVol, vDir);
+    c = c + texture(uArr, vDir);
+    c = c + textureLod(uTex, vDir.xy, 1.0);
+    FragColor = c;
+}

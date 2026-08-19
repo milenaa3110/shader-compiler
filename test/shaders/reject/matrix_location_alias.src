@@ -1,0 +1,18 @@
+# checkStageVarLocations advanced by one slot per stage variable and reserved
+# only that slot, but a matCxR is passed as C column vectors and spans C
+# consecutive locations. This pair was reported clean while mat4 at location 0
+# actually occupies 0..3, aliasing vC at 1. The backend allocator in
+# emit_spirv_from_ir.h had the identical off-by-C, so nothing downstream caught
+# it either.
+
+layout(location=0) out mat4 vM;
+layout(location=1) out vec4 vC;
+
+@entry @stage(vertex)
+fn void main() {
+    vM = mat4(1.0);
+    vC = vec4(1.0);
+    gl_Position = vec4(0.0);
+}
+
+# EXPECT-ERROR: output location 1 of 'vC' collides with 'vM'

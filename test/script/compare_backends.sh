@@ -81,10 +81,13 @@ rv_metrics() {
 
 #  shader sets 
 # Fragment shaders whose <name>_rv.o is the fragment alone (1:1 with .frag.spv).
-FRAG=(cellular city diverge earth fire galaxy julia mandelbrot ocean
+FRAG=(cellular city diverge earth fire galaxy julia mandelbrot matrix ocean
       reaction ripple scene3d tunnel voronoi waves)
 # Compute shaders: <name>.comp.spv  vs  <name>_cs_rv.o.
-COMP=(blur life)
+# `volume` is the sampler3D + imageStore kernel; its RISC-V object is built with
+# the reduced no-inliner pipeline, so its instruction count is not comparable to
+# blur/life on the opt-level axis — only on the backend axis.
+COMP=(blur life volume)
 # Graphics pipelines: vert+frag .spv  vs  one bundled <name>_rv.o.
 PIPE=(mesh terrain)
 

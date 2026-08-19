@@ -1,0 +1,14 @@
+# imagestore_cs.src — makes spirv-val exercise storage images: image2D and
+# imageBuffer load/store lower to OpImageRead / OpImageWrite (Sampled=2, with the
+# StorageImageRead/WriteWithoutFormat and ImageBuffer capabilities).
+
+layout(binding=0) uniform image2D uImg;
+layout(binding=1) uniform imageBuffer uBuf;
+
+@entry @stage(compute)
+fn void main() {
+    vec4 c = imageLoad(uImg, ivec2(1, 2));
+    imageStore(uImg, ivec2(3, 4), c + vec4(0.5));
+    vec4 b = imageLoad(uBuf, 5);
+    imageStore(uBuf, 6, b * 2.0);
+}

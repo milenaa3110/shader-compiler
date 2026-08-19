@@ -1,6 +1,6 @@
 // error_utils_fmt.h — format-string error logger, depends on libfmt.
-// Use this header from host-compiled translation units that link fmt::fmt.
-// Cross-compiled (RISC-V) sources should use plain "error_utils.h".
+// Included by host-compiled translation units that link fmt::fmt.
+// Cross-compiled (RISC-V) sources take plain "error_utils.h" instead.
 #ifndef COMPILER_GLSL_ERROR_UTILS_FMT_H
 #define COMPILER_GLSL_ERROR_UTILS_FMT_H
 
@@ -20,13 +20,10 @@ inline void logErrorContext(const std::string& context, const std::string& msg) 
     logError(fmt::format("{}: {}", context, msg));
 }
 
-// ─── Source-buffer registry for caret diagnostics ──────────────────────────
-//
-// Held as file-scope state because every TU includes this header and the
-// compilers are single-threaded. Set once by the entry point right before
-// ParseProgram, used by logErrorAt to underline the offending column.
-// Empty buffer ⇒ caret rendering is skipped and the old plain-text format
-// is used — keeps fallback behaviour for tools that don't track source.
+// Source buffer used for caret diagnostics.
+// Registered before parsing and cleared afterwards.
+// Without a buffer, diagnostics fall back to plain text.
+
 namespace diag {
 
 inline SourceManager& currentSource() {
@@ -40,18 +37,11 @@ inline void setSource(std::string_view buf, std::string_view name = "<stdin>") {
 
 inline void clearSource() { currentSource() = SourceManager(); }
 
-}  // namespace diag
+} // namespace diag
 
-// Source-located error. With a registered source buffer the output looks
-// like clang:
-//
-//     [ERROR] shader.src:6:13: Expected ';' after assignment
-//         float x = 1.0
-//                     ^
-//
-// Without one, falls back to the original one-liner so cross-compiled
-// runtime code keeps working. The location is an opaque offset; the
-// SourceManager turns it into line/column and pulls the source line.
+// Source-located error. With a registered source buffer, prints the
+// file name, line, column, source line, and a caret pointing to the error.
+// Without a source buffer, falls back to a one-line diagnostic.
 inline void logErrorAt(SourceLocation loc, const std::string& msg) {
     auto& sm = diag::currentSource();
     auto lc = sm.getLineCol(loc);

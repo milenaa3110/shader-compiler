@@ -6,7 +6,7 @@ set -euo pipefail
 # Resolve project directories relative to script location.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$SCRIPT_DIR/../.."
-IRGEN="$ROOT/build/riscv/irgen_riscv"
+IRGEN="${IRGEN:-$ROOT/build/riscv/irgen_riscv}"
 SHADER_DIR="$ROOT/test/shaders/compiler_tests"
 LLVM_AS="${LLVM_AS:-llvm-as-18}"
 TMP_DIR="$(mktemp -d)"

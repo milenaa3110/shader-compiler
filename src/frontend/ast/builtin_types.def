@@ -6,8 +6,7 @@
 //   BTYPE_VECTOR(Tok, Spelling, GlslElem, LlvmElem, N)
 //   BTYPE_MATRIX(Tok, Spelling, Cols, Rows)
 //   BTYPE_SAMPLER(Tok, Spelling, Kind, Dim, Arrayed, IsImage)
-//
-// Note: `void` is intentionally omitted. No include guards (multi-inclusion).
+
 
 #ifndef BTYPE
 #define BTYPE(Tok, Spelling)
@@ -50,6 +49,9 @@ BTYPE_MATRIX(Mat3x2, "mat3x2", 3, 2)
 BTYPE_MATRIX(Mat3x4, "mat3x4", 3, 4)
 BTYPE_MATRIX(Mat4x2, "mat4x2", 4, 2)
 BTYPE_MATRIX(Mat4x3, "mat4x3", 4, 3)
+BTYPE_MATRIX(Mat2x2, "mat2x2", 2, 2)
+BTYPE_MATRIX(Mat3x3, "mat3x3", 3, 3)
+BTYPE_MATRIX(Mat4x4, "mat4x4", 4, 4)
 
 BTYPE_SAMPLER(Sampler2D,      "sampler2D",      Sampler2D,      Dim2D,     0, 0)
 BTYPE_SAMPLER(Sampler3D,      "sampler3D",      Sampler3D,      Dim3D,     0, 0)

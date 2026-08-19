@@ -1,0 +1,12 @@
+# A literal subscript past the end lowered to `getelementptr inbounds` beyond
+# the object. Nothing in sema or codegen compared a constant index against the
+# container's extent.
+
+uniform mat4 MVP;
+
+@entry @stage(vertex)
+fn void main() {
+    gl_Position = MVP[9];
+}
+
+# EXPECT-ERROR: index 9 is out of range for 'mat4' (valid range 0..3)

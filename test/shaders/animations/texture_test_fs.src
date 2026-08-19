@@ -1,6 +1,5 @@
 # texture_test_fs.src — Procedural marble texture with 9-tap multi-sample
-# CPU-side counterpart to test/shaders/spirv_vulkan/texture_test.frag.
-#
+
 # GPU uses VkImage + VkSampler: each tap is one TMU instruction — hardware
 # bilinear interpolation for free, with a dedicated texture cache.
 # CPU must evaluate the marble formula 9x per pixel — pure ALU, no silicon shortcut.

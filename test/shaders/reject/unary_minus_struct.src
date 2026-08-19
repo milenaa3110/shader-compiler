@@ -1,0 +1,15 @@
+# Unary minus on a non-numeric operand. Sema propagated the operand type
+# unchecked, so this reached codegen, where naming the type went through
+# llvm::Type::getStructName() — an unchecked cast<StructType> — and aborted the
+# compiler with std::bad_alloc instead of producing a diagnostic.
+
+struct S { float a; };
+
+@entry @stage(vertex)
+fn void main() {
+    S s;
+    S t = -s;
+    gl_Position = vec4(1.0);
+}
+
+# EXPECT-ERROR: unary '-' requires a numeric or matrix operand

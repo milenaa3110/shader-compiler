@@ -490,6 +490,25 @@ const Type* SemanticAnalyzer::typeExpr(ExprAST* node) {
           ++errorCount_;
         }
         t = Ctx.getBoolTy();
+      } else if (u->Op == TokenKind::Minus || u->Op == TokenKind::BitwiseNot) {
+        // Unchecked propagation would let '-someStruct' and '-mat3' through to
+        // codegen, where naming the operand type crashes the compiler.
+        auto elem = [](const Type* t) { return t->isVector() ? t->elementType() : t; };
+        const bool ok =
+            !o || (u->Op == TokenKind::Minus
+                       ? (o->isMatrix() || elem(o)->isInt() || elem(o)->isUint() ||
+                          elem(o)->isFloat() || elem(o)->isDouble())
+                       : elem(o)->isIntegral());
+        if (!ok) {
+          logErrorAt(u->loc,
+                     fmt::format("unary {} requires {} operand, not '{}'",
+                                 tokenKindName(u->Op),
+                                 u->Op == TokenKind::Minus ? "a numeric or matrix"
+                                                           : "an integer",
+                                 o->toString()));
+          ++errorCount_;
+        }
+        t = o;
       } else {
         t = o;
       }
@@ -501,6 +520,13 @@ const Type* SemanticAnalyzer::typeExpr(ExprAST* node) {
       const Type* r = typeExpr(b->RHS);
       checkOperandTypes(b->Op, l, r, b->loc);  // reject bool arithmetic, etc.
       t = inferBinaryType(b->Op, l, r);
+      // commonOperandType has no matrix case, so the generic promotion below
+      // never fires for a matrix operand — an integer vector or scalar would
+      // reach codegen unconverted and produce ill-typed IR.
+      if (t && (l->isMatrix() || r->isMatrix())) {
+        coerceMatrixOperands(b);
+        break;
+      }
       // Promote operands to their common type.
       if (coercesOperands(b->Op)) {
         if (const Type* common = commonOperandType(l, r)) {
@@ -508,7 +534,7 @@ const Type* SemanticAnalyzer::typeExpr(ExprAST* node) {
           b->RHS = coerceOperand(b->RHS, common);
         } else if (l && r && l->isVector() && r->isVector()) {
           logErrorAt(b->loc, fmt::format(
-              "operator '{}' on vectors of different sizes ('{}' and '{}')",
+              "operator {} on vectors of different sizes ('{}' and '{}')",
               tokenKindName(b->Op), l->toString(), r->toString()));
           ++errorCount_;
         }
@@ -538,6 +564,7 @@ const Type* SemanticAnalyzer::typeExpr(ExprAST* node) {
       auto* c = llvm::cast<CallExprAST>(node);
       for (auto* arg : c->Args) typeExpr(arg);
       if (const Type* ctor = resolveTypeName(c->Callee)) {
+        checkConstructorCall(ctor, c->Args, c->loc);
         t = ctor;
       } else if (auto it = funcSignatures_.find(c->Callee);
                  it != funcSignatures_.end()) {
@@ -548,11 +575,18 @@ const Type* SemanticAnalyzer::typeExpr(ExprAST* node) {
                            params[i], c->Args[i]->loc, "argument");
           c->Args[i] = coerce(c->Args[i], params[i]);  // widen arg → param type
         }
-      } else {
+      } else if (isKnownBuiltin(c->Callee)) {
         std::vector<const Type*> argTys;
         argTys.reserve(c->Args.size());
         for (auto* a : c->Args) argTys.push_back(a ? a->getType() : nullptr);
-        t = typeBuiltinCall(c->Callee, argTys);
+        t = typeBuiltinCall(c->Callee, argTys, c->loc);
+      } else {
+        // Diagnosed here rather than left untyped: every downstream check is
+        // null-tolerant, so the error would only surface in codegen as
+        // "Unknown function referenced", with no source location.
+        logErrorAt(c->loc,
+                   fmt::format("call to undeclared function '{}'", c->Callee));
+        ++errorCount_;
       }
       break;
     }
@@ -576,12 +610,15 @@ const Type* SemanticAnalyzer::typeExpr(ExprAST* node) {
     }
     case K::MatrixAccess: {
       auto* m = llvm::cast<MatrixAccessExprAST>(node);
-      const Type* afterFirst = indexOnce(typeExpr(m->Object));
+      const Type* objTy = typeExpr(m->Object);
+      const Type* afterFirst = indexOnce(objTy);
       typeExpr(m->Index);
       checkIndexType(m->Index);
+      checkIndexBounds(objTy, m->Index);
       if (m->Index2) {
         typeExpr(m->Index2);
         checkIndexType(m->Index2);
+        checkIndexBounds(afterFirst, m->Index2);
         t = indexOnce(afterFirst);  // mat[i][j] → scalar
       } else {
         t = afterFirst;  // arr[i] → elem,  mat[i] → column vector
@@ -591,12 +628,15 @@ const Type* SemanticAnalyzer::typeExpr(ExprAST* node) {
     case K::MatrixAssignment: {
       auto* m = llvm::cast<MatrixAssignmentExprAST>(node);
       reportIfConstWrite(m->Object, m->loc);
-      const Type* target = indexOnce(typeExpr(m->Object));  // a[i] → elem/column
+      const Type* objTy = typeExpr(m->Object);
+      const Type* target = indexOnce(objTy);  // a[i] → elem/column
       typeExpr(m->Index);
       checkIndexType(m->Index);
+      checkIndexBounds(objTy, m->Index);
       if (m->Index2) {
         typeExpr(m->Index2);
         checkIndexType(m->Index2);
+        checkIndexBounds(target, m->Index2);
         target = indexOnce(target);  // a[i][j] → scalar
       }
       typeExpr(m->RHS);
@@ -664,20 +704,48 @@ const Type* SemanticAnalyzer::commonOperandType(const Type* l, const Type* r) {
 // Verifies if a matrix binary operation matches standard layout dimensions (matCxR has C columns, R rows).
 static bool matrixDimsOK(TokenKind op, const glsl::Type* l, const glsl::Type* r) {
   const bool mul = op == TokenKind::Multiply;
+  // Matrices are float-only. An integer operand is legal GLSL (it converts,
+  // per glslangValidator) but must be widened before codegen, or it lowers to
+  // an ill-typed `fmul <4 x float>, <4 x i32>` — see coerceMatrixOperands.
+  // bool is not numeric and has no conversion here.
+  auto numVec = [](const glsl::Type* v) { return !v->elementType()->isBool(); };
   if (mul && l->isMatrix() && r->isVector())
-    return r->vectorSize() == l->matrixCols();   // matCxR * vecC
+    return r->vectorSize() == l->matrixCols() && numVec(r);  // matCxR * vecC
   if (mul && l->isVector() && r->isMatrix())
-    return l->vectorSize() == r->matrixRows();   // vecR * matCxR
+    return l->vectorSize() == r->matrixRows() && numVec(l);  // vecR * matCxR
   if (mul && l->isMatrix() && r->isMatrix())
     return l->matrixCols() == r->matrixRows();   // matCxR * matKxC
+  // Numeric scalars only — bool is isScalar(), and `mat4 * true` would be valid without this check
+  auto numScalar = [](const glsl::Type* s) {
+    return s->isInt() || s->isUint() || s->isFloat() || s->isDouble();
+  };
   if (mul && (l->isMatrix() ^ r->isMatrix()) &&
-      (l->isScalar() || r->isScalar()))
-    return true;                                 // mat * scalar (scaling)
-  if ((op == TokenKind::Plus || op == TokenKind::Minus) &&
+      (numScalar(l) || numScalar(r)))
+    return true; // mat * scalar (scaling)
+ // Non-multiplication ops (+, -, /) between a matrix and a scalar 
+ // apply component-wise (e.g., mat + scalar or scalar / mat).
+  if ((op == TokenKind::Plus || op == TokenKind::Minus ||
+       op == TokenKind::Divide) &&
+      (l->isMatrix() ^ r->isMatrix()) && (numScalar(l) || numScalar(r)))
+    return true;                                 // mat±scalar, scalar±mat, mat/scalar, scalar/mat
+  if (op == TokenKind::Divide && l->isMatrix() && r->isMatrix())
+    return l->matrixCols() == r->matrixCols() &&
+           l->matrixRows() == r->matrixRows();   // mat / mat (component-wise)
+  if ((op == TokenKind::Plus || op == TokenKind::Minus ||
+       op == TokenKind::Equal || op == TokenKind::NotEqual) &&
       l->isMatrix() && r->isMatrix())
     return l->matrixCols() == r->matrixCols() &&
-           l->matrixRows() == r->matrixRows();   // mat ± mat, same shape
+           l->matrixRows() == r->matrixRows();   // mat ± mat / mat == mat
   return false;
+}
+
+// The operators GLSL defines with at least one matrix operand. Anything else
+// (ordered relations, %, shifts, bitwise) is undefined on matrices, and saying
+// so beats the generic "requires numeric operands" message.
+static bool isMatrixCapableOp(TokenKind op) {
+  return op == TokenKind::Multiply || op == TokenKind::Divide ||
+         op == TokenKind::Plus || op == TokenKind::Minus ||
+         op == TokenKind::Equal || op == TokenKind::NotEqual;
 }
 
 // Infer result type of matrix-based binary operations.
@@ -706,9 +774,175 @@ const Type* SemanticAnalyzer::inferBinaryType(TokenKind op, const Type* l,
   return nullptr;
 }
 
+// genType builtins mirror the vector shape of their composite argument.
+static const std::unordered_set<std::string>& genTypeBuiltins() {
+  static const std::unordered_set<std::string> s = {
+      "sin",  "cos",   "tan",    "floor",      "ceil",   "round",
+      "trunc","fract", "exp",    "log",        "exp2",   "log2",
+      "sqrt", "abs",   "sign",   "normalize",  "mix",    "mod",
+      "max",  "min",   "clamp",  "pow",        "reflect","fma",
+      "step", "smoothstep", "dFdx", "dFdy",    "fwidth"};
+  return s;
+}
+
+// Builtins whose return type does not depend on the arguments.
+static const std::unordered_set<std::string>& fixedReturnBuiltins() {
+  static const std::unordered_set<std::string> s = {
+      "dot", "length", "distance", "cross", "texture", "textureLod",
+      "imageLoad", "imageStore", "barrier", "memoryBarrier",
+      "groupMemoryBarrier"};
+  return s;
+}
+
+// Returns the set of GLSL matrix builtins that require custom return-type resolution.
+static const std::unordered_set<std::string>& matrixBuiltins() {
+  static const std::unordered_set<std::string> s = {
+      "transpose", "inverse", "determinant", "matrixCompMult", "outerProduct"};
+  return s;
+}
+
+// The float-element counterpart of an integer scalar or vector, for widening a
+// matrix's partner operand. Returns null when nothing needs to change.
+const Type* SemanticAnalyzer::floatFormOf(const Type* t) {
+  if (!t) return nullptr;
+  if (t->isInt() || t->isUint()) return Ctx.getFloatTy();
+  if (t->isVector() && !t->elementType()->isFloat() &&
+      !t->elementType()->isBool())
+    return Ctx.getVectorTy(Ctx.getFloatTy(), t->vectorSize());
+  return nullptr;
+}
+
+// Widen a matrix expression's non-matrix operand to float. GLSL allows
+// `mat4 * ivec4` and `mat3 * 2`, but matrices are float-only, so without this
+// the operand reaches codegen as an integer vector and lowers to
+// `fmul <4 x float>, <4 x i32>` — IR the verifier rejects. Matrices themselves
+// are never cast (ImplicitCastExprAST asserts on a matrix destination).
+void SemanticAnalyzer::coerceMatrixOperands(BinaryExprAST* b) {
+  if (const Type* f = floatFormOf(b->LHS ? b->LHS->getType() : nullptr))
+    b->LHS = coerce(b->LHS, f);
+  if (const Type* f = floatFormOf(b->RHS ? b->RHS->getType() : nullptr))
+    b->RHS = coerce(b->RHS, f);
+}
+
+// Scalar components a value contributes to a constructor's argument list.
+static unsigned componentCount(const glsl::Type* t) {
+  if (!t) return 0;
+  if (t->isMatrix()) return t->matrixCols() * t->matrixRows();
+  if (t->isVector()) return t->vectorSize();
+  if (t->isScalar()) return 1;
+  return 0;  // sampler / struct / array — not a constructor component
+}
+
+// Arity and argument-type checking for a constructor call. Without it a call is
+// stamped with its named type and nothing more, so mat4(true) and mat3(1.0, 2.0)
+// reach codegen, where some are diagnosed twice (nullptr means both "not mine"
+// and "mine but failed", so the dispatcher falls through) and others silently
+// build a wrong value.
+void SemanticAnalyzer::checkConstructorCall(const Type* ctorTy,
+                                            const std::vector<ExprAST*>& args,
+                                            SourceLocation loc) {
+  if (!ctorTy) return;
+  // Struct and array constructors have their own shapes; samplers are opaque.
+  if (ctorTy->isStruct() || ctorTy->isArray() || ctorTy->isSampler()) return;
+
+  // An untyped argument means an error was already reported for it; a second
+  // diagnostic here would just be noise.
+  for (auto* a : args)
+    if (!a || !a->getType()) return;
+
+  // Bool arguments are legal — GLSL converts them like any other scalar,
+  // so mat4(true) is identity and vec2(true, false) is (1.0, 0.0). Verified
+  // against glslangValidator.
+  const std::string name = ctorTy->toString();
+  for (auto* a : args) {
+    if (componentCount(a->getType()) == 0) {
+      logErrorAt(a->loc,
+                 fmt::format("constructor '{}' cannot take an argument of type "
+                             "'{}'", name, a->getType()->toString()));
+      ++errorCount_;
+      return;
+    }
+  }
+
+  if (ctorTy->isMatrix()) {
+    const unsigned cols = ctorTy->matrixCols(), rows = ctorTy->matrixRows();
+    if (args.empty()) return;                        // identity
+    if (args.size() == 1) {
+      const Type* at = args[0]->getType();
+      if (at->isScalar() || at->isMatrix()) return;  // diagonal / narrowing
+      logErrorAt(loc, fmt::format("constructor '{}' takes a scalar or another "
+                                  "matrix, not '{}'", name, at->toString()));
+      ++errorCount_;
+      return;
+    }
+    // GLSL flattens the argument list column-major and requires exactly C*R
+    // components; the "C column vectors" form is just the case where each
+    // argument happens to supply R of them. Checking the total rather than the
+    // argument count also settles mat2, where cols == 2 and cols*rows == 4 make
+    // any count-based rule ambiguous. mat2(vec2(1,2), 3.0, 4.0) is legal —
+    // confirmed against glslangValidator.
+    unsigned supplied = 0;
+    for (auto* a : args) supplied += componentCount(a->getType());
+    if (supplied == cols * rows) return;
+    logErrorAt(loc,
+               fmt::format("constructor '{}' takes {} column vectors of size {} "
+                           "or {} scalars, got {} arguments",
+                           name, cols, rows, cols * rows, args.size()));
+    ++errorCount_;
+    return;
+  }
+
+  const unsigned want = ctorTy->isVector() ? ctorTy->vectorSize() : 1;
+  if (args.empty()) {
+    logErrorAt(loc,
+               fmt::format("constructor '{}' requires at least one argument",
+                           name));
+    ++errorCount_;
+    return;
+  }
+  if (!ctorTy->isVector()) {
+    // Scalar conversion takes exactly one argument. It need not be a scalar:
+    // GLSL defines float(vec3) as taking the first component.
+    if (args.size() != 1) {
+      logErrorAt(loc,
+                 fmt::format("constructor '{}' takes exactly one argument, got "
+                             "{}", name, args.size()));
+      ++errorCount_;
+    }
+    return;
+  }
+
+  // A single scalar splats to fill any vector; that is not over-supply.
+  if (args.size() == 1 && args[0]->getType()->isScalar()) return;
+
+  // Under-fill is tolerated (codegen pads with 0, and w=1 for vec4), but an
+  // argument that starts past the end of the value is unambiguously wrong.
+  unsigned before = 0;
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (before >= want) {
+      logErrorAt(args[i]->loc,
+                 fmt::format("constructor '{}' takes {} components, but "
+                             "argument {} starts past the end",
+                             name, want, i + 1));
+      ++errorCount_;
+      return;
+    }
+    before += componentCount(args[i]->getType());
+  }
+}
+
+// Checks if name is a valid GLSL builtin, decoupling name lookup from argument validation.
+// Prevents unknown functions from silently passing Sema and failing later in codegen.
+bool SemanticAnalyzer::isKnownBuiltin(const std::string& name) {
+  return fixedReturnBuiltins().count(name) > 0 ||
+         genTypeBuiltins().count(name) > 0 ||
+         matrixBuiltins().count(name) > 0;
+}
+
 // Look up and determine the return type of a standard GLSL builtin function.
 const Type* SemanticAnalyzer::typeBuiltinCall(
-    const std::string& name, const std::vector<const Type*>& args) {
+    const std::string& name, const std::vector<const Type*>& args,
+    SourceLocation loc) {
   if (name == "dot" || name == "length" || name == "distance")
     return Ctx.getFloatTy();
   if (name == "cross") return Ctx.getVec3Ty();
@@ -718,17 +952,67 @@ const Type* SemanticAnalyzer::typeBuiltinCall(
       name == "groupMemoryBarrier")
     return Ctx.getVoidTy();
 
-    // genType builtins mirror the vector shape of their composite argument.
-  static const std::unordered_set<std::string> genType = {
-      "sin",  "cos",   "tan",    "floor",      "ceil",   "round",
-      "trunc","fract", "exp",    "log",        "exp2",   "log2",
-      "sqrt", "abs",   "sign",   "normalize",  "mix",    "mod",
-      "max",  "min",   "clamp",  "pow",        "reflect","fma",
-      "step", "smoothstep", "dFdx", "dFdy",    "fwidth"};
+  if (matrixBuiltins().count(name))
+    return typeMatrixBuiltin(name, args, loc);
+
+  const auto& genType = genTypeBuiltins();
   if (genType.count(name)) {
     for (const Type* a : args)
       if (a && a->isVector()) return a;
     return args.empty() ? nullptr : args[0];
+  }
+  return nullptr;
+}
+
+// Return type + argument validation for the GLSL matrix builtins. A shape error
+// (e.g. inverse of a non-square matrix) is diagnosed here and returns nullptr;
+// leaving it untyped would only surface later, in codegen, without a location.
+const Type* SemanticAnalyzer::typeMatrixBuiltin(
+    const std::string& name, const std::vector<const Type*>& args,
+    SourceLocation loc) {
+  auto err = [&](const std::string& msg) -> const Type* {
+    logErrorAt(loc, msg);
+    ++errorCount_;
+    return nullptr;
+  };
+  auto arg = [&](size_t i) -> const Type* {
+    return i < args.size() && args[i] ? args[i] : nullptr;
+  };
+
+  if (name == "transpose") {
+    const Type* m = arg(0);
+    if (args.size() != 1 || !m || !m->isMatrix())
+      return err("'transpose' takes one matrix argument");
+    return Ctx.getMatrixTy(m->matrixRows(), m->matrixCols());  // matCxR → matRxC
+  }
+  if (name == "inverse" || name == "determinant") {
+    const Type* m = arg(0);
+    if (args.size() != 1 || !m || !m->isMatrix())
+      return err(fmt::format("'{}' takes one matrix argument", name));
+    if (m->matrixCols() != m->matrixRows())
+      return err(fmt::format("'{}' requires a square matrix, got '{}'", name,
+                             m->toString()));
+    return name == "inverse" ? m : Ctx.getFloatTy();
+  }
+  if (name == "matrixCompMult") {
+    const Type* a = arg(0);
+    const Type* b = arg(1);
+    if (args.size() != 2 || !a || !b || !a->isMatrix() || !b->isMatrix())
+      return err("'matrixCompMult' takes two matrix arguments");
+    if (a->matrixCols() != b->matrixCols() ||
+        a->matrixRows() != b->matrixRows())
+      return err(fmt::format(
+          "'matrixCompMult' requires matrices of the same shape, got '{}' and "
+          "'{}'", a->toString(), b->toString()));
+    return a;
+  }
+  if (name == "outerProduct") {
+    const Type* u = arg(0);
+    const Type* v = arg(1);
+    if (args.size() != 2 || !u || !v || !u->isVector() || !v->isVector())
+      return err("'outerProduct' takes two vector arguments");
+    // outerProduct(vecR, vecC) → matCxR (C columns, R rows).
+    return Ctx.getMatrixTy(v->vectorSize(), u->vectorSize());
   }
   return nullptr;
 }
@@ -758,6 +1042,48 @@ const Type* SemanticAnalyzer::indexOnce(const Type* t) {
   if (t->isMatrix()) return Ctx.getVectorTy(Ctx.getFloatTy(), t->matrixRows());
   if (t->isVector()) return t->elementType();
   return nullptr;
+}
+
+// Calculates interface location slots. Must sync with SPIR-V backend.
+static unsigned locationSlots(const glsl::Type* t) {
+  return (t && t->isMatrix()) ? t->matrixCols() : 1;
+}
+
+// Number of elements a subscript may address: matrix columns, array elements,
+// vector components. 0 means "not indexable / unbounded" (unsized arrays).
+static unsigned indexExtent(const glsl::Type* t) {
+  if (!t) return 0;
+  if (t->isMatrix()) return t->matrixCols();
+  if (t->isVector()) return t->vectorSize();
+  if (t->isArray()) return t->arraySize();  // 0 for unsized — skipped below
+  return 0;
+}
+
+// A literal subscript is checkable here, and worth checking: an out-of-range one
+// lowered to a `getelementptr inbounds` past the end of the object.
+void SemanticAnalyzer::checkIndexBounds(const Type* container, ExprAST* idx) {
+  if (!idx || !container) return;
+  const unsigned extent = indexExtent(container);
+  if (extent == 0) return;  // unsized array or not indexable
+
+  // A negative literal parses as unary minus over a number, not a number.
+  double sign = 1.0;
+  ExprAST* e = idx;
+  if (auto* u = llvm::dyn_cast<UnaryExprAST>(e);
+      u && u->Op == TokenKind::Minus) {
+    sign = -1.0;
+    e = u->Operand;
+  }
+  auto* n = llvm::dyn_cast_or_null<NumberExprAST>(e);
+  if (!n || !n->isInt) return;  // dynamic index — nothing to check here
+
+  const double v = sign * n->Val;
+  if (v < 0 || v >= (double)extent) {
+    logErrorAt(idx->loc,
+               fmt::format("index {} is out of range for '{}' (valid range 0..{})",
+                           (long long)v, container->toString(), extent - 1));
+    ++errorCount_;
+  }
 }
 
 // Injects an ImplicitCastExprAST if 'e' implicitly converts to 'target' under assignment rules.
@@ -828,27 +1154,28 @@ void SemanticAnalyzer::checkOperandTypes(TokenKind op, const Type* l,
 
   if (l->isMatrix() || r->isMatrix()) {
     if (matrixDimsOK(op, l, r)) return;
-    if (op == TokenKind::Multiply || op == TokenKind::Plus ||
-        op == TokenKind::Minus) {
-      logErrorAt(loc, fmt::format(
-          "incompatible dimensions for '{}': '{}' and '{}'",
-          tokenKindName(op), l->toString(), r->toString()));
-      ++errorCount_;
-      return;
-    }
+    logErrorAt(loc,
+               isMatrixCapableOp(op)
+                   ? fmt::format("incompatible dimensions for {}: '{}' and '{}'",
+                                 tokenKindName(op), l->toString(), r->toString())
+                   : fmt::format("operator {} is not defined for matrix "
+                                 "operands '{}' and '{}'",
+                                 tokenKindName(op), l->toString(), r->toString()));
+    ++errorCount_;
+    return;
   }
 
   if (arith || relational) {
     if (!numeric(elem(l)) || !numeric(elem(r))) {
       logErrorAt(loc, fmt::format(
-          "operator '{}' requires numeric operands, got '{}' and '{}'",
+          "operator {} requires numeric operands, got '{}' and '{}'",
           tokenKindName(op), l->toString(), r->toString()));
       ++errorCount_;
     }
   } else if (intOnly) {
     if (!integral(elem(l)) || !integral(elem(r))) {
       logErrorAt(loc, fmt::format(
-          "operator '{}' requires integer operands, got '{}' and '{}'",
+          "operator {} requires integer operands, got '{}' and '{}'",
           tokenKindName(op), l->toString(), r->toString()));
       ++errorCount_;
     }
@@ -903,15 +1230,24 @@ void SemanticAnalyzer::checkStageVarLocations(
     for (auto* node : program) {
       auto* s = llvm::dyn_cast_or_null<StageVarDeclAST>(node);
       if (!s || s->isInput != wantInput) continue;
-      int loc = s->location >= 0 ? s->location : nextAuto++;
-      auto [it, inserted] = used.emplace(loc, s->Name);
-      if (!inserted) {
-        logErrorAt(s->loc,
-                   fmt::format("{} location {} of '{}' collides with '{}'",
-                               wantInput ? "input" : "output", loc, s->Name,
-                               it->second));
-        ++errorCount_;
+      const int slots = (int)locationSlots(resolveTypeName(s->TypeName));
+      const int loc = s->location >= 0 ? s->location : nextAuto;
+      // A matCxR spans C consecutive locations, so reserving only the first
+      // would let `layout(location=0) out mat4 M; layout(location=1) out vec4 C;`
+      // report clean while actually aliasing. This mirrors the backend
+      // allocators in emit_spirv_from_ir.h — the two must stay in step.
+      for (int k = 0; k < slots; ++k) {
+        auto [it, inserted] = used.emplace(loc + k, s->Name);
+        if (!inserted && it->second != s->Name) {
+          logErrorAt(s->loc,
+                     fmt::format("{} location {} of '{}' collides with '{}'",
+                                 wantInput ? "input" : "output", loc + k,
+                                 s->Name, it->second));
+          ++errorCount_;
+          break;
+        }
       }
+      if (s->location < 0) nextAuto += slots;
     }
   };
   checkDir(true);

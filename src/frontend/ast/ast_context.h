@@ -72,7 +72,7 @@ class ASTContext {
     const glsl::Type* getVec4Ty() { return getVectorTy(getFloatTy(), 4); }
 
     /// Direct allocator access for custom raw byte allocations inside the pool. 
-    /// Used to bypass heap overhead for temporary structures. Use sparingly.
+    /// Bypasses heap overhead for temporary structures; rarely needed.
     llvm::BumpPtrAllocator& allocator() { return bump_; }
 
    private:

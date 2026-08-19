@@ -46,6 +46,7 @@ extern "C" float uTime;
 #endif
 
 int main() {
+    report_vector_config();
     constexpr int W = WIDTH, H = HEIGHT;
     mkdir("result", 0755);
     std::vector<unsigned char> img(W * H * 3);

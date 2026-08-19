@@ -65,6 +65,44 @@ else()
     message(STATUS "  qemu-riscv64: not found (rv-* targets will skip)")
 endif()
 
+# ── SPMD packet width (f32 lanes) — adapts to the target RVV VLEN ────────────
+# "auto": VLEN/32 on a native RISC-V build (probe the vlenb CSR at configure),
+# else 4 (QEMU user-mode defaults to VLEN=128). An integer overrides. Baked into
+# the emitted .rv IR (kW) and the runtime (PACKET_W); a startup guard aborts on a
+# mismatch. Both MUST agree or the SoA stride disagrees and the output is wrong.
+set(SHADER_PACKET_WIDTH "auto" CACHE STRING
+    "SPMD f32 lane count: 'auto' = VLEN/32 on native RISC-V else 4, or an integer.")
+if(SHADER_PACKET_WIDTH STREQUAL "auto")
+    set(_PKT_W 4)
+    if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "riscv64" AND CROSS_CXX_BIN)
+        file(WRITE ${CMAKE_BINARY_DIR}/_vlenb_probe.cpp
+"#include <cstdio>\nint main(){unsigned long v;__asm__ volatile(\"csrr %0, vlenb\":\"=r\"(v));printf(\"%lu\\n\",v*8);return 0;}\n")
+        execute_process(
+            COMMAND ${CROSS_CXX_BIN} -O2 -static -march=rv64gcv -mabi=lp64d
+                    ${CMAKE_BINARY_DIR}/_vlenb_probe.cpp -o ${CMAKE_BINARY_DIR}/_vlenb_probe
+            RESULT_VARIABLE _probe_cc)
+        if(_probe_cc EQUAL 0)
+            execute_process(COMMAND ${CMAKE_BINARY_DIR}/_vlenb_probe
+                            OUTPUT_VARIABLE _vlen OUTPUT_STRIP_TRAILING_WHITESPACE
+                            RESULT_VARIABLE _probe_run)
+            if(_probe_run EQUAL 0 AND _vlen GREATER 0)
+                math(EXPR _PKT_W "${_vlen} / 32")
+            endif()
+        endif()
+        file(REMOVE ${CMAKE_BINARY_DIR}/_vlenb_probe.cpp ${CMAKE_BINARY_DIR}/_vlenb_probe)
+    endif()
+else()
+    set(_PKT_W ${SHADER_PACKET_WIDTH})
+endif()
+if(NOT _PKT_W MATCHES "^(4|8|16)$")
+    message(FATAL_ERROR "SHADER_PACKET_WIDTH resolved to '${_PKT_W}' — must be 4, 8, or 16.")
+endif()
+math(EXPR _PKT_VLEN "${_PKT_W} * 32")
+message(STATUS "  SPMD packet width: ${_PKT_W} lanes (target VLEN ${_PKT_VLEN} bits)")
+# Surface the width to bench scripts that cross-compile pipeline_runtime.cpp
+# outside CMake (they source packet_width.env via bench_common.sh).
+file(WRITE ${CMAKE_BINARY_DIR}/packet_width.env "SHADER_PACKET_WIDTH=${_PKT_W}\n")
+
 include(ProcessorCount)
 ProcessorCount(NTHREADS)
 if(NTHREADS EQUAL 0)
@@ -150,12 +188,48 @@ else()
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Route B Phase 1: SPMD `fs_packet` packetizer regression (emit + numeric
-# equivalence + bail-to-scalar). Runs the already-built irgen_riscv; the numeric
-# step needs clang-18 and is skipped (not failed) if absent.
+# Shaders that must be REJECTED, and with which diagnostic. run_tests.sh only
+# proves valid shaders compile — nothing proved invalid ones are caught, which
+# is how a unary minus on a struct came to abort the compiler and how mat4*ivec4
+# came to emit ill-typed IR. Each test/shaders/reject/*.src carries its own
+# `# EXPECT-ERROR:` directives. Runs the already-built irgen_riscv.
+# ─────────────────────────────────────────────────────────────────────────────
+add_test(NAME reject_tests
+         COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_reject_tests.sh --no-build)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Executable matrix arithmetic tests. FileCheck pins IR shape and llvm-as proves
+# it is well-formed, but neither computes anything — a transposed multiply or a
+# mat3 column read at the wrong stride passes both. This links the emitted IR
+# with a C++ driver and checks numbers. Needs clang-18; skipped if absent.
+# ─────────────────────────────────────────────────────────────────────────────
+add_test(NAME matrix_numeric
+         COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_matrix_numeric.sh)
+
+# Executable sampler/image test: binds real cube-face / 3D-slice / array-layer /
+# storage-image data and checks the runtime samples it (not a placeholder slice).
+add_test(NAME sampler_numeric
+         COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_sampler_numeric.sh)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Route B Phase 1: SPMD `fs_packet` packetizer regression (emit-only — checks the
+# packetizer produces the right width-agnostic vectorized IR shape). Runs the
+# already-built irgen_riscv; no runtime/toolchain needed.
 # ─────────────────────────────────────────────────────────────────────────────
 add_test(NAME packet_test
          COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_packet_test.sh)
+
+# Packet-width RUNTIME gate: links pipeline_runtime.cpp and runs under QEMU to
+# check the VLEN banner + the build-width guard (a shader/runtime width mismatch
+# must abort loudly, not corrupt the SoA silently). Drives a target so the shader
+# object it needs is built first; the script self-skips if cross-cc/QEMU absent.
+# ─────────────────────────────────────────────────────────────────────────────
+add_custom_target(packet-runtime
+    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_packet_runtime.sh
+    DEPENDS mandelbrot_rv.o
+    USES_TERMINAL)
+add_test(NAME packet_runtime
+         COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target packet-runtime)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Static SPIR-V vs RISC-V backend comparison (test/script/compare_backends.sh).
@@ -169,6 +243,21 @@ if(PYTHON3_EXE)
              COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target compare-backends)
 else()
     message(STATUS "python3 not found — skipping compare_backends test")
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPIR-V validation. The emitter fails silently by design (unsupported types
+# return id 0, unhandled constants become OpConstantNull, the binary-op switch
+# defaults to FAdd), so a malformed module reaches disk with a zero exit code —
+# nothing else in the suite would notice. Drives the `spirv-validate` target,
+# which builds the .spv it reads, so it is self-contained. Needs spirv-val.
+# ─────────────────────────────────────────────────────────────────────────────
+find_program(SPIRV_VAL_EXE NAMES spirv-val)
+if(SPIRV_VAL_EXE)
+    add_test(NAME spirv_validate
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target spirv-validate)
+else()
+    message(STATUS "spirv-val not found — skipping spirv_validate test")
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,14 +303,11 @@ endif()
 # ─────────────────────────────────────────────────────────────────────────────
 # Compiler tool binaries
 # ─────────────────────────────────────────────────────────────────────────────
-add_executable(shader_codegen src/driver/main_codegen.cpp)
-target_link_libraries(shader_codegen PRIVATE compiler_common)
-target_include_directories(shader_codegen PRIVATE ${CMAKE_SOURCE_DIR}/src)
-set_target_properties(shader_codegen PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-
 add_executable(irgen_riscv src/codegen/emit/main_lib_riscv.cpp)
 target_link_libraries(irgen_riscv PRIVATE compiler_common)
 target_include_directories(irgen_riscv PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# Bakes kW into the emitted .rv IR — must match the runtime's PACKET_W.
+target_compile_definitions(irgen_riscv PRIVATE SHADER_PACKET_WIDTH=${_PKT_W})
 set_target_properties(irgen_riscv PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${RISCV_DIR})
 add_dependencies(irgen_riscv _output_dirs)
 
@@ -265,6 +351,25 @@ add_vulkan_host(spirv_vulkan_compute_host test/vk_host/vk_host_compute_blur.cpp)
 add_vulkan_host(spirv_vulkan_life_host    test/vk_host/vk_host_compute.cpp)
 add_vulkan_host(spirv_vulkan_mesh_host    test/vk_host/vk_host_mesh.cpp)
 add_vulkan_host(spirv_vulkan_texture_host test/vk_host/vk_host_texture.cpp)
+add_vulkan_host(spirv_vulkan_volume_host  test/vk_host/vk_host_volume.cpp)
+add_vulkan_host(spirv_vulkan_volume_cs_host test/vk_host/vk_host_volume_cs.cpp)
+
+# GPU Vulkan under WSL2. The NVIDIA WSL driver projects only CUDA/D3D12 into
+# Linux — there is no native Vulkan ICD and no /dev/nvidia*, so vkEnumerate‑
+# PhysicalDevices sees lavapipe (CPU) and nothing else. Mesa's Dozen driver
+# implements Vulkan over D3D12, which is what WSL does expose via /dev/dxg.
+# Point DZN_ICD at its manifest to make the vk-* run targets use the real GPU:
+#   cmake -B build -DDZN_ICD=/opt/mesa-dzn/share/vulkan/icd.d/dzn_icd.x86_64.json
+# Left empty, the run targets use whatever the loader picks by default.
+set(DZN_ICD "" CACHE FILEPATH
+    "dzn_icd.x86_64.json enabling GPU Vulkan over D3D12 (WSL2)")
+if(DZN_ICD)
+    set(VK_RUN_ENV ${CMAKE_COMMAND} -E env
+        "VK_ICD_FILENAMES=${DZN_ICD}" "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
+    message(STATUS "  Vulkan ICD override: ${DZN_ICD}")
+else()
+    set(VK_RUN_ENV "")
+endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shader compilation: helper functions
@@ -305,6 +410,7 @@ function(spv_compile_vertex name srcfile)
         COMMENT "[spv] ${name}.vert.spv"
         VERBATIM)
     add_custom_target(${name}.vert.spv DEPENDS ${out})
+    set_property(GLOBAL APPEND PROPERTY SPV_MODULES ${name}.vert.spv)
 endfunction()
 
 # Compile a fragment shader (.src → .frag.spv).
@@ -317,6 +423,7 @@ function(spv_compile_fragment name srcfile)
         COMMENT "[spv] ${name}.frag.spv"
         VERBATIM)
     add_custom_target(${name}.frag.spv DEPENDS ${out})
+    set_property(GLOBAL APPEND PROPERTY SPV_MODULES ${name}.frag.spv)
 endfunction()
 
 # Compile a compute shader (.src → .comp.spv).
@@ -329,6 +436,7 @@ function(spv_compile_compute name srcfile)
         COMMENT "[spv] ${name}.comp.spv"
         VERBATIM)
     add_custom_target(${name}.comp.spv DEPENDS ${out})
+    set_property(GLOBAL APPEND PROPERTY SPV_MODULES ${name}.comp.spv)
 endfunction()
 
 # RISC-V single-shader path (used for the per-anim VS+FS pipeline).
@@ -379,8 +487,10 @@ function(rv_compile_animation name)
         add_custom_command(
             OUTPUT  ${rvbin}
             COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp
+                    -march=rv64gcv -mabi=lp64d
                     -I${PIPELINE_DIR}
                     -DANIM_NAME="${name}" -DNFRAMES=300 -DWIDTH=512 -DHEIGHT=512
+                    -DSHADER_PACKET_WIDTH=${_PKT_W}
                     ${RV_HOST_SRC} ${PIPELINE_DIR}/pipeline_runtime.cpp
                     ${obj} -o ${rvbin}
             DEPENDS ${obj} ${PIPELINE_DIR}/pipeline_runtime.cpp ${RV_HOST_SRC}
@@ -394,11 +504,15 @@ endfunction()
 # Animation list
 # ─────────────────────────────────────────────────────────────────────────────
 set(ANIMATIONS_PROC mandelbrot julia voronoi waves tunnel ripple galaxy fire
-                    reaction cellular earth scene3d diverge city ocean)
+                    reaction cellular earth scene3d diverge city ocean matrix)
 set(ANIMATIONS ${ANIMATIONS_PROC} texture_test)
 
 # Vulkan vertex shader for the full-screen quad.
 spv_compile_vertex(quad ${ANIM_SHADER_DIR}/quad_vs.src)
+
+# Matrix demo — the shader that makes spirv-val exercise the OpTypeMatrix path
+# (uniform/constant matrices, matrix builtins, whole-matrix arithmetic).
+spv_compile_vertex(matdemo ${ANIM_SHADER_DIR}/matdemo_vs.src)
 
 # Per-animation Vulkan fragment + RISC-V object/binary.
 foreach(anim ${ANIMATIONS_PROC})
@@ -407,7 +521,7 @@ foreach(anim ${ANIMATIONS_PROC})
 
     # Render targets matching the old Makefile's vk-<name> / rv-<name>.
     add_custom_target(vk-${anim}
-        COMMAND $<TARGET_FILE:spirv_vulkan_host>
+        COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_host>
                 ${SPV_DIR}/quad.vert.spv ${SPV_DIR}/${anim}.frag.spv
                 ${anim} 300 512 512
         DEPENDS spirv_vulkan_host quad.vert.spv ${anim}.frag.spv
@@ -465,6 +579,227 @@ endforeach()
 # Texture-sampling fragment shader (uses sampler2D — Vulkan only).
 spv_compile_fragment(texture_test ${ANIM_SHADER_DIR}/texture_test_gpu_fs.src)
 
+# Sampler/image coverage for spirv-val: cube/3D/array/LOD sampling + storage images.
+spv_compile_fragment(cubemap ${ANIM_SHADER_DIR}/cubemap_fs.src)
+spv_compile_compute(imagestore ${ANIM_SHADER_DIR}/imagestore_cs.src)
+# texlayer_fs: cube + 3D + array + 2D sampling AND an image2D load/store in one
+# fragment shader — the widest single sampler/image spirv-val fixture.
+spv_compile_fragment(texlayer ${ANIM_SHADER_DIR}/texlayer_fs.src)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RISC-V layered-texture / storage-image RENDER host. The only caller of the
+# public bind_texture_layered() / bind_image() APIs: it binds a cube, a 3D volume,
+# a 2D array, a plain 2D texture, and a read/write image2D, renders texlayer_fs,
+# and verifies both the pixel color and the image round-trip. Runs under QEMU as
+# the `texlayer_rv` ctest; self-skips if the toolchain is absent.
+#
+# IMPORTANT — reduced opt on purpose. `opt -O3` MISCOMPILES this shader on the
+# RISC-V backend: inlining the always_inline sampler bodies (which write `float*
+# out`, read back as <4 x float>, under vscale_range) into fs_main yields a
+# NULL-deref / wrong-pixel render (LLVM-18 backend bug; scalar and vector, even at
+# llc -O0). The runtime itself is correct — sampler_numeric + the x86 path pass,
+# and a NON-inlining opt pipeline renders bit-exactly. So layered/image render
+# shaders use a curated pipeline (mem2reg/sroa/gvn/dse/… — NO inliner) + llc -O3.
+# The 2D-only render shaders keep the aggressive -O3 (they don't hit the bug).
+# ─────────────────────────────────────────────────────────────────────────────
+if(CROSS_CXX_BIN)
+    set(_tl_vs  ${RISCV_DIR}/texlayer_vs_rv.ll)
+    set(_tl_fs  ${RISCV_DIR}/texlayer_fs_rv.ll)
+    set(_tl_ll  ${RISCV_DIR}/texlayer_rv.ll)
+    set(_tl_opt ${RISCV_DIR}/texlayer_rv.opt.ll)
+    set(_tl_o   ${RISCV_DIR}/texlayer_rv.o)
+    set(_tl_bin ${RISCV_DIR}/texlayer.rv)
+    set(_tl_host ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_texlayer.cpp)
+
+    add_custom_command(
+        OUTPUT  ${_tl_ll}
+        BYPRODUCTS ${_tl_vs} ${_tl_fs}
+        COMMAND $<TARGET_FILE:irgen_riscv> ${_tl_vs} < ${SCENE_VS_SRC}
+        COMMAND $<TARGET_FILE:irgen_riscv> ${_tl_fs} < ${ANIM_SHADER_DIR}/texlayer_fs.src
+        # Link tex_inline.bc so __tex*/__image* resolve against g_tex/g_img.
+        COMMAND ${LLVM_LINK_BIN} ${_tl_vs} ${_tl_fs} ${TEX_INLINE_BC} -S -o ${_tl_ll}
+        DEPENDS ${SCENE_VS_SRC} ${ANIM_SHADER_DIR}/texlayer_fs.src irgen_riscv ${TEX_INLINE_BC}
+        COMMENT "[rv]  texlayer_rv.ll"
+        VERBATIM)
+
+    add_custom_command(
+        OUTPUT  ${_tl_o}
+        BYPRODUCTS ${_tl_opt}
+        # Curated NON-inlining pipeline (see the note above) — everything but the
+        # inliner, so the sampler bodies stay out-of-line and llc compiles them
+        # correctly. Renders bit-identically to the safe reference.
+        COMMAND ${LLVM_OPT_BIN}
+                -passes=function\(mem2reg,sroa,early-cse,instcombine,gvn,dse,simplifycfg,adce\)
+                -S ${_tl_ll} -o ${_tl_opt}
+        COMMAND ${LLVM_LLC_BIN} -O3 --fp-contract=fast -filetype=obj
+                -relocation-model=pic -mtriple=riscv64-unknown-linux-gnu
+                -mattr=+m,+a,+f,+d,+v ${_tl_opt} -o ${_tl_o}
+        DEPENDS ${_tl_ll}
+        COMMENT "[rv]  texlayer_rv.o (reduced opt — no inliner, LLVM -O3 sampler bug)"
+        VERBATIM)
+
+    add_custom_command(
+        OUTPUT  ${_tl_bin}
+        COMMAND ${CROSS_CXX_BIN} -std=c++20 -O2 -static -fopenmp
+                -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
+                ${_tl_host} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_tl_o} -o ${_tl_bin}
+        DEPENDS ${_tl_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_tl_host}
+        COMMENT "[rv]  texlayer.rv"
+        VERBATIM)
+    add_custom_target(texlayer.rv DEPENDS ${_tl_bin})
+
+    add_custom_target(texlayer-rv-run
+        COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_rv_host.sh ${_tl_bin} texlayer-rv
+        DEPENDS ${_tl_bin}
+        USES_TERMINAL)
+    add_test(NAME texlayer_rv
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target texlayer-rv-run)
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Volumetric sampler3D animation — the only ANIMATED consumer of the 3D sampler.
+# texlayer proves the layered runtime is correct on a 1x1 solid volume; this
+# renders a real 64^3 volume over a marching loop, so trilinear filtering and the
+# slice interpolation show up as picture rather than as a single asserted pixel.
+#
+# Uses the same reduced NON-inlining opt pipeline as texlayer, for the same
+# reason: `opt -O3` miscompiles the inlined non-2D sampler bodies on the RISC-V
+# backend (LLVM-18). See the note above the texlayer block.
+# ─────────────────────────────────────────────────────────────────────────────
+spv_compile_fragment(volume ${ANIM_SHADER_DIR}/volume_fs.src)
+
+# GPU render: uploads the same baked volume as a VK_IMAGE_TYPE_3D and binds it
+# to the combined image sampler the shader declares at set 0 binding 0.
+add_custom_target(vk-volume
+    COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_volume_host>
+            ${SPV_DIR}/quad.vert.spv ${SPV_DIR}/volume.frag.spv
+            volume 90 256 256
+    DEPENDS spirv_vulkan_volume_host quad.vert.spv volume.frag.spv
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    VERBATIM)
+
+if(CROSS_CXX_BIN)
+    set(_vol_vs   ${RISCV_DIR}/volume_vs_rv.ll)
+    set(_vol_fs   ${RISCV_DIR}/volume_fs_rv.ll)
+    set(_vol_ll   ${RISCV_DIR}/volume_rv.ll)
+    set(_vol_opt  ${RISCV_DIR}/volume_rv.opt.ll)
+    set(_vol_o    ${RISCV_DIR}/volume_rv.o)
+    set(_vol_bin  ${RISCV_DIR}/volume.rv)
+    set(_vol_host ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_volume.cpp)
+
+    add_custom_command(
+        OUTPUT  ${_vol_ll}
+        BYPRODUCTS ${_vol_vs} ${_vol_fs}
+        COMMAND $<TARGET_FILE:irgen_riscv> ${_vol_vs} < ${SCENE_VS_SRC}
+        COMMAND $<TARGET_FILE:irgen_riscv> ${_vol_fs} < ${ANIM_SHADER_DIR}/volume_fs.src
+        COMMAND ${LLVM_LINK_BIN} ${_vol_vs} ${_vol_fs} ${TEX_INLINE_BC} -S -o ${_vol_ll}
+        DEPENDS ${SCENE_VS_SRC} ${ANIM_SHADER_DIR}/volume_fs.src irgen_riscv ${TEX_INLINE_BC}
+        COMMENT "[rv]  volume_rv.ll"
+        VERBATIM)
+
+    add_custom_command(
+        OUTPUT  ${_vol_o}
+        BYPRODUCTS ${_vol_opt}
+        COMMAND ${LLVM_OPT_BIN}
+                -passes=function\(mem2reg,sroa,early-cse,instcombine,gvn,dse,simplifycfg,adce\)
+                -S ${_vol_ll} -o ${_vol_opt}
+        COMMAND ${LLVM_LLC_BIN} -O3 --fp-contract=fast -filetype=obj
+                -relocation-model=pic -mtriple=riscv64-unknown-linux-gnu
+                -mattr=+m,+a,+f,+d,+v ${_vol_opt} -o ${_vol_o}
+        DEPENDS ${_vol_ll}
+        COMMENT "[rv]  volume_rv.o (reduced opt — no inliner, LLVM -O3 sampler bug)"
+        VERBATIM)
+
+    add_custom_command(
+        OUTPUT  ${_vol_bin}
+        COMMAND ${CROSS_CXX_BIN} -std=c++20 -O2 -static -fopenmp
+                -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
+                -DANIM_NAME="volume" -DNFRAMES=90 -DWIDTH=256 -DHEIGHT=256
+                ${_vol_host} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_vol_o} -o ${_vol_bin}
+        DEPENDS ${_vol_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_vol_host}
+        COMMENT "[rv]  volume.rv"
+        VERBATIM)
+    add_custom_target(volume.rv DEPENDS ${_vol_bin})
+
+    # Scalar render: the packetizer has no vec3-sampler path, so a packet build
+    # would fall back per-pixel anyway.
+    add_custom_target(rv-volume
+        COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}"
+                ${RISCV_SIM} ${RISCV_DIR}/volume.rv
+        DEPENDS volume.rv
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        VERBATIM)
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compute variant of the same ray-march: samples the 3D texture and writes the
+# frame through imageStore rather than rasterizing it. This is the shape
+# volumetrics take in practice, and it is the only sampler3D read from a compute
+# stage in the tree — texlayer covers sampler3D in fragment and imagestore_cs
+# covers imageStore without sampling.
+#
+# Unlike life/blur, this one links tex_inline.bc (it calls __tex3d_sample_lod /
+# __image2d_store) and therefore inherits the same no-inliner opt requirement as
+# the other layered-sampler shaders.
+# ─────────────────────────────────────────────────────────────────────────────
+spv_compile_compute(volume ${ANIM_SHADER_DIR}/volume_cs.src)
+
+add_custom_target(vk-volume-cs
+    COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_volume_cs_host>
+            ${SPV_DIR}/volume.comp.spv volume_cs 90 256 256
+    DEPENDS spirv_vulkan_volume_cs_host volume.comp.spv
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    VERBATIM)
+
+if(CROSS_CXX_BIN)
+    set(_vcs_raw  ${RISCV_DIR}/volume_cs_raw_rv.ll)
+    set(_vcs_ll   ${RISCV_DIR}/volume_cs_rv.ll)
+    set(_vcs_opt  ${RISCV_DIR}/volume_cs_rv.opt.ll)
+    set(_vcs_o    ${RISCV_DIR}/volume_cs_rv.o)
+    set(_vcs_bin  ${RISCV_DIR}/volume_cs.rv)
+    set(_vcs_host ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_volume_cs.cpp)
+
+    add_custom_command(
+        OUTPUT  ${_vcs_ll}
+        BYPRODUCTS ${_vcs_raw}
+        COMMAND $<TARGET_FILE:irgen_riscv> ${_vcs_raw} < ${ANIM_SHADER_DIR}/volume_cs.src
+        COMMAND ${LLVM_LINK_BIN} ${_vcs_raw} ${TEX_INLINE_BC} -S -o ${_vcs_ll}
+        DEPENDS ${ANIM_SHADER_DIR}/volume_cs.src irgen_riscv ${TEX_INLINE_BC}
+        COMMENT "[rv]  volume_cs_rv.ll"
+        VERBATIM)
+
+    add_custom_command(
+        OUTPUT  ${_vcs_o}
+        BYPRODUCTS ${_vcs_opt}
+        COMMAND ${LLVM_OPT_BIN}
+                -passes=function\(mem2reg,sroa,early-cse,instcombine,gvn,dse,simplifycfg,adce\)
+                -S ${_vcs_ll} -o ${_vcs_opt}
+        COMMAND ${LLVM_LLC_BIN} -O3 --fp-contract=fast -filetype=obj
+                -relocation-model=pic -mtriple=riscv64-unknown-linux-gnu
+                -mattr=+m,+a,+f,+d,+v ${_vcs_opt} -o ${_vcs_o}
+        DEPENDS ${_vcs_ll}
+        COMMENT "[rv]  volume_cs_rv.o (reduced opt — no inliner, LLVM -O3 sampler bug)"
+        VERBATIM)
+
+    add_custom_command(
+        OUTPUT  ${_vcs_bin}
+        COMMAND ${CROSS_CXX_BIN} -std=c++20 -O2 -static -fopenmp
+                -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
+                -DANIM_NAME="volume_cs" -DNFRAMES=90 -DWIDTH=256 -DHEIGHT=256
+                ${_vcs_host} ${_vcs_o} -o ${_vcs_bin}
+        DEPENDS ${_vcs_o} ${_vcs_host}
+        COMMENT "[rv]  volume_cs.rv"
+        VERBATIM)
+    add_custom_target(volume_cs.rv DEPENDS ${_vcs_bin})
+
+    add_custom_target(rv-volume-cs
+        COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}"
+                ${RISCV_SIM} ${RISCV_DIR}/volume_cs.rv
+        DEPENDS volume_cs.rv
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        VERBATIM)
+endif()
+
 # Terrain mesh demo: Vulkan-flavoured VS (negated Y for NDC) + shared FS.
 spv_compile_vertex(terrain ${ANIM_SHADER_DIR}/terrain_vs_vk.src)
 spv_compile_fragment(terrain ${ANIM_SHADER_DIR}/terrain_fs.src)
@@ -478,35 +813,35 @@ spv_compile_fragment(mesh ${ANIM_SHADER_DIR}/mesh_fs.src)
 # Default `vk-mesh` runs an icosphere with subdivision level 3 (1280 triangles).
 # Override with: cmake --build build --target vk-mesh-bunny  (loads test/assets/bunny.obj)
 add_custom_target(vk-mesh
-    COMMAND $<TARGET_FILE:spirv_vulkan_mesh_host>
+    COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             mesh 300 icosphere:3
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     VERBATIM)
 add_custom_target(vk-mesh-hi
-    COMMAND $<TARGET_FILE:spirv_vulkan_mesh_host>
+    COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             mesh_hi 300 icosphere:5
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     VERBATIM)
 add_custom_target(vk-mesh-bunny
-    COMMAND $<TARGET_FILE:spirv_vulkan_mesh_host>
+    COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             bunny 300 ${CMAKE_SOURCE_DIR}/test/assets/bunny.obj
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     VERBATIM)
 add_custom_target(vk-mesh-jeep
-    COMMAND $<TARGET_FILE:spirv_vulkan_mesh_host>
+    COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             jeep 300 ${CMAKE_SOURCE_DIR}/test/assets/Jeep_Renegade_2016.obj
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     VERBATIM)
 add_custom_target(vk-mesh-teddy
-    COMMAND $<TARGET_FILE:spirv_vulkan_mesh_host>
+    COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             teddy 300 ${CMAKE_SOURCE_DIR}/test/assets/teddy-bear/teddy-bear.obj
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
@@ -516,7 +851,7 @@ add_custom_target(vk-mesh-teddy
 # the shell gets one argument. obj_loader resolves map_Kd relative to the OBJ
 # dir, so the texture is picked up automatically.
 add_custom_target(vk-mesh-boss
-    COMMAND $<TARGET_FILE:spirv_vulkan_mesh_host>
+    COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             boss 300 "${CMAKE_SOURCE_DIR}/test/assets/boss/Rumba Dancing.obj"
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
@@ -568,6 +903,7 @@ function(rv_mesh_target target_name spec_name spec_value)
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp
                 -march=rv64gcv -mabi=lp64d
                 -DANIM_NAME="${target_name}" -DNFRAMES=300 -DWIDTH=768 -DHEIGHT=768
+                -DSHADER_PACKET_WIDTH=${_PKT_W}
                 ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_mesh.cpp
                 ${PIPELINE_DIR}/pipeline_runtime.cpp
                 ${_mesh_o} -o ${_bin}
@@ -637,8 +973,10 @@ if(CROSS_CXX_BIN)
     add_custom_command(
         OUTPUT  ${_terrain_rv}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp
+                -march=rv64gcv -mabi=lp64d
                 -I${PIPELINE_DIR}
                 -DANIM_NAME="terrain" -DNFRAMES=300 -DWIDTH=512 -DHEIGHT=512 -DVERT_COUNT=6144
+                -DSHADER_PACKET_WIDTH=${_PKT_W}
                 ${RV_HOST_SRC} ${PIPELINE_DIR}/pipeline_runtime.cpp
                 ${_terrain_o} -o ${_terrain_rv}
         DEPENDS ${_terrain_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${RV_HOST_SRC}
@@ -671,7 +1009,7 @@ if(CROSS_CXX_BIN)
 endif()
 
 # Top-level convenience target.
-add_custom_target(tools ALL DEPENDS shader_codegen irgen_riscv irgen_spirv sincos_opt)
+add_custom_target(tools ALL DEPENDS irgen_riscv irgen_spirv sincos_opt)
 
 # Full reset: delegates to clean.sh (rm -rf build result). Works even though
 # make is running inside build/ — rm happily unlinks the cwd's directory tree.
@@ -769,5 +1107,18 @@ list(APPEND COMPARE_DEPS
 add_custom_target(compare-backends
     COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/compare_backends.sh
     DEPENDS ${COMPARE_DEPS}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    USES_TERMINAL)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# spirv-val conformance over every emitted module (test/script/run_spirv_val.sh).
+# The dependency list is collected by the spv_compile_* helpers into the global
+# SPV_MODULES property, so a newly registered shader is validated automatically
+# rather than needing to be remembered here.
+# ─────────────────────────────────────────────────────────────────────────────
+get_property(SPV_MODULES GLOBAL PROPERTY SPV_MODULES)
+add_custom_target(spirv-validate
+    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_spirv_val.sh --no-build
+    DEPENDS ${SPV_MODULES}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)

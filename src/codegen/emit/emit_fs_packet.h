@@ -1,9 +1,10 @@
-// emit_fs_packet.h — Route B: SPMD-on-SIMD packetizer for fragment and vertex shaders.
+// emit_fs_packet.h — SPMD-on-SIMD packetizer for fragment and vertex shaders.
 #pragma once
 
 #include "../codegen_state/codegen_state.h"
 #include "../../frontend/ast/ast.h"
 #include "../../frontend/ast/type.h"
+#include "../../common/packet_width.h"
 
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Constants.h>
@@ -17,8 +18,10 @@ namespace fspacket {
 
 using namespace llvm;
 
-// Fixed packet width matching host runtime vector width
-static constexpr unsigned kW = 4;
+// SPMD packet width (f32 lanes) — single source of truth in packet_width.h,
+// set from the target RVV VLEN at build time (VLEN/32). MUST equal the runtime's
+// PACKET_W (same SoA stride); a build-width guard checks this at startup.
+static constexpr unsigned kW = SHADER_PACKET_WIDTH;
 
 // Vectorized representation of a GLSL value (SoA layout: K separate <W x T> variables)
 struct PacketValue {
@@ -618,11 +621,20 @@ inline PacketValue PacketEmitter::emitTexture(CallExprAST* c) {
 
     auto* ptrTy = PointerType::getUnqual(*Context);
     auto* voidTy = Type::getVoidTy(*Context);
+    // Signature matches codegen_state.cpp: (sampler, i32 slot, u, v, out).
     Function* fn = TheModule->getFunction("__tex2d_sample");
     if (!fn) {
-        auto* FT = FunctionType::get(voidTy, { ptrTy, f32_, f32_, ptrTy }, false);
+        auto* FT = FunctionType::get(voidTy, { ptrTy, i32_, f32_, f32_, ptrTy }, false);
         fn = Function::Create(FT, Function::ExternalLinkage, "__tex2d_sample", TheModule.get());
     }
+    // Binding slot of the sampler uniform, so the runtime reads the right texture.
+    int slot = 0;
+    if (auto* var = llvm::dyn_cast<VariableExprAST>(c->Args[0]))
+        if (auto* g = TheModule->getGlobalVariable(var->Name))
+            if (auto* md = g->getMetadata("shader.binding"))
+                slot = (int)llvm::mdconst::extract<llvm::ConstantInt>(
+                           md->getOperand(0))->getSExtValue();
+    Value* slotV = Builder->getInt32(slot);
     auto* vec4Ty = FixedVectorType::get(f32_, 4);
     AllocaInst* tmp = allocaEntry(vec4Ty, "tex.lane");
     Value* nullSampler = ConstantPointerNull::get(ptrTy);
@@ -634,7 +646,7 @@ inline PacketValue PacketEmitter::emitTexture(CallExprAST* c) {
     for (unsigned l = 0; l < kW; ++l) {
         Value* u = Builder->CreateExtractElement(uv.comps[0], Builder->getInt32(l), "u");
         Value* v = Builder->CreateExtractElement(uv.comps[1], Builder->getInt32(l), "v");
-        Builder->CreateCall(fn, { nullSampler, u, v, tmp });
+        Builder->CreateCall(fn, { nullSampler, slotV, u, v, tmp });
         Value* rgba = Builder->CreateLoad(vec4Ty, tmp, "rgba");
         for (unsigned k = 0; k < 4; ++k)
             r.comps[k] = Builder->CreateInsertElement(
@@ -739,8 +751,15 @@ inline void PacketEmitter::emitStmt(ExprAST* s) {
             LocalVar& lv = localVars_[a->VarName];
             if (lv.slots.empty()) {
                 lv.ty = v.ty;
-                for (unsigned c = 0; c < v.comps.size(); ++c)
-                    lv.slots.push_back(allocaEntry(vty(velem(v.ty)), "loc"));
+                Type* et = vty(velem(v.ty));
+                for (unsigned c = 0; c < v.comps.size(); ++c) {
+                    AllocaInst* slot = allocaEntry(et, "loc");
+                    // Zero-init like the output allocas (see below): a masked-off
+                    // lane in a boundary packet blends against the slot's prior
+                    // value, which must be a defined 0, not undef.
+                    Builder->CreateStore(ConstantAggregateZero::get(et), slot);
+                    lv.slots.push_back(slot);
+                }
             }
             if (lv.slots.size() != v.comps.size()) {
                 bail();

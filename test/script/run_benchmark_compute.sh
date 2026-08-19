@@ -11,6 +11,7 @@
 #   --sweep     GPU vs CPU across grid sizes
 #   --animate   Render 256×256 animation (GPU + CPU) and encode MP4s
 #   --tiny      Add a 32×32 case
+#   --volume    Volumetric ray-march instead of Life: sampler3D + imageStore
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
@@ -22,6 +23,7 @@ QUICK=0
 SWEEP=0
 ANIMATE=0
 TINY=0
+VOLUME=0
 for arg in "$@"; do
     case $arg in
         --grid)    shift; GRID="$1" ;;
@@ -30,16 +32,68 @@ for arg in "$@"; do
         --sweep)   SWEEP=1 ;;
         --animate) ANIMATE=1 ;;
         --tiny)    TINY=1 ;;
+        --volume)  VOLUME=1 ;;
     esac
 done
 
 echo -e "${CYAN}Building…${RESET}"
-# life_cs_rv.o is the RISC-V compute kernel the CPU life host links against; without
-# it the life.rv link below fails and the CPU column silently drops to SKIP.
-build_target spirv_vulkan_life_host life.comp.spv life_cs_rv.o 2>/dev/null | \
-    grep -E "^g\+\+|error" || true
+if [[ "$VOLUME" -eq 1 ]]; then
+    build_target spirv_vulkan_volume_cs_host volume.comp.spv volume_cs.rv 2>/dev/null | \
+        grep -E "^g\+\+|error" || true
+else
+    # life_cs_rv.o is the RISC-V compute kernel the CPU life host links against; without
+    # it the life.rv link below fails and the CPU column silently drops to SKIP.
+    build_target spirv_vulkan_life_host life.comp.spv life_cs_rv.o 2>/dev/null | \
+        grep -E "^g\+\+|error" || true
+fi
 
 mkdir -p result "$BUILD_DIR"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VOLUME MODE — volumetric ray-march (sampler3D + imageStore)
+#
+# Life measures a memory-bound stencil; this measures the sampler. Per pixel it
+# is 64 trilinear fetches out of a 64³ volume, which is the access pattern a
+# texture cache exists for — so the GPU/CPU gap here is a different number from
+# the Life one, and that is the point of having both.
+#
+# Both binaries are built at a fixed 256×256×90 by CMake (the RISC-V host bakes
+# its geometry in via -D), so the mode takes no size arguments.
+# ══════════════════════════════════════════════════════════════════════════════
+if [[ "$VOLUME" -eq 1 ]]; then
+    VOL_W=256; VOL_H=256; VOL_FRAMES=90
+    echo ""
+    echo -e "${BOLD}Volumetric ray-march — ${VOL_W}×${VOL_H}, ${VOL_FRAMES} frames, 64 steps/pixel${RESET}"
+    echo ""
+
+    gpu_out=$(./build/spirv/spirv_vulkan_volume_cs_host \
+                  build/spirv/volume.comp.spv volume_cs "$VOL_FRAMES" "$VOL_W" "$VOL_H" \
+                  2>/dev/null || true)
+    gpu_ms=$(parse_avg "$gpu_out")
+    gpu_dev=$(echo "$gpu_out" | grep -oE 'GPU: .*' | head -1 | cut -c6-)
+
+    cpu_ms="N/A"
+    if [[ "$RISCV_AVAIL" -eq 1 && -f build/riscv/volume_cs.rv ]]; then
+        cpu_out=$(OMP_NUM_THREADS="${NTHREADS}" $RISCV_SIM \
+                      ./build/riscv/volume_cs.rv 2>/dev/null || true)
+        cpu_ms=$(parse_avg "$cpu_out")
+    fi
+
+    echo -e "${BOLD}┌──────────────────────┬──────────────┬──────────────┬─────────┐${RESET}"
+    echo -e "${BOLD}│ Workload             │ GPU ms/frame │ CPU ms/frame │ Speedup │${RESET}"
+    echo -e "${BOLD}├──────────────────────┼──────────────┼──────────────┼─────────┤${RESET}"
+    printf "│ %-20s │ %12s │ %12s │ %7s │\n" \
+        "volume_cs" "$gpu_ms" "$cpu_ms" "$(speedup_label "$gpu_ms" "$cpu_ms")"
+    echo -e "${BOLD}└──────────────────────┴──────────────┴──────────────┴─────────┘${RESET}"
+    echo ""
+    [[ -n "$gpu_dev" ]] && echo -e "  GPU device: ${gpu_dev}"
+    echo -e "  CPU: ${NTHREADS} threads via ${RISCV_SIM:-none}"
+    echo ""
+    echo -e "${BOLD}Output:${RESET}"
+    [[ -f result/volume_cs.mp4 ]]    && echo -e "  ${GREEN}GPU:${RESET} result/volume_cs.mp4"
+    [[ -f result/volume_cs_rv.mp4 ]] && echo -e "  ${GREEN}CPU:${RESET} result/volume_cs_rv.mp4"
+    exit 0
+fi
 
 # ── helper: run one (grid, gens) pair, print a table row ──────────────────────
 run_pair() {

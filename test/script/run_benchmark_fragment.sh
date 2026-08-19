@@ -20,7 +20,10 @@ cd "$ROOT"
 source "$(dirname "${BASH_SOURCE[0]}")/bench_common.sh"
 
 # ── config ────────────────────────────────────────────────────────────────────
-ANIMATIONS=(mandelbrot julia voronoi waves tunnel ripple galaxy fire reaction cellular earth scene3d city ocean)
+# `matrix` is the matrix-bound entry: per pixel it runs two mat3*mat3 products,
+# an inverse, a transpose and a determinant, so it reports on the matrix
+# lowering path rather than on transcendental throughput like the rest.
+ANIMATIONS=(mandelbrot julia voronoi waves tunnel ripple galaxy fire reaction cellular earth scene3d city ocean matrix)
 VK_FRAMES=60
 VK_WIDTH=512
 VK_HEIGHT=512
@@ -132,9 +135,10 @@ for A in "${ANIMATIONS[@]}"; do
             # unguarded failure here (e.g. no static libgomp on the board) aborts
             # the whole script silently mid-loop.
             rv_err=$(mktemp)
-            if $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Isrc/runtime \
+            if $CROSS_CXX -std=c++20 -O3 -static -fopenmp -march=rv64gcv -mabi=lp64d -Isrc/runtime \
                     -DANIM_NAME="\"${A}\"" -DNFRAMES="${VK_FRAMES}" -DFPS=30 \
                     -DWIDTH="${RV_WIDTH}" -DHEIGHT="${RV_HEIGHT}" \
+                    -DSHADER_PACKET_WIDTH="${SHADER_PACKET_WIDTH}" \
                     test/rv_host/rv_host_fragment.cpp \
                     src/runtime/pipeline_runtime.cpp \
                     "build/riscv/${A}_rv.o" -o "build/riscv/${A}_bench.rv" 2>"$rv_err"; then

@@ -2,19 +2,6 @@
 #
 # Left half  (x < 0.5): trivial 4-op sine wave.
 # Right half (x >= 0.5): 80-iteration Mandelbrot.
-#
-# The iteration count must stay equal to mandelbrot_fs.src's, since that shader
-# is the uniform baseline this one is measured against. Only then does "half the
-# pixels do the heavy path" translate into an exact 50% ideal time ratio.
-#
-# CPU ADVANTAGE: each RISC-V thread takes exactly its own branch.
-# There is no SIMD register group — threads are truly independent.
-# A pixel on the left executes 4 instructions; one on the right executes ~640.
-# With OpenMP, all CPU cores run their own pixels with no cross-thread stalling.
-#
-# GPU PENALTY: warp lanes on the left must idle while right-side lanes iterate.
-# The boundary region (warps spanning x=0.5) pays full 80-iteration cost for all lanes.
-# This narrows the GPU speedup compared to uniform shaders.
 
 uniform float uTime;
 in vec2 vUV;

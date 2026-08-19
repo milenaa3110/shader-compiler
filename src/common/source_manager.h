@@ -1,12 +1,8 @@
 // source_manager.h — source locations as byte offsets, plus a SourceManager
 // that reconstructs (line, column) and the source line on demand.
 //
-// Modelled on LLVM's SMLoc / SourceMgr: a SourceLocation is an opaque offset
-// into the source buffer, nothing more. The lexer stamps tokens with offsets
-// (trivially — just `Cur - Begin`) and never counts lines or columns; the
-// translation to human-readable positions happens lazily, only when a
-// diagnostic is actually printed. That keeps Token small, makes advance()
-// branch-free, and moves all the \r / \n / tab bookkeeping into one place.
+// SourceLocation stores an opaque byte offset; SourceManager maps it to
+// human-readable line, column, and source-line information.
 #ifndef COMPILER_GLSL_SOURCE_MANAGER_H
 #define COMPILER_GLSL_SOURCE_MANAGER_H
 
@@ -27,7 +23,7 @@ struct SourceLocation {
   static SourceLocation fromOffset(uint32_t off) { return SourceLocation{off}; }
 };
 
-// Owns (a view of) one source buffer and answers position queries about it.
+// References one source buffer and answers position queries about it.
 // Line starts are computed once, lazily, on the first query.
 class SourceManager {
  public:
@@ -57,8 +53,7 @@ class SourceManager {
     return {line, col};
   }
 
-  // The text of the source line containing `loc` (without the line terminator),
-  // for caret rendering. Empty if the location is invalid.
+  // The text of the source line containing `loc` (without the line terminator) for caret rendering.
   std::string_view getLineText(SourceLocation loc) const {
     if (!loc.isValid() || Buffer.empty()) return {};
     size_t off = std::min<size_t>(loc.Offset, Buffer.size());
@@ -84,8 +79,7 @@ class SourceManager {
       if (c == '\n') {
         LineStarts.push_back(i + 1);
       } else if (c == '\r') {
-        // Treat \r\n as a single break: step over the \n so it doesn't start
-        // its own empty line.
+        // Treat \r\n as a single break: step over the \n
         if (i + 1 < Buffer.size() && Buffer[i + 1] == '\n') ++i;
         LineStarts.push_back(i + 1);
       }

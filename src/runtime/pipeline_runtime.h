@@ -21,9 +21,23 @@ struct PipelineDesc {
 // rgb_out must point to width * height * 3 bytes (packed RGB).
 void render_pipeline(const PipelineDesc& desc, unsigned char* rgb_out);
 
-// Binds an RGBA float texture to slot 0..7. 
+// Binds an RGBA float texture to slot 0..7.
 // Underlying data must remain valid for the duration of rendering.
 void bind_texture(int slot, const float* data, int width, int height);
 
-// Note: __tex_lookup and __tex2d_sample are emitted as always_inline LLVM 
+// Binds a layered sampled texture: cube map (depth=6, GL face order), 2D array
+// (depth=layers), or 3D volume (depth=slices). Slices are contiguous w*h*4 planes.
+void bind_texture_layered(int slot, const float* data, int width, int height,
+                          int depth);
+
+// Binds a read/write storage image (image2D: w*h; imageBuffer: w*1) to slot 0..7.
+void bind_image(int slot, float* data, int width, int height);
+
+// Hardware RVV vector length in bits (VLEN) via the vlenb CSR; 0 on non-V builds.
+unsigned get_vlen_bits();
+
+// Prints "VLEN=… packet width=…" to stderr; warns on a suboptimal/idle pairing.
+void report_vector_config();
+
+// __tex_lookup and __tex2d_sample are emitted as always_inline LLVM
 // bitcode in tex_inline.cpp and are not exposed as public C symbols.

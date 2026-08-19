@@ -1,15 +1,5 @@
 // sincos_opt.cpp — LLVM pass plugin: combine llvm.sin.f32(X) + llvm.cos.f32(X)
 // pairs into a single sincosf(X, &s, &c) libcall.
-//
-// Background: irgen emits llvm.sin.f32 / llvm.cos.f32 intrinsics. LLVM's
-// built-in sincos-combining only fires on direct sinf/cosf libcalls, so it
-// never triggers on intrinsics. This pass runs after opt -O3 (which unifies
-// identical subexpressions via GVN), at which point sin and cos of the same
-// expression share the same SSA Value* argument — making pairs easy to find.
-//
-// Build:  see Makefile target sincos_opt.so
-// Usage:  opt-18 -load-pass-plugin=./sincos_opt.so \
-//                -passes='sincos-opt,mem2reg,instcombine' -S in.ll -o out.ll
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -21,11 +11,9 @@
 
 using namespace llvm;
 
-// ── Pass ────────────────────────────────────────────────────────────────────
-
 struct SinCosOptPass : PassInfoMixin<SinCosOptPass> {
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
-        // Assign a sequential index to every instruction so we can order them.
+        // Assign a sequential index to every instruction to order them.
         DenseMap<Instruction *, unsigned> order;
         unsigned n = 0;
         for (auto &BB : F)
@@ -62,16 +50,16 @@ struct SinCosOptPass : PassInfoMixin<SinCosOptPass> {
             if (it == cosOf.end()) continue;
             IntrinsicInst *cosII = it->second;
 
-            // Only handle same-basic-block pairs (cross-block dominance is
-            // more complex; those cases are rare in straight-line shader code).
+            // Only same-basic-block pairs are handled; cross-block dominance is
+            // more complex and rare in straight-line shader code.
             if (sinII->getParent() != cosII->getParent()) continue;
 
-            // Insert alloca at function entry (always dominates everything).
+            // Allocas go at function entry, which dominates every use.
             IRBuilder<> entryB(&F.getEntryBlock().front());
             AllocaInst *SP = entryB.CreateAlloca(F32, nullptr, "sc_s");
             AllocaInst *CP = entryB.CreateAlloca(F32, nullptr, "sc_c");
 
-            // Place the sincosf call + loads before whichever intrinsic
+            // The sincosf call + loads are placed before whichever intrinsic
             // comes first; that guarantees the results dominate all uses.
             Instruction *first = (order[sinII] < order[cosII])
                                      ? static_cast<Instruction *>(sinII)
@@ -94,8 +82,6 @@ struct SinCosOptPass : PassInfoMixin<SinCosOptPass> {
         return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
 };
-
-// ── Plugin registration ──────────────────────────────────────────────────────
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
     return {

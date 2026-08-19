@@ -31,14 +31,12 @@ KEYWORD(Continue, "continue")
 KEYWORD(Return,   "return")
 KEYWORD(Discard,  "discard")
 
-// Keywords — value-bearing builtin types (scalar / vector / matrix / sampler).
-// Generated from the single source of truth so the lexer, parser, sema, and
-// codegen type lists can never drift apart.
+// Keywords — value-bearing builtin types (scalars, vectors, matrices, samplers)
 #define BTYPE(Tok, Spelling) KEYWORD(Tok, Spelling)
 #include "../ast/builtin_types.def"
 
-// Boolean literals and the return-only `void` are keywords but NOT value types,
-// so they live here rather than in builtin_types.def.
+// Boolean literals and void are keywords, but they are not value types,
+// so they are defined here instead of in builtin_types.def.
 KEYWORD(True,        "true")
 KEYWORD(False,       "false")
 KEYWORD(Void,        "void")

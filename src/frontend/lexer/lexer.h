@@ -16,7 +16,7 @@ enum class TokenKind {
 // A single lexical token
 // text: A view into the original source (the source must outlive this token)
 // num/isInt/isUnsigned: Only populated for numeric literals
-// loc: Byte offset of the token's first character;
+// loc: Byte offset of the token's first character in the source
 struct Token {
     TokenKind kind = TokenKind::Eof;
     std::string_view text;
@@ -26,13 +26,13 @@ struct Token {
     SourceLocation loc;
 };
 
-// Buffer-backed, instantiable, reentrant scanner
+// Buffer-backed lexer
 class Lexer {
  public:
     explicit Lexer(std::string_view src)
         : Beg(src.data()), Cur(src.data()), End(src.data() + src.size()) {}
 
-    // String literals / const char* bind here
+    // Allow construction from C strings and string literals
     explicit Lexer(const char* src) : Lexer(std::string_view(src)) {}
 
     // Reject temporary strings
@@ -42,9 +42,9 @@ class Lexer {
     Token next();
 
  private:
-    const char* Beg;  // start of the buffer, for computing token offsets
-    const char* Cur;
-    const char* End;
+    const char* Beg;  // start of the buffer
+    const char* Cur;  // current position
+    const char* End;  // end of the buffer
 
     // Lookahead without consuming. Returns '\0' past End.
     char peekCh(uint32_t n = 0) const {

@@ -8,9 +8,10 @@
 #include <llvm/IR/IRBuilder.h>
 #include "../codegen_state/codegen_state.h"
 #include "../../common/error_utils_fmt.h"
+#include <optional>
 #include <string>
 
-// NOTE: no `using namespace llvm;` — this is a header, and a using-directive
+// No `using namespace llvm;` here — this is a header, and a using-directive
 // here leaks llvm:: into every translation unit that includes it (and would
 // collide with glsl::Type vs llvm::Type). llvm names are qualified; `Builder`,
 // `Context`, `NamedStructTypes`, `logError`, and the helper functions are
@@ -75,7 +76,7 @@ inline llvm::Value* toI32(llvm::Value* v) {
             return Builder->CreateFPExt(v, dst, "fpext");
 
         // int to fp. bool (i1) is an unsigned 0/1 value → uitofp (sitofp would
-        // give -1.0 for true; GLSL §5.4.1: float(true) == 1.0). NOTE: signed-only
+        // give -1.0 for true; GLSL §5.4.1: float(true) == 1.0). Signed-only
         // for the int/uint split is still a Step-5 gap — only bool is fixed here.
         if (src->isIntegerTy() && (dst->isFloatTy() || dst->isDoubleTy())) {
             return src->isIntegerTy(1) ? Builder->CreateUIToFP(v, dst, "uitofp")
@@ -126,12 +127,74 @@ inline llvm::Value* toI32(llvm::Value* v) {
         return res;
     }
 
+    // ── Matrix representation ────────────────────────────────────────────────
+    // A matCxR is a named struct wrapping the column-major [Cols x <Rows x
+    // float>] array:  %glsl.mat4x4 = type { [4 x <4 x float>] }
+    //
+    // The wrapper exists purely to make matrices *distinguishable*. A bare
+    // [4 x <4 x float>] is the identical LLVM type as a genuine `vec4 a[4]`,
+    // and LLVM uniques types, so without the wrapper the SPIR-V backend cannot
+    // tell the two apart — it needs to, to emit OpTypeMatrix (with
+    // ColMajor/MatrixStride member decorations) rather than OpTypeArray.
+    //
+    // The array stays *inside* the struct rather than the struct having C
+    // members because `m[i]` with a dynamic index must lower to a GEP, and a
+    // struct index must be constant. Memory layout is unchanged (a single-member
+    // struct adds no padding), so host code declaring `float M[4][4]` is
+    // unaffected, and SROA folds the wrapper away entirely.
+    inline llvm::StructType* matrixTypeFor(unsigned cols, unsigned rows) {
+        std::string n = "glsl.mat" + std::to_string(cols) + "x" + std::to_string(rows);
+        if (auto* st = llvm::StructType::getTypeByName(*Context, n)) return st;
+        auto* colTy =
+            llvm::FixedVectorType::get(llvm::Type::getFloatTy(*Context), rows);
+        return llvm::StructType::create(*Context,
+                                        {llvm::ArrayType::get(colTy, cols)}, n);
+    }
+
+    struct MatrixShape { unsigned cols, rows; };
+
+    // The single predicate for "is this a matrix?". A shape-based test such as
+    // `isArrayTy() && getElementType()->isVectorTy()` cannot distinguish a
+    // matrix from an array of vectors.
+    inline std::optional<MatrixShape> matrixShapeOf(llvm::Type* t) {
+        auto* st = llvm::dyn_cast_or_null<llvm::StructType>(t);
+        if (!st || !st->hasName() || !st->getName().starts_with("glsl.mat"))
+            return std::nullopt;
+        if (st->getNumElements() != 1) return std::nullopt;
+        auto* at = llvm::dyn_cast<llvm::ArrayType>(st->getElementType(0));
+        if (!at) return std::nullopt;
+        auto* vt = llvm::dyn_cast<llvm::FixedVectorType>(at->getElementType());
+        if (!vt) return std::nullopt;
+        return MatrixShape{static_cast<unsigned>(at->getNumElements()),
+                           vt->getNumElements()};
+    }
+
+    inline bool isMatrixTy(llvm::Type* t) { return matrixShapeOf(t).has_value(); }
+
+    // The inner [Cols x <Rows x float>] of a matrix type.
+    inline llvm::ArrayType* matrixArrayTy(llvm::Type* t) {
+        auto* st = llvm::cast<llvm::StructType>(t);
+        return llvm::cast<llvm::ArrayType>(st->getElementType(0));
+    }
+
+    // Matrix value <-> inner column array. The five lowering kernels operate on
+    // the array, so the wrapper is peeled at the dispatch boundary and put back
+    // on the result; instcombine removes both.
+    inline llvm::Value* matrixColumns(llvm::Value* m) {
+        return Builder->CreateExtractValue(m, 0, "mat.cols");
+    }
+    inline llvm::Value* matrixFromColumns(llvm::Value* cols, unsigned c,
+                                          unsigned r) {
+        return Builder->CreateInsertValue(
+            llvm::UndefValue::get(matrixTypeFor(c, r)), cols, 0, "mat.wrap");
+    }
+
     inline llvm::Type* resolveTypeByName(llvm::StringRef name) {
         // For struct types. An opaque pre-declaration (FieldNames still
         // empty) is a *valid* reference at struct-decl time: LLVM allows
         // opaque struct types in nested field lists, and the body gets
         // set when that struct's StructDeclExprAST::codegen() runs.
-        // Sema rejects truly unknown names before we get here.
+        // Sema rejects truly unknown names before this point.
         if (auto it = NamedStructTypes.find(name.str()); it != NamedStructTypes.end()) {
             return it->second.Type;
         }
@@ -146,8 +209,7 @@ inline llvm::Value* toI32(llvm::Value* v) {
             return nullptr;
         }
         // Every value-bearing builtin from builtin_types.def — the same source
-        // the lexer/parser/sema use, so the lists can't drift. (Replaces the old
-        // hand-listed scalars + algorithmically-parsed vec/mat.) Matrices are
+        // the lexer/parser/sema use, so the lists can't drift. Matrices are
         // column-major [Cols x <Rows x float>]; samplers are opaque pointers.
 #define BTYPE_SCALAR(Tok, Spelling, GlslKind, LlvmGetter) \
         if (name == Spelling) return llvm::Type::LlvmGetter(*Context);
@@ -155,9 +217,7 @@ inline llvm::Value* toI32(llvm::Value* v) {
         if (name == Spelling) \
             return llvm::FixedVectorType::get(llvm::Type::LlvmElem(*Context), N);
 #define BTYPE_MATRIX(Tok, Spelling, Cols, Rows) \
-        if (name == Spelling) \
-            return llvm::ArrayType::get( \
-                llvm::FixedVectorType::get(llvm::Type::getFloatTy(*Context), Rows), Cols);
+        if (name == Spelling) return matrixTypeFor(Cols, Rows);
 #define BTYPE_SAMPLER(Tok, Spelling, Kind, Dim, Arrayed, IsImage) \
         if (name == Spelling) return llvm::PointerType::getUnqual(*Context);
 #include "../../frontend/ast/builtin_types.def"

@@ -7,7 +7,7 @@
 #include <system_error>
 #include <unordered_map>
 
-// Static lookup table that maps keyword spellings to their TokenKind
+// Maps keyword spellings to token kinds.
 static const std::unordered_map<std::string_view, TokenKind>& keywords() {
     static const std::unordered_map<std::string_view, TokenKind> table = {
 #define KEYWORD(Kind, Spelling) { Spelling, TokenKind::Kind },
@@ -16,9 +16,7 @@ static const std::unordered_map<std::string_view, TokenKind>& keywords() {
     return table;
 }
 
-// Lexer
-
-// Avoid using locale-dependent functions (like std::isdigit) to ensure determinism.
+// ASCII-only character classification for deterministic lexing.
 static bool isDigit(char c) {
     return c >= '0' && c <= '9';
 }
@@ -34,7 +32,6 @@ static bool isSpace(char c) {
 
 Token Lexer::next() {
     // Skip whitespace and `#`-to-end-of-line comments.
-    // A plain loop — no recursion — so an all-comments file cannot overflow the stack.
     for (;;) {
         if (Cur >= End) break;
         char c = *Cur;
@@ -76,8 +73,7 @@ Token Lexer::next() {
     }
 
     // Number, or a bare '.'
-    // Consumes a numeric literal.
-    // Malformed numbers (e.g., '1.2.3.4' or '1e5e6') are folded into a single TokenKind::InvalidNumber
+    // Malformed numeric literals are returned as a single InvalidNumber token.
     if (isDigit(c) || c == '.') {
         // A '.' not followed by a digit is the member-access operator.
         if (c == '.' && !isDigit(peekCh(1))) {
@@ -95,7 +91,7 @@ Token Lexer::next() {
             while (Cur < End && isDigit(*Cur))
                 advance();
         }
-        if (Cur < End && *Cur == '.') {  // second '.' → bad
+        if (Cur < End && *Cur == '.') {  // second '.' -> bad
             malformed = true;
             advance();
             while (Cur < End && (isDigit(*Cur) || *Cur == '.'))
@@ -111,7 +107,7 @@ Token Lexer::next() {
                 while (Cur < End && isDigit(*Cur))
                     advance();
             }
-            if (Cur < End && (*Cur == 'e' || *Cur == 'E')) {  // second 'e' → bad
+            if (Cur < End && (*Cur == 'e' || *Cur == 'E')) {  // second 'e' -> bad
                 malformed = true;
                 advance();
                 if (Cur < End && (*Cur == '+' || *Cur == '-')) advance();
@@ -133,12 +129,12 @@ Token Lexer::next() {
 
         std::string_view text(start, static_cast<size_t>(Cur - start));
         double v = 0.0;
-        // Fast, locale-independent parsing via C++17 std::from_chars if supported
+        // Locale-independent parsing via std::from_chars when supported.
 #if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
         auto res = std::from_chars(text.data(), text.data() + text.size(), v);
         if (res.ec == std::errc::result_out_of_range) return makeToken(TokenKind::InvalidNumber);
 #else
-        // Fallback for older stdlibs; requires a copy to guarantee null-termination
+        // Fallback for older standard libraries; requires a null-terminated copy.
         std::string buf(text);
         errno = 0;
         v = std::strtod(buf.c_str(), nullptr);

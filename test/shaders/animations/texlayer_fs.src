@@ -1,0 +1,30 @@
+# texlayer_fs.src — render-host coverage for the layered-texture runtime:
+# samplerCube / sampler3D / sampler2DArray (bound via bind_texture_layered), a
+# plain sampler2D (bind_texture), and a read/write image2D (bind_image). Each
+# sampler drives a distinct output channel so a wrong binding surfaces as a wrong
+# pixel; the image does a load→store round-trip the host reads back. Layers are
+# bound solid by the host, so the pixel is independent of face/slice/layer
+# selection precision — that selection is separately checked by sampler_numeric.
+
+layout(binding=0) uniform samplerCube uCube;
+layout(binding=1) uniform sampler3D uVol;
+layout(binding=2) uniform sampler2DArray uArr;
+layout(binding=3) uniform sampler2D uTex;
+layout(binding=4) uniform image2D uImg;
+
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    vec4 c = texture(uCube, vec3(1.0, 0.0, 0.0));   # cube  → R
+    c = c + texture(uVol,  vec3(0.5, 0.5, 0.0));     # 3D    → G
+    c = c + texture(uArr,  vec3(vUV, 1.0));          # array → B (uses the vUV varying)
+    c = c + texture(uTex,  vUV);                      # 2D    → adds to R
+    # Storage-image round-trip (bind_image): read texel (1,2), write it+0.5 to
+    # (3,4). Every fragment writes the same value (the source texel is never
+    # touched), so the result is deterministic under parallel rasterization.
+    vec4 s = imageLoad(uImg, ivec2(1, 2));
+    imageStore(uImg, ivec2(3, 4), s + vec4(0.5));
+    FragColor = c;
+}

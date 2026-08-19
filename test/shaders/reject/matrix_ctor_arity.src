@@ -1,0 +1,13 @@
+# Sema stamped any call naming a type with that type and checked nothing —
+# no arity, no argument types. mat3(1.0, 2.0) reached codegen, which reported
+# it twice (nullptr means both "not my constructor" and "mine but it failed",
+# so the dispatcher fell through to the next constructor and then to
+# "Unknown function referenced").
+
+@entry @stage(vertex)
+fn void main() {
+    mat3 m = mat3(1.0, 2.0);
+    gl_Position = vec4(m[0], 1.0);
+}
+
+# EXPECT-ERROR: constructor 'mat3' takes 3 column vectors of size 3 or 9 scalars, got 2 arguments

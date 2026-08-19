@@ -24,7 +24,6 @@ The primary goal is to compare GPU and CPU execution of the same shader logic, m
 │   │   └── emit/           irgen_riscv / irgen_spirv entry points + SPIR-V/trampoline emitters
 │   ├── passes/         sincos_opt.cpp — LLVM pass plugin
 │   ├── runtime/        Software rasterizer (pipeline_runtime.cpp/h, pipeline_abi.h, tex_inline)
-│   ├── driver/         shader_codegen (interactive IR dump tool)
 │   └── common/         error_utils helpers
 ├── test/
 │   ├── assets/         3D mesh data (cube, Stanford bunny, textured jeep, high-poly teddy, Mixamo boss)
@@ -81,7 +80,7 @@ The project uses CMake. A one-time configure populates `build/`, after which any
 # First-time configure (Release by default)
 cmake -S . -B build
 
-# Build everything: build/{shader_codegen, riscv/irgen_riscv, spirv/irgen_spirv,
+# Build everything: build/{riscv/irgen_riscv, spirv/irgen_spirv,
 #                          spirv/spirv_vulkan_*, llvm/sincos_opt.so}
 cmake --build build -j$(nproc)
 

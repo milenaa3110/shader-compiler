@@ -1,0 +1,16 @@
+# The rasterizer interpolates into fixed 16-float per-thread scratch arrays, but
+# every loop was bounded by the shader-supplied vs_varying_floats with no check
+# against that capacity. A mat4 varying is 16 floats on its own, so this pair
+# emitted @vs_varying_floats = 20 and overran the stack at render time.
+
+out mat4 vM;
+out vec4 vC;
+
+@entry @stage(vertex)
+fn void main() {
+    vM = mat4(1.0);
+    vC = vec4(1.0);
+    gl_Position = vec4(0.0);
+}
+
+# EXPECT-ERROR: shader declares 20 varying floats

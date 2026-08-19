@@ -176,6 +176,10 @@ Value* VariableExprAST::codegen() {
 }
 
 // Unary operator
+// Defined below with the other matrix kernels.
+static bool isMatrixType(Type* t);
+static Value* matNegate(Value* M);
+
 Value* UnaryExprAST::codegen() {
     Value* v = Operand->codegen();
     if (!v) {
@@ -187,6 +191,9 @@ Value* UnaryExprAST::codegen() {
         if (v->getType()->isFPOrFPVectorTy()) {
             return Builder->CreateFNeg(v, "neg");
         }
+        if (isMatrixType(v->getType())) {
+            return matNegate(v);
+        }
         if (v->getType()->isIntOrIntVectorTy()) {
             if (v->getType()->isIntegerTy(1)) {
                 logErrorAt(loc,"Negation not supported for boolean type");
@@ -194,7 +201,11 @@ Value* UnaryExprAST::codegen() {
             }
             return Builder->CreateNeg(v, "neg");
         }
-        logErrorAt(loc,fmt::format("Negation not supported for type: {}", v->getType()->getStructName()));
+        // getStructName() is an unchecked cast<StructType> — printing the type
+        // is the only safe way to name an arbitrary operand here.
+        std::string ts;
+        llvm::raw_string_ostream(ts) << *v->getType();
+        logErrorAt(loc,fmt::format("Negation not supported for type: {}", ts));
         return nullptr;
     }
 
@@ -231,6 +242,11 @@ Value* UnaryExprAST::codegen() {
                std::string("Unknown unary operator: ") + tokenKindName(Op));
     return nullptr;
 }
+
+// A matrix value is the named struct %glsl.matCxR wrapping the column-major
+// [Cols x <Rows x float>] array. See matrixTypeFor in utils.h for why the
+// wrapper exists.
+static bool isMatrixType(Type* t) { return isMatrixTy(t); }
 
 // Matrix binary-op lowering
 // mat(CxR) * vecC → vecR.  res = Σ_c column_c * splat(v[c])  (vector FMA per col)
@@ -286,9 +302,10 @@ static Value* matTimesMat(Value* M, Value* N) {
     return res;  // [K x <R x float>]
 }
 
-// mat * scalar (and scalar * mat): scale each column by splat(s). Matrices are
-// always float, so castScalarTo is a backstop for a scalar arriving as double.
-static Value* matTimesScalar(Value* M, Value* s) {
+// Component-wise mat/scalar operation. Broadcasts the scalar to each column, 
+// handles operand order for non-commutative ops (-, /), and auto-casts the 
+// scalar (e.g. int/double) to float.
+static Value* matScalarOp(TokenKind op, Value* M, Value* s, bool scalarOnLeft) {
     auto* matTy = cast<ArrayType>(M->getType());
     unsigned cols = matTy->getNumElements();
     auto* colTy = cast<FixedVectorType>(matTy->getElementType());
@@ -301,8 +318,17 @@ static Value* matTimesScalar(Value* M, Value* s) {
     Value* res = UndefValue::get(matTy);
     for (unsigned c = 0; c < cols; ++c) {
         Value* col = Builder->CreateExtractValue(M, c, "ms.col");
-        res = Builder->CreateInsertValue(
-            res, Builder->CreateFMul(col, sV, "ms.scaled"), c, "ms.ins");
+        Value* a = scalarOnLeft ? sV : col;
+        Value* b = scalarOnLeft ? col : sV;
+        Value* r = nullptr;
+        switch (op) {
+            case TokenKind::Multiply: r = Builder->CreateFMul(a, b, "ms.mul"); break;
+            case TokenKind::Divide:   r = Builder->CreateFDiv(a, b, "ms.div"); break;
+            case TokenKind::Plus:     r = Builder->CreateFAdd(a, b, "ms.add"); break;
+            case TokenKind::Minus:    r = Builder->CreateFSub(a, b, "ms.sub"); break;
+            default: return nullptr;
+        }
+        res = Builder->CreateInsertValue(res, r, c, "ms.ins");
     }
     return res;
 }
@@ -322,28 +348,114 @@ static Value* matAddSub(TokenKind op, Value* M, Value* N) {
     return res;
 }
 
+// Performs element-wise matrix division (M / N) column by column.
+static Value* matCompDivide(Value* M, Value* N) {
+    auto* matTy = cast<ArrayType>(M->getType());
+    unsigned cols = matTy->getNumElements();
+    Value* res = UndefValue::get(matTy);
+    for (unsigned c = 0; c < cols; ++c) {
+        Value* a = Builder->CreateExtractValue(M, c, "md.l");
+        Value* b = Builder->CreateExtractValue(N, c, "md.r");
+        res = Builder->CreateInsertValue(res, Builder->CreateFDiv(a, b, "md.div"),
+                                         c, "md.ins");
+    }
+    return res;
+}
+
+// mat == mat / mat != mat → a single bool. GLSL compares all components, so the
+// per-column <R x i1> results are and-reduced serially (same shape as
+// dotFloatVector's reduction) rather than via a vector.reduce intrinsic, which
+// the RISC-V and packet paths would each have to learn to lower.
+static Value* matCompare(TokenKind op, Value* M, Value* N) {
+    auto* matTy = cast<ArrayType>(M->getType());
+    unsigned cols = matTy->getNumElements();
+    unsigned rows = cast<FixedVectorType>(matTy->getElementType())->getNumElements();
+    Value* acc = nullptr;
+    for (unsigned c = 0; c < cols; ++c) {
+        Value* a = Builder->CreateExtractValue(M, c, "mc.l");
+        Value* b = Builder->CreateExtractValue(N, c, "mc.r");
+        Value* eq = Builder->CreateFCmpOEQ(a, b, "mc.eq");  // <R x i1>
+        for (unsigned r = 0; r < rows; ++r) {
+            Value* lane = Builder->CreateExtractElement(eq, Builder->getInt32(r),
+                                                        "mc.lane");
+            acc = acc ? Builder->CreateAnd(acc, lane, "mc.and") : lane;
+        }
+    }
+    return (op == TokenKind::NotEqual) ? Builder->CreateNot(acc, "mc.ne") : acc;
+}
+
+// -mat: component-wise negation, column by column.
+static Value* matNegate(Value* M) {
+    auto shape = matrixShapeOf(M->getType());
+    Value* cols = matrixColumns(M);
+    auto* arrTy = cast<ArrayType>(cols->getType());
+    Value* res = UndefValue::get(arrTy);
+    for (unsigned c = 0; c < shape->cols; ++c) {
+        Value* a = Builder->CreateExtractValue(cols, c, "mn.col");
+        res = Builder->CreateInsertValue(res, Builder->CreateFNeg(a, "mn.neg"), c,
+                                         "mn.ins");
+    }
+    return matrixFromColumns(res, shape->cols, shape->rows);
+}
+
 // Dispatch the five sema-validated matrix shapes. Anything else reaching here is
 // a sema/codegen split — sema should have rejected it.
+// The kernels above all work on the inner column array, so the %glsl.matCxR
+// wrapper is peeled here and put back on a matrix-typed result. Keeping the
+// peel at this one boundary leaves every kernel untouched by the representation
+// change; SROA/instcombine fold the extractvalue/insertvalue pair away.
 static Value* codegenMatrixBinary(TokenKind op, Value* L, Value* R,
                                   SourceLocation loc) {
-    const bool lMat = L->getType()->isArrayTy();
-    const bool rMat = R->getType()->isArrayTy();
+    const auto lShape = matrixShapeOf(L->getType());
+    const auto rShape = matrixShapeOf(R->getType());
+    const bool lMat = lShape.has_value();
+    const bool rMat = rShape.has_value();
+
+    Value* lv = lMat ? matrixColumns(L) : L;
+    Value* rv = rMat ? matrixColumns(R) : R;
+
+    // Result shape for the forms that produce a matrix.
+    auto wrap = [&](Value* cols, unsigned c, unsigned r) -> Value* {
+        return cols ? matrixFromColumns(cols, c, r) : nullptr;
+    };
+
     if (op == TokenKind::Multiply) {
-        if (lMat && rMat)                       return matTimesMat(L, R);
-        if (lMat && R->getType()->isVectorTy()) return matTimesVec(L, R);
-        if (L->getType()->isVectorTy() && rMat) return vecTimesMat(L, R);
-        if (lMat && !rMat)                      return matTimesScalar(L, R);
-        if (rMat && !lMat)                      return matTimesScalar(R, L);
+        if (lMat && rMat)
+            return wrap(matTimesMat(lv, rv), rShape->cols, lShape->rows);
+        if (lMat && R->getType()->isVectorTy()) return matTimesVec(lv, rv);
+        if (L->getType()->isVectorTy() && rMat) return vecTimesMat(lv, rv);
+        if (lMat && !rMat)
+            return wrap(matScalarOp(op, lv, rv, false),
+                        lShape->cols, lShape->rows);
+        if (rMat && !lMat)
+            return wrap(matScalarOp(op, rv, lv, true),
+                        rShape->cols, rShape->rows);
+    }
+    // Dispatch component-wise matrix operations (+, -, /).
+    if (op == TokenKind::Plus || op == TokenKind::Minus ||
+        op == TokenKind::Divide) {
+        if (lMat && rMat && op == TokenKind::Divide)
+            return wrap(matCompDivide(lv, rv), lShape->cols, lShape->rows);
+        if (lMat && !rMat)
+            return wrap(matScalarOp(op, lv, rv, false),
+                        lShape->cols, lShape->rows);
+        if (rMat && !lMat)
+            return wrap(matScalarOp(op, rv, lv, true),
+                        rShape->cols, rShape->rows);
     }
     if (op == TokenKind::Plus || op == TokenKind::Minus)
-        if (lMat && rMat)                       return matAddSub(op, L, R);
+        if (lMat && rMat)
+            return wrap(matAddSub(op, lv, rv), lShape->cols, lShape->rows);
+    if (op == TokenKind::Equal || op == TokenKind::NotEqual)
+        if (lMat && rMat)                       return matCompare(op, lv, rv);
     logErrorAt(loc, "Internal: unsupported matrix operation reached codegen");
     return nullptr;
 }
 
 // Binary operator
 Value* BinaryExprAST::codegen() {
-    // whole function and returns early — it never falls through to that path.
+    // Short-circuit `&&` / `||` is lowered in full here and returns early; it
+    // never falls through to the arithmetic path below.
     if (Op == TokenKind::And || Op == TokenKind::Or) {
         Function* F = Builder->GetInsertBlock()->getParent();
 
@@ -403,18 +515,14 @@ Value* BinaryExprAST::codegen() {
     Value* R = RHS->codegen();
     if (!L || !R) return nullptr;
 
-    auto isMatrixVal = [](Value* v) {
-        auto* a = dyn_cast<ArrayType>(v->getType());
-        return a && a->getElementType()->isVectorTy();
-    };
-    if (isMatrixVal(L) || isMatrixVal(R))
+    if (isMatrixType(L->getType()) || isMatrixType(R->getType()))
         return codegenMatrixBinary(Op, L, R, loc);
 
     if (L->getType() != R->getType()) {
         std::string ls, rs;
         llvm::raw_string_ostream(ls) << *L->getType();
         llvm::raw_string_ostream(rs) << *R->getType();
-        logErrorAt(loc, fmt::format("operands of '{}' have incompatible types "
+        logErrorAt(loc, fmt::format("operands of {} have incompatible types "
                                     "'{}' and '{}'", tokenKindName(Op), ls, rs));
         return nullptr;
     }
@@ -691,17 +799,17 @@ llvm::Value* MemberAssignmentExprAST::codegen() {
 
 // Function call or constructor call ast
 Value* CallExprAST::codegen() {
-    if (auto* v = tryCodegenMatrixConstructor(this))
-        return v;
-
-    if (auto* v = tryCodegenVectorConstructor(this))
-        return v;
-
-    if (auto* v = tryCodegenScalarConstructor(this))
-        return v;
-
-    if (auto* v = tryCodegenStructConstructor(this))
-        return v;
+    // Each handler reports NotMine / Ok / Failed. Stopping on Failed is what
+    // keeps a bad `mat3(1.0, 2.0)` from also being run through the vector,
+    // scalar and struct constructors and finally reported as an unknown
+    // function — one mistake would otherwise produce two unrelated diagnostics.
+    using CtorFn = CtorResult (*)(const CallExprAST*);
+    for (CtorFn ctor : {tryCodegenMatrixConstructor, tryCodegenVectorConstructor,
+                        tryCodegenScalarConstructor, tryCodegenStructConstructor}) {
+        CtorResult r = ctor(this);
+        if (r.status == CtorStatus::Ok) return r.value;
+        if (r.status == CtorStatus::Failed) return nullptr;
+    }
 
     // Generate arguments once
     std::vector<llvm::Value*> ArgsV;
@@ -712,8 +820,22 @@ Value* CallExprAST::codegen() {
         ArgsV.push_back(v);
     }
 
-    // Try builtin with generated args
-    if (auto* bv = codegenBuiltin(*Builder, TheModule.get(), Callee, ArgsV))
+    // Try builtin with generated args. Pass the first arg's GLSL type spelling so
+    // sampler/image builtins can dispatch by sampler type (the LLVM value erases
+    // 2D/3D/cube/array/image to an opaque ptr), plus its binding slot so the
+    // runtime reads the right texture.
+    std::string arg0TypeName;
+    int arg0Binding = 0;
+    if (!Args.empty() && Args[0]->getType()) {
+        arg0TypeName = Args[0]->getType()->toString();
+        if (auto* var = llvm::dyn_cast<VariableExprAST>(Args[0]))
+            if (auto* g = TheModule ? TheModule->getGlobalVariable(var->Name) : nullptr)
+                if (auto* md = g->getMetadata("shader.binding"))
+                    arg0Binding = (int)llvm::mdconst::extract<llvm::ConstantInt>(
+                                      md->getOperand(0))->getSExtValue();
+    }
+    if (auto* bv = codegenBuiltin(*Builder, TheModule.get(), Callee, ArgsV,
+                                  arg0TypeName, arg0Binding))
         return bv;
 
     // User-defined function
@@ -779,7 +901,8 @@ llvm::Value* IfExprAST::codegen() {
     Value* condVal = Condition->codegen();
     if (!condVal) return nullptr;
 
-    // Ensure condition is i1 (adjust if your language allows float/bool conditions)
+    // The condition is normalized to i1; float and wider integer conditions are
+    // compared against zero first.
     if (condVal->getType()->isFloatTy()) {
         condVal = Builder->CreateFCmpONE(
             condVal,
@@ -836,7 +959,7 @@ llvm::Value* IfExprAST::codegen() {
     // If no ELSE, false edge already goes to mergeBB, so merge is reachable.
     Builder->SetInsertPoint(mergeBB);
 
-    // Your language currently treats `if` as statement-like expression -> dummy value
+    // `if` is a statement-like expression, so the result is an unused dummy value.
     return ConstantFP::get(Type::getFloatTy(*Context), 0.0f);
 }
 
@@ -977,14 +1100,37 @@ static Value* lvalueAddr(ExprAST* e, Type*& outTy) {
                                           sName + "." + mem->Member + ".ptr");
     }
     if (auto* macc = dyn_cast<MatrixAccessExprAST>(e)) {
-        if (macc->Index2) return nullptr;  // m[i][j] scalar — vector path handles it
         Type* baseTy = nullptr;
         Value* basePtr = lvalueAddr(macc->Object, baseTy);
-        if (!basePtr || !baseTy->isArrayTy()) return nullptr;
-        Value* iVal = macc->Index->codegen();
-        if (!iVal) return nullptr;
-        iVal = toI32(iVal);
+        if (!basePtr) return nullptr;
+        // A matrix is %glsl.matCxR = { [C x <R x float>] }, so indexing a column
+        // needs one more level than a plain array does.
+        const bool isMat = isMatrixTy(baseTy);
         Value* zero = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+        if (macc->Index2) {
+            // The only addressable two-index form is an array-of-matrix column,
+            // `arr[i][j]` → a pointer to column j of matrix element i. A matrix's
+            // own m[i][j] scalar has no stable address (dynamic vector component).
+            if (isMat || !baseTy->isArrayTy()) return nullptr;
+            auto ms = matrixShapeOf(cast<ArrayType>(baseTy)->getElementType());
+            if (!ms) return nullptr;
+            Value* iVal = toI32(macc->Index->codegen());
+            Value* jVal = toI32(macc->Index2->codegen());
+            if (!iVal || !jVal) return nullptr;
+            outTy = FixedVectorType::get(Type::getFloatTy(*Context), ms->rows);
+            return Builder->CreateInBoundsGEP(baseTy, basePtr,
+                                              {zero, iVal, zero, jVal},
+                                              "arr.mat.col.ptr");
+        }
+        if (!isMat && !baseTy->isArrayTy()) return nullptr;
+        Value* iVal = toI32(macc->Index->codegen());
+        if (!iVal) return nullptr;
+        if (isMat) {
+            auto* arrTy = matrixArrayTy(baseTy);
+            outTy = arrTy->getElementType();
+            return Builder->CreateInBoundsGEP(baseTy, basePtr, {zero, zero, iVal},
+                                              "mat.col.ptr");
+        }
         outTy = cast<ArrayType>(baseTy)->getElementType();
         return Builder->CreateInBoundsGEP(baseTy, basePtr, {zero, iVal},
                                           "elem.ptr");
@@ -997,11 +1143,23 @@ Value *MatrixAccessExprAST::codegen() {
     Type* baseTy = nullptr;
     std::string baseName = "arr";
     if (Value* basePtr = lvalueAddr(Object, baseTy)) {
-        if (!baseTy->isArrayTy()) {
+        // Object is itself an addressable column vector (arr[i][j] of an
+        // array-of-matrix): a trailing [k] selects a component. `arr[i][j][k]`
+        // parses as MatrixAccess(MatrixAccess(arr,i,j), k).
+        if (baseTy->isVectorTy() && Index && !Index2) {
+            Value* v = Builder->CreateLoad(baseTy, basePtr, baseName + ".col.ld");
+            Value* kVal = toI32(Index->codegen());
+            if (!kVal) return nullptr;
+            return Builder->CreateExtractElement(v, kVal, baseName + ".elem");
+        }
+        // A matrix is %glsl.matCxR = { [C x <R x float>] }, so reaching a column
+        // costs one more GEP index than a plain array element does.
+        const bool isMat = isMatrixTy(baseTy);
+        if (!isMat && !baseTy->isArrayTy()) {
             logErrorAt(loc, "Matrix/array access only supported on array types");
             return nullptr;
         }
-        auto* arrTy  = cast<ArrayType>(baseTy);
+        auto* arrTy  = isMat ? matrixArrayTy(baseTy) : cast<ArrayType>(baseTy);
         Type* elemTy = arrTy->getElementType();
         if (!Index) {
             logErrorAt(loc, "Array/matrix access requires first index");
@@ -1012,12 +1170,25 @@ Value *MatrixAccessExprAST::codegen() {
         iVal = toI32(iVal);
         if (!iVal) { logErrorAt(loc, "First index is not convertible to i32"); return nullptr; }
 
-        Value* zero    = ConstantInt::get(Type::getInt32Ty(*Context), 0);
-        Value* elemPtr = Builder->CreateInBoundsGEP(baseTy, basePtr, {zero, iVal},
+        Value* zero = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+        llvm::SmallVector<Value*, 3> idx{zero};
+        if (isMat) idx.push_back(zero);
+        idx.push_back(iVal);
+        Value* elemPtr = Builder->CreateInBoundsGEP(baseTy, basePtr, idx,
                                                     baseName + ".elem.ptr");
         if (!Index2) {
             return Builder->CreateLoad(elemTy, elemPtr,
                                        baseName + (elemTy->isVectorTy() ? ".col" : ".elem"));
+        }
+        // arr[i][j] where the array element is itself a matrix (`mat3 arr[N]`):
+        // elemPtr points at that matrix, so index into its wrapper for column j.
+        if (auto ms = matrixShapeOf(elemTy)) {
+            Value* jVal = toI32(Index2->codegen());
+            if (!jVal) { logErrorAt(this->loc, "Second index is not convertible to i32"); return nullptr; }
+            Value* colPtr = Builder->CreateInBoundsGEP(
+                elemTy, elemPtr, {zero, zero, jVal}, baseName + ".mat.col.ptr");
+            auto* colTy = FixedVectorType::get(Type::getFloatTy(*Context), ms->rows);
+            return Builder->CreateLoad(colTy, colPtr, baseName + ".mat.col");
         }
         if (!elemTy->isVectorTy()) {
             logErrorAt(loc, "Second index is only valid for matrix (array-of-vector)");
@@ -1062,21 +1233,33 @@ Value *MatrixAccessExprAST::codegen() {
         return Builder->CreateLoad(info.elemTy, elemPtr, lhsVar->Name + ".elem");
     }
 
+    // UniformArrays is populated only by UniformArrayDeclExprAST, so a plain
+    // `uniform mat4 M` never appears there — fall back to the module global
+    // exactly as VariableExprAST::codegen does.
+    GlobalVariable* gv = nullptr;
     auto uit = UniformArrays.find(lhsVar->Name);
-    if (uit == UniformArrays.end()) {
+    if (uit != UniformArrays.end()) {
+        gv = uit->second;
+    } else if (TheModule) {
+        gv = TheModule->getGlobalVariable(lhsVar->Name);
+    }
+    if (!gv) {
         logErrorAt(loc,fmt::format("Unknown variable '{}' in matrix/array access", lhsVar->Name));
         return nullptr;
     }
 
-    auto *gv    = uit->second;
     Type *uBaseTy = gv->getValueType();
 
-    if (!uBaseTy->isArrayTy()) {
-        logErrorAt(loc,fmt::format("Uniform '{}' is not an array type", lhsVar->Name));
+    // Either `uniform mat4 M` (%glsl.mat4x4 = { [4 x <4 x float>] }) or a real
+    // uniform array like `uniform vec4 M[4]`. The matrix needs one more GEP
+    // index to reach a column.
+    const bool uIsMat = isMatrixTy(uBaseTy);
+    if (!uIsMat && !uBaseTy->isArrayTy()) {
+        logErrorAt(loc,fmt::format("Uniform '{}' is not an array or matrix type", lhsVar->Name));
         return nullptr;
     }
 
-    auto *arrTy  = cast<ArrayType>(uBaseTy);
+    auto *arrTy  = uIsMat ? matrixArrayTy(uBaseTy) : cast<ArrayType>(uBaseTy);
     Type *elemTy = arrTy->getElementType();
 
     if (!Index) {
@@ -1092,9 +1275,12 @@ Value *MatrixAccessExprAST::codegen() {
         return nullptr;
     }
 
-    Value *zero    = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+    Value *zero = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+    llvm::SmallVector<Value*, 3> uIdx{zero};
+    if (uIsMat) uIdx.push_back(zero);
+    uIdx.push_back(iVal);
     Value *elemPtr = Builder->CreateInBoundsGEP(
-        uBaseTy, gv, { zero, iVal }, lhsVar->Name + ".u.elem.ptr"
+        uBaseTy, gv, uIdx, lhsVar->Name + ".u.elem.ptr"
     );
 
     if (!Index2) {
@@ -1165,17 +1351,51 @@ Value* MatrixAssignmentExprAST::codegen() {
         logErrorAt(loc, "Array assignment LHS must be a named variable or struct field");
         return nullptr;
     }
-    if (!matTy->isArrayTy()) {
-        logErrorAt(loc, fmt::format("'{}' is not an array type", baseName));
+    Value* zero = ConstantInt::get(Type::getInt32Ty(*Context), 0);
+    // Object is an addressable column vector (arr[i][j] of an array-of-matrix):
+    // `arr[i][j][k] = scalar` updates component k. `arr[i][j][k]` parses as
+    // MatrixAssignment(Object = MatrixAccess(arr,i,j), Index = k).
+    if (matTy->isVectorTy() && Index && !Index2) {
+        Value* kVal = toI32(Index->codegen());
+        if (!kVal) return nullptr;
+        Value* rhs = RHS->codegen();
+        if (!rhs) return nullptr;
+        Value* v   = Builder->CreateLoad(matTy, basePtr, baseName + ".col.ld");
+        Value* upd = Builder->CreateInsertElement(v, rhs, kVal, baseName + ".upd");
+        Builder->CreateStore(upd, basePtr);
+        return rhs;
+    }
+    // Matrix (%glsl.matCxR = { [C x <R x float>] }) or plain array; the matrix
+    // takes one more GEP index to reach a column.
+    const bool isMat = isMatrixTy(matTy);
+    if (!isMat && !matTy->isArrayTy()) {
+        logErrorAt(loc, fmt::format("'{}' is not an array or matrix type", baseName));
         return nullptr;
     }
-    auto* arrTy = cast<ArrayType>(matTy);
+    auto* arrTy = isMat ? matrixArrayTy(matTy) : cast<ArrayType>(matTy);
     Type* colTy = arrTy->getElementType();
     Value* iVal = Index->codegen();
     if (!iVal) return nullptr;
     iVal = toI32(iVal);
-    Value* zero   = ConstantInt::get(Type::getInt32Ty(*Context), 0);
-    Value* colPtr = Builder->CreateInBoundsGEP(matTy, basePtr, {zero, iVal},
+    // Array-of-matrix column store: `arr[i][j] = col`. The array element (colTy)
+    // is a matrix, so the second index addresses its column.
+    if (!isMat && Index2) {
+        if (auto ms = matrixShapeOf(colTy)) {
+            (void)ms;
+            Value* jVal = toI32(Index2->codegen());
+            if (!jVal) return nullptr;
+            Value* mcolPtr = Builder->CreateInBoundsGEP(
+                matTy, basePtr, {zero, iVal, zero, jVal}, baseName + ".mat.col.ptr");
+            Value* rhs = RHS->codegen();
+            if (!rhs) return nullptr;
+            Builder->CreateStore(rhs, mcolPtr);
+            return rhs;
+        }
+    }
+    llvm::SmallVector<Value*, 3> aIdx{zero};
+    if (isMat) aIdx.push_back(zero);
+    aIdx.push_back(iVal);
+    Value* colPtr = Builder->CreateInBoundsGEP(matTy, basePtr, aIdx,
                                                baseName + ".col.ptr");
     if (!Index2) {
         Value* rhs = RHS->codegen();
@@ -1663,7 +1883,7 @@ Value* ForExprAST::codegen() {
     Builder->SetInsertPoint(IncBB);
     if (Increment && !Increment->codegen()) return nullptr;
 
-    // inc always goes back to condition (unless increment terminated, which it shouldn't)
+    // the increment block branches back to the condition unless it terminated
     if (!Builder->GetInsertBlock()->getTerminator()) {
         Builder->CreateBr(CondBB);
     }
@@ -1737,6 +1957,25 @@ Value* StageVarDeclAST::codegen() {
 }
 
 // Uniform declaration
+// Neutral sampler descriptor for the SPIR-V backend, decoupled from spirv.h.
+// Packs dimCode (0=2D,1=3D,2=Cube,3=Buffer) | arrayed<<4 | isImage<<5, straight
+// from builtin_types.def so there is one source of truth. -1 = not a sampler.
+static int samplerMetaCode(const std::string& spelling) {
+#define DIMCODE_Dim2D 0
+#define DIMCODE_Dim3D 1
+#define DIMCODE_DimCube 2
+#define DIMCODE_DimBuffer 3
+#define BTYPE_SAMPLER(Tok, Spelling, Kind, Dim, Arrayed, IsImage) \
+    if (spelling == Spelling)                                      \
+        return DIMCODE_##Dim | ((Arrayed) << 4) | ((IsImage) << 5);
+#include "builtin_types.def"
+#undef DIMCODE_Dim2D
+#undef DIMCODE_Dim3D
+#undef DIMCODE_DimCube
+#undef DIMCODE_DimBuffer
+    return -1;
+}
+
 Value* UniformDeclExprAST::codegen() {
     using namespace llvm;
     Type* t = resolveTypeByName(TypeName);
@@ -1766,6 +2005,13 @@ Value* UniformDeclExprAST::codegen() {
         G->setMetadata("shader.binding",
             MDNode::get(*Context, ConstantAsMetadata::get(
                 ConstantInt::get(Type::getInt32Ty(*Context), binding))));
+    // Record the sampler/image dimensionality so the SPIR-V backend can emit the
+    // right OpTypeImage — the LLVM type is an opaque ptr that erases 2D/3D/cube/
+    // array/image. (RISC-V dispatch reads the AST sampler type directly instead.)
+    if (int sc = samplerMetaCode(TypeName); sc >= 0)
+        G->setMetadata("shader.sampler.kind",
+            MDNode::get(*Context, ConstantAsMetadata::get(
+                ConstantInt::get(Type::getInt32Ty(*Context), sc))));
     return Constant::getNullValue(t);
 }
 
@@ -1966,21 +2212,35 @@ Value* IncrDecrExprAST::codegen() {
     if (!oldVal) return nullptr;
 
     Type* ty = oldVal->getType();
-    Value* one = nullptr;
-    if (ty->isIntegerTy()) {
-        one = ConstantInt::get(ty, 1);
-    } else if (ty->isFloatingPointTy()) {
-        one = ConstantFP::get(ty, 1.0);
+    Value* newVal = nullptr;
+    if (auto shape = matrixShapeOf(ty)) {
+        Value* cols = matrixColumns(oldVal);
+        auto* arrTy = cast<ArrayType>(cols->getType());
+        auto* colTy = cast<FixedVectorType>(arrTy->getElementType());
+        Value* onesCol = ConstantFP::get(colTy, 1.0);  // splatted <R x float> 1.0
+        Value* onesArr = UndefValue::get(arrTy);
+        for (unsigned c = 0; c < shape->cols; ++c)
+            onesArr = Builder->CreateInsertValue(onesArr, onesCol, c);
+        Value* resCols = matAddSub(
+            isDecrement ? TokenKind::Minus : TokenKind::Plus, cols, onesArr);
+        newVal = matrixFromColumns(resCols, shape->cols, shape->rows);
     } else {
-        logErrorAt(loc, "Postfix ++/-- only supported on int / float scalars");
-        return nullptr;
+        Value* one = nullptr;
+        if (ty->isIntegerTy()) {
+            one = ConstantInt::get(ty, 1);
+        } else if (ty->isFloatingPointTy()) {
+            one = ConstantFP::get(ty, 1.0);
+        } else {
+            logErrorAt(loc,
+                       "Postfix ++/-- only supported on int / float scalars or matrices");
+            return nullptr;
+        }
+        newVal = ty->isIntegerTy()
+            ? (isDecrement ? Builder->CreateSub(oldVal, one, "dec")
+                           : Builder->CreateAdd(oldVal, one, "inc"))
+            : (isDecrement ? Builder->CreateFSub(oldVal, one, "dec")
+                           : Builder->CreateFAdd(oldVal, one, "inc"));
     }
-
-    Value* newVal = ty->isIntegerTy()
-        ? (isDecrement ? Builder->CreateSub(oldVal, one, "dec")
-                       : Builder->CreateAdd(oldVal, one, "inc"))
-        : (isDecrement ? Builder->CreateFSub(oldVal, one, "dec")
-                       : Builder->CreateFAdd(oldVal, one, "inc"));
 
     if (varAlloca) {
         Builder->CreateStore(newVal, varAlloca);

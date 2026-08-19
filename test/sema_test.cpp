@@ -219,7 +219,91 @@ int main() {
     expectInitType("mat3 * scalar → mat3", "uniform mat3 A;\nfn void f() { mat3 c = A * 2.0; }", 0, "mat3");
     check(analyzeErrors("uniform mat3 M;\nfn void f(vec4 p) { vec4 r = M*p; }") > 0, "mat3 * vec4 dimension mismatch is an error");
     check(analyzeErrors("uniform mat4x2 A; uniform mat2x4 B;\nfn void f() { mat4x2 c = A + B; }") > 0, "mat + mat of different shapes is an error");
-    check(analyzeErrors("uniform mat3 A; uniform mat3 B;\nfn void f() { mat3 c = A / B; }") > 0, "matrix / matrix division is an error");
+    // Component-wise scalar/matrix broadcast (GLSL): mat±scalar, scalar±mat,
+    // scalar/mat, and mat/mat are all defined and yield the matrix shape. Only
+    // mat*mat stays the linear-algebra product.
+    expectInitType("mat3 / mat3 → mat3", "uniform mat3 A; uniform mat3 B;\nfn void f() { mat3 c = A / B; }", 0, "mat3");
+    expectInitType("mat3 + scalar → mat3", "uniform mat3 A;\nfn void f() { mat3 c = A + 1.0; }", 0, "mat3");
+    expectInitType("scalar + mat3 → mat3", "uniform mat3 A;\nfn void f() { mat3 c = 1.0 + A; }", 0, "mat3");
+    expectInitType("mat3 - scalar → mat3", "uniform mat3 A;\nfn void f() { mat3 c = A - 2.0; }", 0, "mat3");
+    expectInitType("scalar - mat3 → mat3", "uniform mat3 A;\nfn void f() { mat3 c = 2.0 - A; }", 0, "mat3");
+    expectInitType("scalar / mat3 → mat3", "uniform mat3 A;\nfn void f() { mat3 c = 2.0 / A; }", 0, "mat3");
+
+    //  Matrix Operand Domain ─
+    // Matrices are float-only: a mixed-element operand used to pass the
+    // dimension check and lower to `fmul <4 x float>, <4 x i32>`.
+    // GLSL converts an integer operand rather than rejecting it (confirmed
+    // against glslangValidator); sema must widen it so codegen does not emit
+    // `fmul <4 x float>, <4 x i32>`.
+    expectInitType("mat4 * ivec4 → vec4", "uniform mat4 M;\nfn void f(ivec4 v) { vec4 r = M * v; }", 0, "vec4");
+    expectInitType("mat3 * uvec3 → vec3", "uniform mat3 M;\nfn void f(uvec3 v) { vec3 r = M * v; }", 0, "vec3");
+    check(analyzeErrors("uniform mat4 M;\nfn void f() { mat4 c = M * true; }") > 0, "mat4 * bool is an error (bool is not numeric)");
+    expectInitType("mat3 / scalar → mat3", "uniform mat3 A;\nfn void f() { mat3 c = A / 2.0; }", 0, "mat3");
+    expectInitType("mat3 * int scalar → mat3", "uniform mat3 A;\nfn void f() { mat3 c = A * 2; }", 0, "mat3");
+    expectInitType("mat3 == mat3 → bool", "uniform mat3 A; uniform mat3 B;\nfn void f() { bool e = A == B; }", 0, "bool");
+    check(analyzeErrors("uniform mat3 A; uniform mat4 B;\nfn void f() { bool e = A == B; }") > 0, "comparing matrices of different shapes is an error");
+    check(analyzeErrors("uniform mat3 A; uniform mat3 B;\nfn void f() { bool e = A < B; }") > 0, "ordered relation on matrices is an error");
+
+    //  Unary Operand Domain ─
+    // Unchecked propagation let these reach codegen, where naming the operand
+    // type crashed the compiler (unchecked cast<StructType>).
+    expectInitType("-mat3 → mat3", "uniform mat3 A;\nfn void f() { mat3 c = -A; }", 0, "mat3");
+    check(analyzeErrors("struct S { float a; };\nfn void f() { S s; S t = -s; }") > 0, "negating a struct is an error");
+    check(analyzeErrors("uniform mat3 A;\nfn void f() { mat3 c = ~A; }") > 0, "bitwise not on a matrix is an error");
+    check(analyzeErrors("fn void f(float x) { float y = ~x; }") > 0, "bitwise not on a float is an error");
+
+    //  Literal Subscript Bounds ─
+    // An out-of-range literal index lowered to a getelementptr past the end.
+    check(analyzeErrors("uniform mat4 M;\nfn void f() { vec4 c = M[9]; }") > 0, "column index past a mat4 is an error");
+    check(analyzeErrors("uniform mat4 M;\nfn void f() { vec4 c = M[-1]; }") > 0, "negative column index is an error");
+    check(analyzeErrors("uniform mat4 M;\nfn void f() { float c = M[1][7]; }") > 0, "row index past a column is an error");
+    check(analyzeErrors("uniform mat4 M;\nfn void f() { vec4 c = M[3]; }") == 0, "the last valid column index is allowed");
+
+    //  Undeclared Callees ─
+    // typeBuiltinCall returned nullptr for an unknown name, leaving the node
+    // untyped; every downstream check is null-tolerant, so nothing was reported
+    // until codegen.
+    check(analyzeErrors("fn void f() { float x = sinn(1.0); }") > 0, "a typo'd builtin is an error");
+    check(analyzeErrors("fn void f() { float x = sin(1.0); }") == 0, "a known builtin still resolves");
+    check(analyzeErrors("fn float g(float a) { return a; }\nfn void f() { float x = g(1.0); }") == 0, "a user function still resolves");
+
+    // Matrix Builtins ─ 
+    // Validates shape-dependent return types (transpose, outerProduct)
+    // and verifies semantic error reporting for invalid shapes (non-square inverse/determinant, shape mismatches).
+    expectInitType("transpose(mat4x2) → mat2x4", "uniform mat4x2 A;\nfn void f() { mat2x4 t = transpose(A); }", 0, "mat2x4");
+    expectInitType("inverse(mat3) → mat3", "uniform mat3 A;\nfn void f() { mat3 c = inverse(A); }", 0, "mat3");
+    expectInitType("determinant(mat3) → float", "uniform mat3 A;\nfn void f() { float d = determinant(A); }", 0, "float");
+    expectInitType("matrixCompMult(mat3,mat3) → mat3", "uniform mat3 A; uniform mat3 B;\nfn void f() { mat3 c = matrixCompMult(A, B); }", 0, "mat3");
+    expectInitType("outerProduct(vec3,vec2) → mat2x3", "fn void f() { mat2x3 m = outerProduct(vec3(1.0), vec2(2.0)); }", 0, "mat2x3");
+    check(analyzeErrors("uniform mat2x3 A;\nfn void f() { mat2x3 c = inverse(A); }") > 0, "inverse of a non-square matrix is an error");
+    check(analyzeErrors("uniform mat4x2 A;\nfn void f() { float d = determinant(A); }") > 0, "determinant of a non-square matrix is an error");
+    check(analyzeErrors("uniform mat3 A; uniform mat4 B;\nfn void f() { mat3 c = matrixCompMult(A, B); }") > 0, "matrixCompMult of mismatched shapes is an error");
+
+    //  Matrix Aggregates ─
+    // Arrays of matrices and matrices as struct members, indexed at every level.
+    expectInitType("arr[i] → mat3", "fn void f(int i) { mat3 arr[2]; mat3 m = arr[i]; }", 1, "mat3");
+    expectInitType("arr[i][j] → vec3", "fn void f(int i, int j) { mat3 arr[2]; vec3 c = arr[i][j]; }", 1, "vec3");
+    expectInitType("arr[i][j][k] → float", "fn void f(int i, int j, int k) { mat3 arr[2]; float e = arr[i][j][k]; }", 1, "float");
+    expectInitType("struct matrix member s.m → mat3", "struct S { mat3 m; };\nfn void f() { S s; mat3 m = s.m; }", 1, "mat3");
+    expectInitType("struct matrix member column s.m[j] → vec3", "struct S { mat3 m; };\nfn void f(int j) { S s; vec3 c = s.m[j]; }", 1, "vec3");
+
+    //  Constructor Arity and Argument Types ─
+    check(analyzeErrors("fn void f() { mat3 m = mat3(1.0, 2.0); }") > 0, "a matrix constructor with a partial column set is an error");
+    check(analyzeErrors("fn void f() { mat2 m = mat2(1.0, 2.0); }") > 0, "mat2 from two scalars is an error (needs 2 columns or 4 scalars)");
+    check(analyzeErrors("fn void f() { mat2 m = mat2(vec2(1.0), vec2(2.0)); }") == 0, "mat2 from two column vectors is allowed");
+    check(analyzeErrors("fn void f() { mat2 m = mat2(1.0, 2.0, 3.0, 4.0); }") == 0, "mat2 from four scalars is allowed");
+    check(analyzeErrors("fn void f() { mat4 m = mat4(); }") == 0, "a zero-argument matrix constructor is allowed");
+    check(analyzeErrors("fn void f() { mat4 m = mat4(1.0); }") == 0, "a scalar diagonal matrix constructor is allowed");
+    check(analyzeErrors("fn void f() { vec2 v = vec2(1.0, 2.0, 3.0, 4.0); }") > 0, "a vector constructor with excess arguments is an error");
+    check(analyzeErrors("fn void f() { vec4 v = vec4(vec3(1.0), 1.0); }") == 0, "mixing a vector and a scalar is allowed");
+    check(analyzeErrors("fn void f() { mat4 m = mat4(true); }") == 0, "a bool matrix constructor argument is allowed (GLSL converts it)");
+    check(analyzeErrors("fn void f() { float x = float(vec3(1.0)); }") == 0, "float(vec3) takes the first component (matches glslang)");
+
+    //  Stage Location Spans ─
+    // A matCxR occupies C consecutive locations; reserving only the first let
+    // an explicit location on the next variable alias it silently.
+    check(analyzeErrors("layout(location=0) out mat4 vM;\nlayout(location=1) out vec4 vC;\nfn void f() {}") > 0, "a variable inside a matrix's location span collides");
+    check(analyzeErrors("layout(location=0) out mat3 vM;\nlayout(location=3) out vec4 vC;\nfn void f() {}") == 0, "a variable just past a mat3's span does not collide");
 
     //  Modulo Constraints ─
     check(analyzeErrors("fn void f() { float x = 2.5 % 1.0; }") > 0, "float modulo is an error");

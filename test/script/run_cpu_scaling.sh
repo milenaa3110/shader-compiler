@@ -59,9 +59,10 @@ build_frag() {
         src/runtime/pipeline_runtime.cpp > "$tmp_rt"
     # `|| echo …>&2` keeps a failed compile from aborting the whole script under
     # `set -e`; run_rv then reports N/A for the missing binary.
-    $CROSS_CXX -std=c++20 -O3 -static -fopenmp -Isrc/runtime \
+    $CROSS_CXX -std=c++20 -O3 -static -fopenmp -march=rv64gcv -mabi=lp64d -Isrc/runtime \
         -DANIM_NAME="\"${anim}\"" -DNFRAMES="$FRAG_FRAMES" \
         -DWIDTH="$FRAG_W" -DHEIGHT="$FRAG_H" \
+        -DSHADER_PACKET_WIDTH="${SHADER_PACKET_WIDTH}" \
         test/rv_host/rv_host_fragment.cpp \
         "$tmp_rt" \
         "build/riscv/${anim}_rv.o" -o "$out" >/dev/null 2>&1 || \

@@ -86,9 +86,30 @@ class SemanticAnalyzer {
   const glsl::Type* inferMatrixBinary(TokenKind op, const glsl::Type* l,
                                       const glsl::Type* r);
 
-  // Resolve polymorphism for builtins (e.g., genType) based on argument shapes.
+// Resolves builtin function types and validates constraints (e.g., matrix shape rules).
   const glsl::Type* typeBuiltinCall(const std::string& name,
-                                    const std::vector<const glsl::Type*>& args);
+                                    const std::vector<const glsl::Type*>& args,
+                                    SourceLocation loc);
+
+// Validates argument shapes and infers return types for GLSL matrix builtins, returning nullptr on error.
+  const glsl::Type* typeMatrixBuiltin(const std::string& name,
+                                      const std::vector<const glsl::Type*>& args,
+                                      SourceLocation loc);
+
+  // Whether a name denotes a builtin at all. typeBuiltinCall returning nullptr
+  // conflates "unknown callee" with "return type not inferable", so the call
+  // site needs this to tell a typo from an uninferable argument list.
+  static bool isKnownBuiltin(const std::string& name);
+
+  // Widen a matrix expression's non-matrix operand to float. commonOperandType
+  // has no matrix case, so the generic operand promotion never covers these.
+  const glsl::Type* floatFormOf(const glsl::Type* t);
+  void coerceMatrixOperands(BinaryExprAST* b);
+
+  // Arity and argument-type rules for a `T(...)` constructor call.
+  void checkConstructorCall(const glsl::Type* ctorTy,
+                            const std::vector<ExprAST*>& args,
+                            SourceLocation loc);
   const glsl::Type* typeMember(const glsl::Type* objTy,
                                const std::string& member);
   const glsl::Type* indexOnce(const glsl::Type* aggregate);
@@ -110,6 +131,10 @@ class SemanticAnalyzer {
 
   // A subscript index (`a[i]`, `m[i][j]`) must be integral (int/uint); reject if not
   void checkIndexType(ExprAST* idx);
+
+  // A *literal* subscript must also be in range for the container it indexes;
+  // an out-of-range one would otherwise lower to a getelementptr past the end.
+  void checkIndexBounds(const glsl::Type* container, ExprAST* idx);
 
   // Lexical scope stack for variable types (scopes_.front() is the globals).
   void enterScope() { scopes_.emplace_back(); }

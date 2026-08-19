@@ -2,22 +2,54 @@
 #include "pipeline_runtime.h"
 #include "pipeline_abi.h"
 #include "tex_inline.h"
+#include "../common/packet_width.h"
 
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdint>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
-// Global texture slots accessed by always_inline shader routines
+// Global texture / storage-image slots accessed by always_inline shader routines
 TexSlot g_tex[8] = {};
+ImgSlot g_img[8] = {};
+
+// Hardware RVV vector length in bits (VLEN) via the vlenb CSR (vlenb = VLEN/8).
+// Returns 0 on non-RISC-V or no-V builds so x86 host builds compile.
+unsigned get_vlen_bits() {
+#if defined(__riscv) && defined(__riscv_v)
+    unsigned long vlenb;
+    __asm__ volatile("csrr %0, vlenb" : "=r"(vlenb));
+    return (unsigned)(vlenb * 8UL);
+#else
+    return 0;
+#endif
+}
 
 void bind_texture(int slot, const float* data, int width, int height) {
     if (slot >= 0 && slot <= 7) {
-        g_tex[slot] = {data, width, height};
+        g_tex[slot] = {data, width, height, 1};
+    }
+}
+
+// Bind a layered sampled texture: a cube map (depth = 6 faces, GL face order),
+// a 2D array (depth = layers), or a 3D volume (depth = slices). Slices are
+// contiguous width*height*4-float planes.
+void bind_texture_layered(int slot, const float* data, int width, int height,
+                          int depth) {
+    if (slot >= 0 && slot <= 7) {
+        g_tex[slot] = {data, width, height, depth};
+    }
+}
+
+// Bind a read/write storage image (image2D: width*height; imageBuffer: width*1).
+void bind_image(int slot, float* data, int width, int height) {
+    if (slot >= 0 && slot <= 7) {
+        g_img[slot] = {data, width, height};
     }
 }
 
@@ -29,12 +61,51 @@ static inline float clamp01(float v) {
     return v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
 }
 
-static constexpr int MAX_VARYINGS = 16;
-static constexpr int MAX_FS_OUT   = 8;
-static constexpr int PACKET_W     = 4;
+static constexpr int MAX_VARYINGS = PIPELINE_MAX_VARYINGS;
+static constexpr int MAX_FS_OUT   = PIPELINE_MAX_FS_OUT;
+// SPMD lane count — single source of truth in packet_width.h; MUST equal the
+// packetizer's kW (checked by the build-width guard at host startup).
+static constexpr int PACKET_W     = SHADER_PACKET_WIDTH;
 
 extern "C" __attribute__((weak)) void fs_packet(const float* vary_soa, const float* frag_soa, float* out_soa, int* live_out);
 extern "C" __attribute__((weak)) void vs_packet(const float* in_soa, int vid_base, int iid, float* out_soa);
+
+// Build-width marker emitted into the compiled shader (.rv) by irgen_riscv. A
+// STRONG reference so the linker pulls in the shader's linkonce_odr definition
+// (a weak ref lets it be discarded → the check silently no-ops). Every host that
+// links this runtime also links a shader that defines it, so it always resolves.
+extern "C" const int __shader_packet_width;
+
+// Abort before running packet code if the shader was built for a different lane
+// count than the runtime — the SoA stride would disagree and silently corrupt
+// every pixel. A loud failure beats garbage output.
+static void check_packet_width() {
+    if (__shader_packet_width != PACKET_W) {
+        std::fprintf(stderr,
+            "[pipeline] FATAL: SPMD packet-width mismatch — shader built for %d "
+            "lanes, runtime for %d. Rebuild both with the same "
+            "-DSHADER_PACKET_WIDTH.\n",
+            __shader_packet_width, PACKET_W);
+        std::abort();
+    }
+}
+
+// Print the detected VLEN and the compiled packet width, warning on a suboptimal
+// or mismatched pairing. Called from the RISC-V host startup banners.
+void report_vector_config() {
+    unsigned vlen = get_vlen_bits();
+    if (vlen == 0) {
+        std::fprintf(stderr, "[pipeline] packet width=%d lanes (VLEN unknown — non-V build)\n",
+                     PACKET_W);
+        return;
+    }
+    unsigned optimal = vlen / 32;  // f32 lanes that fill one vector register
+    const char* note = (PACKET_W == (int)optimal) ? "match"
+                     : (PACKET_W < (int)optimal)  ? "leaves lanes idle"
+                                                  : "wider than one register (LMUL>1), still correct";
+    std::fprintf(stderr, "[pipeline] VLEN=%u bits, packet width=%d lanes (optimal %u) [%s]\n",
+                 vlen, PACKET_W, optimal, note);
+}
 
 void render_pipeline(const PipelineDesc& desc, unsigned char* rgb_out) {
     const int W = desc.width;
@@ -42,9 +113,26 @@ void render_pipeline(const PipelineDesc& desc, unsigned char* rgb_out) {
     const int NV = desc.vert_count;
 
     const int vtot     = vs_total_floats;
-    const int nvar     = vs_varying_floats;
     const int ninput   = vs_input_floats;
     const int ninput_d = vs_input_doubles;
+
+    // The interpolation loops below are bounded by the shader-supplied counts,
+    // while the scratch buffers they write into are fixed-size — clamp rather
+    // than smash the stack if a shader slips past the emitter's check.
+    int nvar = vs_varying_floats;
+    if (nvar > MAX_VARYINGS) {
+        std::fprintf(stderr,
+                     "[pipeline] shader declares %d varying floats, capacity is %d "
+                     "— clamping (output will be wrong)\n",
+                     nvar, MAX_VARYINGS);
+        nvar = MAX_VARYINGS;
+    }
+    if (fs_output_floats > MAX_FS_OUT) {
+        std::fprintf(stderr,
+                     "[pipeline] shader declares %d fragment output floats, "
+                     "capacity is %d\n",
+                     fs_output_floats, MAX_FS_OUT);
+    }
 
     const bool indexed   = (desc.indices != nullptr);
     const int triCount   = indexed ? (desc.index_count / 3) : (NV / 3);
@@ -53,6 +141,7 @@ void render_pipeline(const PipelineDesc& desc, unsigned char* rgb_out) {
     // Vertex Shader Execution Pass
     std::vector<float> vsout(vtot * NV);
     const bool vsPacketMode = (vs_packet != nullptr) && (std::getenv("SHADER_PACKET") != nullptr);
+    if (vsPacketMode) check_packet_width();
 
     if (vsPacketMode) {
         #pragma omp parallel for schedule(static)
@@ -130,7 +219,7 @@ void render_pipeline(const PipelineDesc& desc, unsigned char* rgb_out) {
         auto& myBins   = threadBins[tid];
         mySetups.reserve(triCount / std::max(1, max_threads) / 2 + 64);
 
-        #pragma omp_for schedule(static)
+        #pragma omp for schedule(static)
         for (int tri = 0; tri < triCount; ++tri) {
             int32_t i0, i1, i2;
             if (indexed) {
@@ -198,8 +287,9 @@ void render_pipeline(const PipelineDesc& desc, unsigned char* rgb_out) {
         }
     }
 
-    // Parallel Per-Tile Rasterization & Fragment Execution 
+    // Parallel Per-Tile Rasterization & Fragment Execution
     const bool packetMode = (fs_packet != nullptr) && (std::getenv("SHADER_PACKET") != nullptr);
+    if (packetMode) check_packet_width();
 
     #pragma omp parallel
     {

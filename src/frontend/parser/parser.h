@@ -8,7 +8,7 @@
 #include <vector>
 
 // Parses a shader into an AST allocated within 'ctx'.
-// Both 'ctx' and the 'source' buffer must outlive the returned nodes (zero-allocation parsing).
+// Both 'ctx' and the source buffer must outlive the returned nodes.
 // Malformed nodes are logged and omitted from the final vector.
 std::vector<ExprAST*> ParseProgram(ASTContext& ctx, std::string_view source);
 

@@ -7,11 +7,13 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/GetElementPtrTypeIterator.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Operator.h>
 #include <llvm/Support/raw_ostream.h>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.h>
@@ -21,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -49,6 +52,24 @@ inline void appendOpV(std::vector<Word>& dst, SpvOp op, const std::vector<Word>&
         dst.push_back(w);
 }
 
+// A matrix is the named wrapper struct %glsl.matCxR = { [C x <R x float>] }.
+// This is a local copy of utils.h's matrixShapeOf; the two predicates must stay
+// in sync.
+struct SpvMatShape {
+    unsigned cols, rows;
+};
+
+inline std::optional<SpvMatShape> spvMatrixShape(llvm::Type* t) {
+    auto* st = llvm::dyn_cast_or_null<llvm::StructType>(t);
+    if (!st || !st->hasName() || !st->getName().starts_with("glsl.mat")) return std::nullopt;
+    if (st->getNumElements() != 1) return std::nullopt;
+    auto* at = llvm::dyn_cast<llvm::ArrayType>(st->getElementType(0));
+    if (!at) return std::nullopt;
+    auto* vt = llvm::dyn_cast<llvm::FixedVectorType>(at->getElementType());
+    if (!vt) return std::nullopt;
+    return SpvMatShape{ static_cast<unsigned>(at->getNumElements()), vt->getNumElements() };
+}
+
 // Pack a UTF-8 string into 32-bit little-endian words, NUL-terminated, padded.
 inline void packStringInto(std::vector<Word>& dst, llvm::StringRef s) {
   size_t n = s.size();
@@ -72,13 +93,14 @@ inline std::vector<Word> packString(llvm::StringRef s) {
 }
 
 // OpName / OpString / OpEntryPoint etc. encode trailing string as packed words.
-inline void appendOpStr(std::vector<Word>& dst, SpvOp op,
-                        const std::vector<Word>& prefix, llvm::StringRef str) {
-  std::vector<Word> packed = packString(str);
-  Word wordCount = 1u + (Word)prefix.size() + (Word)packed.size();
-  dst.push_back((wordCount << 16) | (Word)op);
-  for (Word w : prefix) dst.push_back(w);
-  for (Word w : packed) dst.push_back(w);
+inline void appendOpStr(std::vector<Word>& dst, SpvOp op, const std::vector<Word>& prefix, llvm::StringRef str) {
+    std::vector<Word> packed = packString(str);
+    Word wordCount = 1u + (Word)prefix.size() + (Word)packed.size();
+    dst.push_back((wordCount << 16) | (Word)op);
+    for (Word w : prefix)
+        dst.push_back(w);
+    for (Word w : packed)
+        dst.push_back(w);
 }
 
 // Translator
@@ -100,8 +122,7 @@ class IRToSPIRV {
 
   llvm::DenseMap<llvm::Value*, Word> valueIDs;  // LLVM value -> SPIR-V id
   llvm::DenseMap<llvm::Type*, Word> typeIDs;    // base types
-  llvm::DenseMap<uint64_t, Word>
-      ptrTypeCache;  // (sc << 32) | typeID -> ptr type id
+  llvm::DenseMap<uint64_t, Word> ptrTypeCache;  // (sc << 32) | typeID -> ptr type id
   llvm::DenseMap<uint64_t, Word> intConstCache;         // (typeID << 32) | bits
   llvm::DenseMap<uint64_t, Word> fpConstCache;          // (typeID << 32) | bits
   llvm::DenseMap<llvm::Constant*, Word> aggConstCache;  // composite constants
@@ -130,8 +151,7 @@ class IRToSPIRV {
   Word pushConstStructTypeID = 0;
   Word pushConstVarID = 0;
   Word pushConstStructPtrID = 0;  // ptr to struct (PushConstant)
-  llvm::DenseMap<llvm::GlobalVariable*, uint32_t>
-      uniformMemberIdx;  // global -> member index
+  llvm::DenseMap<llvm::GlobalVariable*, uint32_t> uniformMemberIdx;  // global -> member index
 
   // SSBO descriptors (compute storage buffers)
   struct SSBOInfo {
@@ -140,17 +160,18 @@ class IRToSPIRV {
     uint32_t binding = 0;
   };
   llvm::DenseMap<llvm::GlobalVariable*, SSBOInfo> ssboInfo;
-  // Tracks `%p = load ptr, ptr @ssbo_global` results so that GEPs through %p
-  // know which SSBO they're indexing into.
+  // Tracks `%p = load ptr, ptr @ssbo_global` - used for GEP
   llvm::DenseMap<llvm::Value*, llvm::GlobalVariable*> valueToSSBO;
 
   // Combined image-sampler descriptors (sampler2D uniforms)
-  // sampler2Ds appear in IR as opaque-pointer externals (`@tex = global ptr`)
-  // whose loads are consumed by `__tex2d_sample(ptr, float, float)` calls.
   struct SamplerInfo {
     Word varID = 0;             // OpVariable id (UniformConstant storage class)
-    Word sampledImageTypeID = 0;
+    Word sampledImageTypeID = 0;  // 0 for a storage image (no sampled-image type)
+    Word imageTypeID = 0;         // the OpTypeImage id (for storage image load/store)
     uint32_t binding = 0;
+    SpvDim dim = SpvDim2D;
+    bool arrayed = false;
+    bool isImage = false;         // storage image (Sampled=2) vs sampled texture
   };
   llvm::DenseMap<llvm::GlobalVariable*, SamplerInfo> samplerInfo;
   // Tracks `%p = load ptr, ptr @sampler_global` so that subsequent
@@ -158,12 +179,10 @@ class IRToSPIRV {
   llvm::DenseMap<llvm::Value*, llvm::GlobalVariable*> valueToSampler;
 
   // Stage IO
-  // Map function-arg/alloca → input/output OpVariable id.
+  // Map function-arg/alloca -> input/output OpVariable id.
   llvm::DenseMap<llvm::Argument*, Word> argInputVarID;
-  llvm::DenseMap<llvm::AllocaInst*, Word>
-      allocaToOutputVar;  // FragColor/gl_Position
-  llvm::DenseMap<llvm::AllocaInst*, Word>
-      allocaToInputVar;                   // shadow allocas for inputs
+  llvm::DenseMap<llvm::AllocaInst*, Word> allocaToOutputVar;  // FragColor/gl_Position
+  llvm::DenseMap<llvm::AllocaInst*, Word> allocaToInputVar;   // allocas for inputs
   std::vector<Word> entryPointInterface;  // Input/Output var ids
 
   // Trampoline / dead value tracking 
@@ -178,6 +197,20 @@ class IRToSPIRV {
   llvm::DenseMap<llvm::BasicBlock*, llvm::BasicBlock*> selectionMerge;
   llvm::DenseMap<llvm::BasicBlock*, llvm::BasicBlock*> loopMerge;
   llvm::DenseMap<llvm::BasicBlock*, llvm::BasicBlock*> loopContinue;
+
+  // Maps matrix inner-array SSA values to their shape for SPIR-V OpTypeMatrix lowerings.
+  llvm::DenseMap<const llvm::Value*, SpvMatShape> matColVals;
+  void buildMatColVals(llvm::Function& F);
+
+  // Set when an unsupported construct (an unlowered `__tex*`/`__image*` sampler
+  // intrinsic) is hit. emit() then returns an empty module so the driver reports
+  // failure instead of silently writing an invalid `.spv` and exiting 0.
+  bool emitFailed_ = false;
+
+  // Access-chain into the push-constant block for a matrix GEP whose base is a
+  // uniform global (`M[i]`, `M[i][j]`). Returns the chain id, or 0 if the base
+  // is not a uniform. Shared by the constant-GEP load path and the dynamic GEP.
+  Word uniformMatrixAccessChain(llvm::GEPOperator* gep, std::vector<Word>& out);
 
   // Type / constant builders
   Word typeFor(llvm::Type* t);
@@ -234,71 +267,84 @@ class IRToSPIRV {
   SpvBuiltIn builtinForName(llvm::StringRef name);
 
   // Splat / vector helpers
-  Word splatToVector(Word scalarID, llvm::Type* dstVecType,
-                     std::vector<Word>& out);
+  Word splatToVector(Word scalarID, llvm::Type* dstVecType, std::vector<Word>& out);
   Word uintTypeFor();
 };
 
+// Interface slots a stage variable of this type occupies
+inline uint32_t spvLocationSlots(llvm::Type* t) {
+    if (auto shape = spvMatrixShape(t)) return shape->cols;
+    auto* at = dyn_cast<llvm::ArrayType>(t);
+    if (at && at->getElementType()->isVectorTy()) return (uint32_t)at->getNumElements();
+    return 1;
+}
+
 // Implementation
 inline Word IRToSPIRV::typeFor(llvm::Type* t) {
-  auto it = typeIDs.find(t);
-  if (it != typeIDs.end()) return it->second;
+    auto it = typeIDs.find(t);
+    if (it != typeIDs.end()) return it->second;
 
-  Word id = 0;
-  if (t->isVoidTy()) {
-    id = allocID();
-    appendOp(typesGlobals, SpvOpTypeVoid, {id});
-    voidTypeID = id;
-  } else if (t->isFloatTy()) {
-    id = allocID();
-    appendOp(typesGlobals, SpvOpTypeFloat, {id, 32});
-    floatTypeID = id;
-  } else if (t->isDoubleTy()) {
-    id = allocID();
-    appendOp(typesGlobals, SpvOpTypeFloat, {id, 64});
-  } else if (t->isIntegerTy(1)) {
-    id = allocID();
-    appendOp(typesGlobals, SpvOpTypeBool, {id});
-    boolTypeID = id;
-  } else if (t->isIntegerTy(32)) {
-    id = allocID();
-    appendOp(typesGlobals, SpvOpTypeInt, {id, 32, 1});  // signed
-    int32TypeID = id;
-  } else if (t->isIntegerTy()) {
-    unsigned bw = t->getIntegerBitWidth();
-    id = allocID();
-    appendOp(typesGlobals, SpvOpTypeInt, {id, bw, 1});
-  } else if (auto* vt = dyn_cast<llvm::FixedVectorType>(t)) {
-    Word elemID = typeFor(vt->getElementType());
-    id = allocID();
-    appendOp(typesGlobals, SpvOpTypeVector,
-             {id, elemID, (Word)vt->getNumElements()});
-  } else if (auto* at = dyn_cast<llvm::ArrayType>(t)) {
-    Word elemID = typeFor(at->getElementType());
-    Word countID = constUint((uint32_t)at->getNumElements());
-    id = allocID();
-    appendOp(typesGlobals, SpvOpTypeArray, {id, elemID, countID});
-  } else if (auto* st = dyn_cast<llvm::StructType>(t)) {
-    std::vector<Word> memberIDs;
-    for (auto* mt : st->elements()) memberIDs.push_back(typeFor(mt));
-    id = allocID();
-    std::vector<Word> ops;
-    ops.push_back(id);
-    for (Word w : memberIDs) ops.push_back(w);
-    appendOpV(typesGlobals, SpvOpTypeStruct, ops);
-  } else if (t->isPointerTy()) {
-    // Opaque pointer: default to Function storage if requested standalone.
-    // Most uses go through ptrTypeFor() which knows the storage class.
-    id = ptrTypeFor(llvm::Type::getInt32Ty(M.getContext()),
-                    SpvStorageClassFunction);
-  } else {
-    llvm::errs() << "[spv] unsupported type: ";
-    t->print(llvm::errs());
-    llvm::errs() << "\n";
-    return 0;
-  }
-  typeIDs[t] = id;
-  return id;
+    Word id = 0;
+    if (t->isVoidTy()) {
+        id = allocID();
+        appendOp(typesGlobals, SpvOpTypeVoid, { id });
+        voidTypeID = id;
+    } else if (t->isFloatTy()) {
+        id = allocID();
+        appendOp(typesGlobals, SpvOpTypeFloat, { id, 32 });
+        floatTypeID = id;
+    } else if (t->isDoubleTy()) {
+        id = allocID();
+        appendOp(typesGlobals, SpvOpTypeFloat, { id, 64 });
+    } else if (t->isIntegerTy(1)) {
+        id = allocID();
+        appendOp(typesGlobals, SpvOpTypeBool, { id });
+        boolTypeID = id;
+    } else if (t->isIntegerTy(32)) {
+        id = allocID();
+        appendOp(typesGlobals, SpvOpTypeInt, { id, 32, 1 });  // signed
+        int32TypeID = id;
+    } else if (t->isIntegerTy()) {
+        unsigned bw = t->getIntegerBitWidth();
+        id = allocID();
+        appendOp(typesGlobals, SpvOpTypeInt, { id, bw, 1 });
+    } else if (auto* vt = dyn_cast<llvm::FixedVectorType>(t)) {
+        Word elemID = typeFor(vt->getElementType());
+        id = allocID();
+        appendOp(typesGlobals, SpvOpTypeVector, { id, elemID, (Word)vt->getNumElements() });
+    } else if (auto* at = dyn_cast<llvm::ArrayType>(t)) {
+        Word elemID = typeFor(at->getElementType());
+        Word countID = constUint((uint32_t)at->getNumElements());
+        id = allocID();
+        appendOp(typesGlobals, SpvOpTypeArray, { id, elemID, countID });
+    } else if (auto shape = spvMatrixShape(t)) {
+        // A matrix lowers to a real OpTypeMatrix of `cols` column vectors
+        Word colVecID = typeFor(
+            llvm::FixedVectorType::get(llvm::Type::getFloatTy(M.getContext()), shape->rows));
+        id = allocID();
+        appendOp(typesGlobals, SpvOpTypeMatrix, { id, colVecID, shape->cols });
+    } else if (auto* st = dyn_cast<llvm::StructType>(t)) {
+        std::vector<Word> memberIDs;
+        for (auto* mt : st->elements())
+            memberIDs.push_back(typeFor(mt));
+        id = allocID();
+        std::vector<Word> ops;
+        ops.push_back(id);
+        for (Word w : memberIDs)
+            ops.push_back(w);
+        appendOpV(typesGlobals, SpvOpTypeStruct, ops);
+    } else if (t->isPointerTy()) {
+        // Opaque pointer: default to Function storage if requested standalone.
+        // Most uses go through ptrTypeFor() which knows the storage class.
+        id = ptrTypeFor(llvm::Type::getInt32Ty(M.getContext()), SpvStorageClassFunction);
+    } else {
+        llvm::errs() << "[spv] unsupported type: ";
+        t->print(llvm::errs());
+        llvm::errs() << "\n";
+        return 0;
+    }
+    typeIDs[t] = id;
+    return id;
 }
 
 inline Word IRToSPIRV::ptrTypeFor(llvm::Type* pointee, SpvStorageClass sc) {
@@ -382,7 +428,7 @@ inline Word IRToSPIRV::constFP(llvm::Type* ty, double v) {
     float f = (float)v;
     std::memcpy(&w, &f, sizeof w);
   } else {
-    // For doubles we'd emit two words; not needed here.
+    // A double would take two words; not needed here.
     float f = (float)v;
     std::memcpy(&w, &f, sizeof w);
   }
@@ -445,6 +491,30 @@ inline Word IRToSPIRV::lowerConstant(llvm::Constant* c) {
     std::vector<Word> elems;
     for (unsigned i = 0, n = cda->getNumElements(); i < n; ++i)
       elems.push_back(lowerConstant(cda->getElementAsConstant(i)));
+    id = constComposite(c->getType(), elems);
+  } else if (auto shape = spvMatrixShape(c->getType())) {
+    // Unwrap ConstantStruct and build OpConstantComposite of column vectors for OpTypeMatrix.
+    llvm::Constant* arr = c->getAggregateElement(0u);
+    std::vector<Word> cols;
+    for (unsigned i = 0; i < shape->cols; ++i)
+      cols.push_back(lowerConstant(arr->getAggregateElement(i)));
+    id = constComposite(c->getType(), cols);
+  } else if (isa<llvm::ConstantArray>(c) || isa<llvm::ConstantStruct>(c) ||
+             isa<llvm::ConstantDataArray>(c)) {
+    // Without this, a constant-folded aggregate (a matrix literal is
+    // [C x <R x float>]) falls through to OpConstantNull below, making mat4(1.0)
+    // identity on the RISC-V path and a zero matrix on SPIR-V from the same
+    // source — and the module still passes validation.
+    // ConstantDataArray keeps its elements as raw data rather than operands, so
+    // the count has to come from the type, not getNumOperands().
+    unsigned n = 0;
+    if (auto* at = dyn_cast<llvm::ArrayType>(c->getType()))
+      n = (unsigned)at->getNumElements();
+    else if (auto* st = dyn_cast<llvm::StructType>(c->getType()))
+      n = st->getNumElements();
+    std::vector<Word> elems;
+    for (unsigned i = 0; i < n; ++i)
+      elems.push_back(lowerConstant(c->getAggregateElement(i)));
     id = constComposite(c->getType(), elems);
   } else {
     llvm::errs() << "[spv] unsupported constant: ";
@@ -529,8 +599,7 @@ inline bool IRToSPIRV::isSamplerGlobal(llvm::GlobalVariable& G) {
       auto* CI = llvm::dyn_cast<llvm::CallInst>(U2);
       if (!CI || !CI->getCalledFunction()) continue;
       llvm::StringRef cn = CI->getCalledFunction()->getName();
-      if (cn == "__tex2d_sample" || cn == "__tex2d_sample_lod" ||
-          cn == "__texcube_sample")
+      if (cn.starts_with("__tex") || cn.starts_with("__image"))
         return true;
     }
   }
@@ -567,14 +636,27 @@ inline void IRToSPIRV::analyzeUniforms() {
     uint32_t sz = (uint32_t)DL.getTypeAllocSize(ty);
     // Align to type size for std430 (vec3 aligned to 16, vec2 to 8, float to 4).
     uint32_t align = sz;
+    auto matShape = spvMatrixShape(ty);
     if (auto* vt = dyn_cast<llvm::FixedVectorType>(ty)) {
       unsigned n = vt->getNumElements();
       unsigned elemSz = (unsigned)DL.getTypeAllocSize(vt->getElementType());
       align = (n == 3 ? 4 : n) * elemSz;
+    } else if (matShape) {
+      // A matrix column is a <rows x float> vector; its base alignment is the
+      // MatrixStride, and the matrix member itself aligns to that.
+      align = (matShape->rows == 3 ? 4 : matShape->rows) * 4;
     }
     offset = (offset + align - 1) & ~(align - 1);
     appendOp(annotations, SpvOpMemberDecorate,
              {pushConstStructTypeID, i, SpvDecorationOffset, offset});
+    if (matShape) {
+      // std140/std430 require ColMajor + MatrixStride on a matrix block member.
+      uint32_t stride = (matShape->rows == 3 ? 4 : matShape->rows) * 4;
+      appendOp(annotations, SpvOpMemberDecorate,
+               {pushConstStructTypeID, i, SpvDecorationColMajor});
+      appendOp(annotations, SpvOpMemberDecorate,
+               {pushConstStructTypeID, i, SpvDecorationMatrixStride, stride});
+    }
     uniformMemberIdx[uniforms[i]] = i;
     offset += sz;
   }
@@ -665,30 +747,52 @@ inline void IRToSPIRV::analyzeSamplers() {
   using namespace llvm;
 
   uint32_t binding = 0;
+  bool anyStorage = false, anyBuffer = false;
   for (auto& G : M.globals()) {
     if (!isSamplerGlobal(G)) continue;
 
     int explicitB = explicitBindingOf(G);
     uint32_t slot = explicitB >= 0 ? (uint32_t)explicitB : binding++;
 
+    // Decode dimensionality from shader.sampler.kind metadata
+    // (dimCode 0=2D 1=3D 2=Cube 3=Buffer | arrayed<<4 | isImage<<5). The LLVM
+    // type is an opaque ptr, so the dim can only come from here.
+    int code = 0;
+    if (auto* md = G.getMetadata("shader.sampler.kind"))
+      code = (int)llvm::mdconst::extract<llvm::ConstantInt>(md->getOperand(0))
+                 ->getZExtValue();
+    int dimCode = code & 0xF;
+    bool arrayed = (code >> 4) & 1;
+    bool isImage = (code >> 5) & 1;
+    SpvDim dim = dimCode == 1 ? SpvDim3D
+                 : dimCode == 2 ? SpvDimCube
+                 : dimCode == 3 ? SpvDimBuffer
+                                : SpvDim2D;
+    uint32_t sampled = isImage ? 2u : 1u;  // 2 = storage image, 1 = sampled
+    if (isImage) { anyStorage = true; if (dim == SpvDimBuffer) anyBuffer = true; }
+
     Word floatTID = typeFor(Type::getFloatTy(M.getContext()));
 
-    // OpTypeImage %float 2D depth=0 arrayed=0 ms=0 sampled=1 format=Unknown
+    // OpTypeImage %float <dim> depth=0 arrayed ms=0 sampled format=Unknown
     Word imageTID = allocID();
     appendOp(typesGlobals, SpvOpTypeImage,
-             {imageTID, floatTID, SpvDim2D, 0u, 0u, 0u, 1u,
+             {imageTID, floatTID, (Word)dim, 0u, arrayed ? 1u : 0u, 0u, sampled,
               SpvImageFormatUnknown});
 
-    // OpTypeSampledImage %image
-    Word sampledImageTID = allocID();
-    appendOp(typesGlobals, SpvOpTypeSampledImage, {sampledImageTID, imageTID});
+    // Sampled textures wrap the image in OpTypeSampledImage; a storage image is
+    // accessed directly, so the pointer points at the image itself.
+    Word sampledImageTID = 0;
+    Word ptrPointeeTID = imageTID;
+    if (!isImage) {
+      sampledImageTID = allocID();
+      appendOp(typesGlobals, SpvOpTypeSampledImage, {sampledImageTID, imageTID});
+      ptrPointeeTID = sampledImageTID;
+    }
 
-    // OpTypePointer UniformConstant %sampledImage
     Word ptrTID = allocID();
     appendOp(typesGlobals, SpvOpTypePointer,
-             {ptrTID, SpvStorageClassUniformConstant, sampledImageTID});
+             {ptrTID, SpvStorageClassUniformConstant, ptrPointeeTID});
 
-    // OpVariable %ptr UniformConstant
     Word varID = allocID();
     appendOp(typesGlobals, SpvOpVariable,
              {ptrTID, varID, SpvStorageClassUniformConstant});
@@ -701,9 +805,23 @@ inline void IRToSPIRV::analyzeSamplers() {
     SamplerInfo info;
     info.varID = varID;
     info.sampledImageTypeID = sampledImageTID;
+    info.imageTypeID = imageTID;
     info.binding = slot;
+    info.dim = dim;
+    info.arrayed = arrayed;
+    info.isImage = isImage;
     samplerInfo[&G] = info;
   }
+  // Storage images with an Unknown format require these capabilities for
+  // OpImageRead/OpImageWrite; a buffer image also needs ImageBuffer.
+  if (anyStorage) {
+    appendOp(capabilities, SpvOpCapability,
+             {(Word)SpvCapabilityStorageImageReadWithoutFormat});
+    appendOp(capabilities, SpvOpCapability,
+             {(Word)SpvCapabilityStorageImageWriteWithoutFormat});
+  }
+  if (anyBuffer)
+    appendOp(capabilities, SpvOpCapability, {(Word)SpvCapabilityImageBuffer});
 }
 
 inline SpvBuiltIn IRToSPIRV::builtinForName(llvm::StringRef name) {
@@ -749,9 +867,9 @@ inline void IRToSPIRV::emitStageIO() {
   if (!entryFn) return;
 
   // Explicit `layout(location=N)` slots, keyed by in/out var name, as recorded
-  // on the entry function by ast.cpp. When a name is present here we decorate
-  // that exact Location (matching VS-out to FS-in across modules); otherwise we
-  // fall back to the positional counters below.
+  // on the entry function by ast.cpp. A name present here is decorated with that
+  // exact Location (matching VS-out to FS-in across modules); anything else falls
+  // back to the positional counters below.
   std::unordered_map<std::string, uint32_t> explicitLoc;
   if (auto* md = entryFn->getMetadata("shader.io.location")) {
     for (auto& op : md->operands()) {
@@ -787,7 +905,9 @@ inline void IRToSPIRV::emitStageIO() {
       vid = declareInputBuiltin(A, bi);
     } else {
       auto it = explicitLoc.find(A.getName().str());
-      uint32_t loc = it != explicitLoc.end() ? it->second : inputLoc++;
+      const uint32_t slots = spvLocationSlots(A.getType());
+      uint32_t loc = it != explicitLoc.end() ? it->second : inputLoc;
+      if (it == explicitLoc.end()) inputLoc += slots;
       vid = declareInputLocation(A, loc);
     }
     argInputVarID[&A] = vid;
@@ -843,9 +963,9 @@ inline void IRToSPIRV::emitStageIO() {
   // vars.
   //
   // ast.cpp inserts each output alloca at the START of the entry block, so the
-  // IR contains them in REVERSE declaration order. We iterate in reverse to
-  // recover declaration order, which is what the FS expects for Location
-  // numbering (FS reads Location 0 = first VS out-var, Location 1 = second).
+  // IR contains them in REVERSE declaration order. Iterating in reverse recovers
+  // declaration order, which is what the FS expects for Location numbering
+  // (FS reads Location 0 = first VS out-var, Location 1 = second).
   if (stage == ShaderStage::Vertex) {
     std::vector<llvm::AllocaInst*> vsOutAllocas;
     for (auto& I : EB) {
@@ -855,8 +975,12 @@ inline void IRToSPIRV::emitStageIO() {
       llvm::StringRef n = AI->getName();
       if (n == "FragColor" || n == "gl_Position") continue;
       if (!n.starts_with("v")) continue;
-      auto* vt = dyn_cast<llvm::FixedVectorType>(AI->getAllocatedType());
-      if (!vt || !vt->getElementType()->isFloatTy()) continue;
+      // A float-vector or a matrix varying (a matrix spans its C columns'
+      // locations; spvLocationSlots accounts for that). Anything else is skipped.
+      auto* allocTy = AI->getAllocatedType();
+      auto* vt = dyn_cast<llvm::FixedVectorType>(allocTy);
+      bool floatVec = vt && vt->getElementType()->isFloatTy();
+      if (!floatVec && !spvMatrixShape(allocTy)) continue;
       vsOutAllocas.push_back(AI);
     }
     uint32_t outLoc = 0;
@@ -867,7 +991,9 @@ inline void IRToSPIRV::emitStageIO() {
       appendOp(typesGlobals, SpvOpVariable,
                {ptrID, vid, SpvStorageClassOutput});
       auto le = explicitLoc.find(AI->getName().str());
-      uint32_t loc = le != explicitLoc.end() ? le->second : outLoc++;
+      const uint32_t slots = spvLocationSlots(AI->getAllocatedType());
+      uint32_t loc = le != explicitLoc.end() ? le->second : outLoc;
+      if (le == explicitLoc.end()) outLoc += slots;
       appendOp(annotations, SpvOpDecorate,
                {vid, SpvDecorationLocation, loc});
       allocaToOutputVar[AI] = vid;
@@ -878,7 +1004,7 @@ inline void IRToSPIRV::emitStageIO() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CFG analysis: detect loops and selections by block-name pattern.
-// Our codegen always names them: for.cond / for.body / for.inc / for.end,
+// Codegen always names them: for.cond / for.body / for.inc / for.end,
 // then / else / ifend, logical.rhs / logical.merge.
 // ─────────────────────────────────────────────────────────────────────────────
 inline void IRToSPIRV::analyzeCFG(llvm::Function& F) {
@@ -945,7 +1071,7 @@ inline void IRToSPIRV::analyzeCFG(llvm::Function& F) {
           selectionMerge[&BB] = t;
         } else {
           // if/else: merge is whichever shared successor is the join.
-          // For our codegen, "then" and "else" both branch to "ifend".
+          // Codegen emits "then" and "else" both branching to "ifend".
           for (auto* st : llvm::successors(t)) {
             if (isMerge(st)) {
               selectionMerge[&BB] = st;
@@ -981,8 +1107,8 @@ inline void IRToSPIRV::analyzeCFG(llvm::Function& F) {
 inline bool IRToSPIRV::isExtInstFunction(llvm::Function* F, GLSLstd450& outOp) {
   if (!F) return false;
   if (!F->isIntrinsic()) {
-    // Some codegen builtins map to extinsts as user fn names — we don't use
-    // those.
+    // Some codegen builtins map to extinsts as user fn names — those are not
+    // handled here.
     return false;
   }
   switch (F->getIntrinsicID()) {
@@ -1102,7 +1228,7 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
   if (auto* LI = dyn_cast<LoadInst>(&I)) {
     Value* ptr = LI->getPointerOperand();
     // Loading the SSBO base pointer (`%p = load ptr, ptr @ssbo`) emits no
-    // SPIR-V — we just remember that %p stands in for that SSBO so downstream
+    // SPIR-V — %p is only recorded as standing in for that SSBO so downstream
     // GEPs can lower into OpAccessChain on the real OpVariable.
     if (auto* GV = dyn_cast<GlobalVariable>(ptr)) {
       if (ssboInfo.count(GV)) {
@@ -1119,7 +1245,7 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
     if (deadValues.count(ptr) || (LI->getType()->isPointerTy())) {
       // Loading from a tombstone (e.g. _out pointer chain) — taint result.
       // Also: any load that produces a pointer is part of the trampoline
-      // tail (we don't generate user-pointer values in shaders).
+      // tail (shaders produce no user-pointer values).
       deadValues.insert(&I);
       valueIDs[&I] = 0;
       if (getenv("IRGEN_SPIRV_DEBUG")) {
@@ -1144,6 +1270,21 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
         valueIDs[&I] = resID;
         appendOp(out, SpvOpLoad, {resTy, resID, acID});
         return;
+      }
+    }
+    // Load through a constant GEP into a uniform matrix (`M[2]`, `M[1][3]`): a
+    // literal index folds the GEP into a ConstantExpr in the load pointer. Build
+    // the push-constant access chain and load from it. (A dynamic `M[i]` is a
+    // separate GEP instruction, lowered by the GEP handler below.)
+    if (auto* ce = dyn_cast<llvm::ConstantExpr>(ptr)) {
+      if (ce->getOpcode() == llvm::Instruction::GetElementPtr) {
+        if (Word ac = uniformMatrixAccessChain(cast<llvm::GEPOperator>(ce), out)) {
+          Word resTy = typeFor(LI->getType());
+          Word resID = allocID();
+          valueIDs[&I] = resID;
+          appendOp(out, SpvOpLoad, {resTy, resID, ac});
+          return;
+        }
       }
     }
     Word resTy = typeFor(LI->getType());
@@ -1185,6 +1326,12 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
       valueIDs[&I] = 0;
       return;
     }
+    // GEP whose base is a uniform matrix global (dynamic `M[i]`): access-chain
+    // into the push-constant block rather than treating @M as a standalone var.
+    if (Word ac = uniformMatrixAccessChain(cast<GEPOperator>(GEP), out)) {
+      valueIDs[&I] = ac;
+      return;
+    }
     // Generic GEP on a Function-storage aggregate (local array element or
     // struct field, possibly chained: `s.a[i]`) → OpAccessChain. The first LLVM
     // index addresses the base pointer itself (always 0 for an alloca) and is
@@ -1209,9 +1356,19 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
     Word acID = allocID();
     valueIDs[&I] = acID;
     std::vector<Word> ops = {resPtrTy, acID, baseID};
+    // Drop the leading 0 (the base-pointer deref, implicit in an access chain).
+    // Also drop any matrix-wrapper struct-member index: an OpTypeMatrix has no
+    // wrapper struct, so the column index that follows addresses it directly.
+    // Walking the GEP's indexed types finds that member wherever it nests (a
+    // plain matrix `m[i]` → `%m,0,0,i`; an array of matrices `arr[i][j]` →
+    // `%arr,0,i,0,j`).
+    auto GTI = llvm::gep_type_begin(GEP);
     bool firstIdx = true;
     for (auto& idx : GEP->indices()) {
-      if (firstIdx) { firstIdx = false; continue; }  // drop the leading 0
+      llvm::StructType* container = GTI.getStructTypeOrNull();
+      ++GTI;
+      if (firstIdx) { firstIdx = false; continue; }
+      if (container && spvMatrixShape(container)) continue;
       ops.push_back(valueOf(idx.get()));
     }
     appendOpV(out, SpvOpAccessChain, ops);
@@ -1290,14 +1447,19 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
       case Instruction::AShr:
         op = SpvOpShiftRightArithmetic;
         break;
+      // On i1 (bool) operands SPIR-V requires the Logical* ops — OpBitwise* is
+      // only defined for integers. `mat == mat` and-reduces per-lane <R x i1>
+      // comparisons (and CreateNot → `xor i1 x, true`), so without this the
+      // bool reduction emits an invalid OpBitwiseAnd/Xor.
       case Instruction::And:
-        op = SpvOpBitwiseAnd;
+        op = BO->getType()->isIntegerTy(1) ? SpvOpLogicalAnd : SpvOpBitwiseAnd;
         break;
       case Instruction::Or:
-        op = SpvOpBitwiseOr;
+        op = BO->getType()->isIntegerTy(1) ? SpvOpLogicalOr : SpvOpBitwiseOr;
         break;
       case Instruction::Xor:
-        op = SpvOpBitwiseXor;
+        op = BO->getType()->isIntegerTy(1) ? SpvOpLogicalNotEqual
+                                           : SpvOpBitwiseXor;
         break;
       default:
         op = SpvOpFAdd;
@@ -1462,6 +1624,12 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
   // constant LITERAL indices, lowering to OpCompositeExtract / OpCompositeInsert
   // (distinct from the vector Extract/InsertElement above, whose index is an id).
   if (auto* EV = dyn_cast<ExtractValueInst>(&I)) {
+    // Peel `extractvalue matWrapper, 0`: matrix has no wrapper struct under OpTypeMatrix.
+    // Column reads (`extractvalue mat, c`) fall through to standard OpCompositeExtract.
+    if (spvMatrixShape(EV->getAggregateOperand()->getType())) {
+      valueIDs[&I] = valueOf(EV->getAggregateOperand());
+      return;
+    }
     Word agg = valueOf(EV->getAggregateOperand());
     Word ty = typeFor(EV->getType());
     Word id = allocID();
@@ -1473,11 +1641,35 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
   }
 
   if (auto* IV = dyn_cast<InsertValueInst>(&I)) {
-    Word agg = valueOf(IV->getAggregateOperand());
+    // Wrap `insertvalue matWrapper undef, cols, {0}`: alias to the columns value
+    // (itself emitted as an OpTypeMatrix); no instruction needed.
+    if (spvMatrixShape(IV->getType())) {
+      valueIDs[&I] = valueOf(IV->getInsertedValueOperand());
+      return;
+    }
     Word el = valueOf(IV->getInsertedValueOperand());
-    Word ty = typeFor(IV->getType());
     Word id = allocID();
     valueIDs[&I] = id;
+    // Matrix column build (`insertvalue matColumns, col, {c}`): emit an
+    // OpCompositeInsert into the OpTypeMatrix, not the OpTypeArray. A constant
+    // undef/zero base is synthesized fresh — the shared inner-array constant must
+    // not be reused as a matrix.
+    if (auto mcv = matColVals.find(&I); mcv != matColVals.end()) {
+      std::string mn = "glsl.mat" + std::to_string(mcv->second.cols) + "x" +
+                       std::to_string(mcv->second.rows);
+      if (llvm::Type* matTy =
+              llvm::StructType::getTypeByName(M.getContext(), mn)) {
+        Word ty = typeFor(matTy);
+        llvm::Value* aggV = IV->getAggregateOperand();
+        Word agg = isa<llvm::Constant>(aggV) ? constNull(matTy) : valueOf(aggV);
+        std::vector<Word> ops = {ty, id, el, agg};
+        for (unsigned idx : IV->indices()) ops.push_back(idx);
+        appendOpV(out, SpvOpCompositeInsert, ops);
+        return;
+      }
+    }
+    Word agg = valueOf(IV->getAggregateOperand());
+    Word ty = typeFor(IV->getType());
     std::vector<Word> ops = {ty, id, el, agg};
     for (unsigned idx : IV->indices()) ops.push_back(idx);
     appendOpV(out, SpvOpCompositeInsert, ops);
@@ -1581,41 +1773,164 @@ inline void IRToSPIRV::emitInstruction(llvm::Instruction& I,
     //   call void @__tex2d_sample(ptr %sampler, float u, float v, ptr %out)
     // where %out is an alloca <4 x float>. Lower to OpImageSampleImplicitLod
     // and store the result into the alloca so the subsequent OpLoad reads it.
-    if (nm == "__tex2d_sample" && CALL->arg_size() == 4) {
+    // Arg layout (all sampler/image intrinsics): (sampler, i32 slot, coords…,
+    // out/value). The slot (arg 1) is RISC-V-only; SPIR-V reads the descriptor
+    // via valueToSampler and ignores it.
+    if (nm == "__tex2d_sample" && CALL->arg_size() == 5) {
       Value* samplerArg = CALL->getArgOperand(0);
       auto it = valueToSampler.find(samplerArg);
       if (it == valueToSampler.end()) {
         llvm::errs() << "[spv] __tex2d_sample: sampler arg not tracked\n";
+        emitFailed_ = true;
         return;
       }
       const SamplerInfo& info = samplerInfo[it->second];
-      // Load the combined sampled image once per call.
       Word loadedID = allocID();
       appendOp(out, SpvOpLoad,
                {info.sampledImageTypeID, loadedID, info.varID});
-      // Build a vec2 UV from the two scalar args.
       auto* vec2Ty = FixedVectorType::get(Type::getFloatTy(M.getContext()), 2);
-      Word vec2TID = typeFor(vec2Ty);
       Word uvID = allocID();
       appendOp(out, SpvOpCompositeConstruct,
-               {vec2TID, uvID,
-                valueOf(CALL->getArgOperand(1)),
-                valueOf(CALL->getArgOperand(2))});
-      // Sample.
+               {typeFor(vec2Ty), uvID, valueOf(CALL->getArgOperand(2)),
+                valueOf(CALL->getArgOperand(3))});
       auto* vec4Ty = FixedVectorType::get(Type::getFloatTy(M.getContext()), 4);
-      Word vec4TID = typeFor(vec4Ty);
       Word sampleID = allocID();
       appendOp(out, SpvOpImageSampleImplicitLod,
-               {vec4TID, sampleID, loadedID, uvID});
-      // OpStore the result into the caller's out alloca.
-      Word outPtrID = valueOf(CALL->getArgOperand(3));
-      appendOp(out, SpvOpStore, {outPtrID, sampleID});
+               {typeFor(vec4Ty), sampleID, loadedID, uvID});
+      appendOp(out, SpvOpStore, {valueOf(CALL->getArgOperand(4)), sampleID});
       return;
     }
 
-    // User-defined function calls — not in our shaders today, but support if
-    // needed. (helpers from codegen_state are inlined as intrinsics, so this
-    // rarely fires)
+    // texture(sampler{Cube,3D,2DArray}, vec3) → __texcube_sample(ptr, x,y,z,out).
+    // A single vec3 sample covers all three: the OpTypeImage dim comes from the
+    // sampler descriptor (analyzeSamplers reads it from metadata), so cube uses a
+    // direction, 3D a volume coord, 2DArray (x,y,layer). (The RISC-V runtime
+    // needs distinct functions per dim; SPIR-V does not.)
+    if ((nm == "__texcube_sample" || nm == "__tex3d_sample" ||
+         nm == "__tex2darray_sample") && CALL->arg_size() == 6) {
+      Value* samplerArg = CALL->getArgOperand(0);
+      auto it = valueToSampler.find(samplerArg);
+      if (it == valueToSampler.end()) {
+        llvm::errs() << "[spv] " << nm << ": sampler arg not tracked\n";
+        emitFailed_ = true;
+        return;
+      }
+      const SamplerInfo& info = samplerInfo[it->second];
+      Word loadedID = allocID();
+      appendOp(out, SpvOpLoad,
+               {info.sampledImageTypeID, loadedID, info.varID});
+      auto* vec3Ty = FixedVectorType::get(Type::getFloatTy(M.getContext()), 3);
+      Word coordID = allocID();
+      appendOp(out, SpvOpCompositeConstruct,
+               {typeFor(vec3Ty), coordID, valueOf(CALL->getArgOperand(2)),
+                valueOf(CALL->getArgOperand(3)),
+                valueOf(CALL->getArgOperand(4))});
+      auto* v4Ty = FixedVectorType::get(Type::getFloatTy(M.getContext()), 4);
+      Word sampleID = allocID();
+      appendOp(out, SpvOpImageSampleImplicitLod,
+               {typeFor(v4Ty), sampleID, loadedID, coordID});
+      appendOp(out, SpvOpStore, {valueOf(CALL->getArgOperand(5)), sampleID});
+      return;
+    }
+
+    // textureLod → __tex{2d,cube,3d,2darray}_sample_lod. Explicit-LOD sample
+    // (OpImageSampleExplicitLod + Lod operand). 2D coord is vec2 (arg_size 6);
+    // cube/3D/array coord is vec3 (arg_size 7). Layout: (sampler, slot, coords…,
+    // lod, out).
+    if (nm == "__tex2d_sample_lod" || nm == "__texcube_sample_lod" ||
+        nm == "__tex3d_sample_lod" || nm == "__tex2darray_sample_lod") {
+      bool vec3 = (nm != "__tex2d_sample_lod");
+      Value* samplerArg = CALL->getArgOperand(0);
+      auto it = valueToSampler.find(samplerArg);
+      if (it == valueToSampler.end()) {
+        llvm::errs() << "[spv] " << nm << ": sampler arg not tracked\n";
+        emitFailed_ = true;
+        return;
+      }
+      const SamplerInfo& info = samplerInfo[it->second];
+      Word loadedID = allocID();
+      appendOp(out, SpvOpLoad,
+               {info.sampledImageTypeID, loadedID, info.varID});
+      unsigned n = vec3 ? 3u : 2u;
+      auto* coordTy = FixedVectorType::get(Type::getFloatTy(M.getContext()), n);
+      std::vector<Word> cc = {typeFor(coordTy), 0};
+      for (unsigned i = 0; i < n; ++i)
+        cc.push_back(valueOf(CALL->getArgOperand(2 + i)));
+      Word coordID = allocID();
+      cc[1] = coordID;
+      appendOpV(out, SpvOpCompositeConstruct, cc);
+      // lod and out are the last two operands.
+      Word lodID = valueOf(CALL->getArgOperand(CALL->arg_size() - 2));
+      auto* v4Ty = FixedVectorType::get(Type::getFloatTy(M.getContext()), 4);
+      Word sampleID = allocID();
+      appendOp(out, SpvOpImageSampleExplicitLod,
+               {typeFor(v4Ty), sampleID, loadedID, coordID,
+                SpvImageOperandsLodMask, lodID});
+      appendOp(out, SpvOpStore,
+               {valueOf(CALL->getArgOperand(CALL->arg_size() - 1)), sampleID});
+      return;
+    }
+
+    // Storage-image load/store → OpImageRead / OpImageWrite. The image global
+    // points directly at the OpTypeImage (analyzeSamplers, isImage). image2D uses
+    // an ivec2 coord (x,y); imageBuffer a scalar int.
+    if (nm == "__image2d_load" || nm == "__imagebuffer_load" ||
+        nm == "__image2d_store" || nm == "__imagebuffer_store") {
+      bool isBuf = nm.contains("buffer");
+      bool isStore = nm.contains("store");
+      auto it = valueToSampler.find(CALL->getArgOperand(0));
+      if (it == valueToSampler.end()) {
+        llvm::errs() << "[spv] " << nm << ": image arg not tracked\n";
+        emitFailed_ = true;
+        return;
+      }
+      const SamplerInfo& info = samplerInfo[it->second];
+      Word imgID = allocID();
+      appendOp(out, SpvOpLoad, {info.imageTypeID, imgID, info.varID});
+      // Coordinate (after sampler+slot): scalar int for buffer at arg 2, ivec2
+      // for image2D at args 2,3.
+      Word coordID;
+      if (isBuf) {
+        coordID = valueOf(CALL->getArgOperand(2));
+      } else {
+        auto* iv2 = FixedVectorType::get(Type::getInt32Ty(M.getContext()), 2);
+        coordID = allocID();
+        appendOp(out, SpvOpCompositeConstruct,
+                 {typeFor(iv2), coordID, valueOf(CALL->getArgOperand(2)),
+                  valueOf(CALL->getArgOperand(3))});
+      }
+      if (isStore) {
+        // The value is the last operand, passed as a ptr (alloca) — OpLoad it.
+        auto* v4 = FixedVectorType::get(Type::getFloatTy(M.getContext()), 4);
+        Word valPtr = valueOf(CALL->getArgOperand(CALL->arg_size() - 1));
+        Word valID = allocID();
+        appendOp(out, SpvOpLoad, {typeFor(v4), valID, valPtr});
+        appendOp(out, SpvOpImageWrite, {imgID, coordID, valID});
+      } else {
+        // args: (img, coord..., out-ptr). out is the last operand.
+        auto* v4 = FixedVectorType::get(Type::getFloatTy(M.getContext()), 4);
+        Word readID = allocID();
+        appendOp(out, SpvOpImageRead, {typeFor(v4), readID, imgID, coordID});
+        appendOp(out, SpvOpStore,
+                 {valueOf(CALL->getArgOperand(CALL->arg_size() - 1)), readID});
+      }
+      return;
+    }
+
+    // Fail loudly on an unlowered sampler/image intrinsic instead of emitting an
+    // OpFunctionCall to a body-less external (which writes an invalid module and
+    // exits 0). Every implemented dim is lowered above; anything left here is a
+    // gap, not a user call.
+    if (nm.starts_with("__tex") || nm.starts_with("__image")) {
+      llvm::errs() << "[spv] unsupported sampler/image intrinsic '" << nm
+                   << "' — not lowered by the SPIR-V backend\n";
+      emitFailed_ = true;
+      return;
+    }
+
+    // User-defined function calls — absent from the shaders today, but supported
+    // anyway (helpers from codegen_state are inlined as intrinsics, so this
+    // rarely fires).
     Word fid = valueOf(callee);
     Word ty = typeFor(CALL->getType());
     Word id = allocID();
@@ -1692,6 +2007,66 @@ inline void IRToSPIRV::emitTerminator(llvm::BasicBlock& BB,
   }
 }
 
+// Classify the inner column-array SSA values that are really matrix columns, so
+// their building insertvalue is emitted into an OpTypeMatrix. Seeds from matrix
+// wraps (`insertvalue matWrapper, cols, {0}`) and propagates backward through the
+// column-build insertvalue chain. Anchoring on actual wrapper instructions keeps
+// a genuine `vec[C]` array (identical LLVM type) from being misclassified.
+inline void IRToSPIRV::buildMatColVals(llvm::Function& F) {
+  matColVals.clear();
+  std::vector<const llvm::Value*> work;
+  for (auto& BB : F)
+    for (auto& I : BB)
+      if (auto* IV = dyn_cast<llvm::InsertValueInst>(&I))
+        if (auto shape = spvMatrixShape(IV->getType())) {
+          const llvm::Value* col = IV->getInsertedValueOperand();
+          if (isa<llvm::Instruction>(col) && !matColVals.count(col)) {
+            matColVals[col] = *shape;
+            work.push_back(col);
+          }
+        }
+  while (!work.empty()) {
+    const llvm::Value* v = work.back();
+    work.pop_back();
+    SpvMatShape shape = matColVals[v];
+    if (auto* IV = dyn_cast<llvm::InsertValueInst>(v))
+      if (IV->getNumIndices() == 1) {
+        const llvm::Value* agg = IV->getAggregateOperand();
+        if (isa<llvm::InsertValueInst>(agg) && !matColVals.count(agg)) {
+          matColVals[agg] = shape;
+          work.push_back(agg);
+        }
+      }
+  }
+}
+
+inline Word IRToSPIRV::uniformMatrixAccessChain(llvm::GEPOperator* gep,
+                                                std::vector<Word>& out) {
+  auto* GV = dyn_cast<llvm::GlobalVariable>(gep->getPointerOperand());
+  if (!GV) return 0;
+  auto it = uniformMemberIdx.find(GV);
+  if (it == uniformMemberIdx.end()) return 0;
+  // {pushConstVar, memberIdx, <remaining GEP indices, matrix-wrapper member
+  // stripped>}. The wrapper strip mirrors the local matrix GEP (an OpTypeMatrix
+  // has no wrapper struct, so the column index addresses it directly).
+  Word resPtrTy =
+      ptrTypeFor(gep->getResultElementType(), SpvStorageClassPushConstant);
+  Word acID = allocID();
+  std::vector<Word> ops = {resPtrTy, acID, pushConstVarID,
+                           constUint(it->second)};
+  auto GTI = llvm::gep_type_begin(gep);
+  bool firstIdx = true;
+  for (auto& idx : gep->indices()) {
+    llvm::StructType* container = GTI.getStructTypeOrNull();
+    ++GTI;
+    if (firstIdx) { firstIdx = false; continue; }
+    if (container && spvMatrixShape(container)) continue;
+    ops.push_back(valueOf(idx.get()));
+  }
+  appendOpV(out, SpvOpAccessChain, ops);
+  return acID;
+}
+
 inline void IRToSPIRV::emitFunction(llvm::Function& F) {
   using namespace llvm;
   if (F.isDeclaration()) return;
@@ -1700,7 +2075,7 @@ inline void IRToSPIRV::emitFunction(llvm::Function& F) {
   // The entry function gets a particular id; helpers get fresh ids.
   Word fnID = valueOf(&F);
 
-  // Build function type. For the entry function we pretend the signature is
+  // Build function type. The entry function's signature is forced to
   // `void()` — all inputs/outputs are routed through globals. Param type ids are
   // computed via paramTypeID so opaque-pointer (out/inout) params get the right
   // pointee, and the OpFunctionParameter decls reuse the very same ids.
@@ -1725,6 +2100,7 @@ inline void IRToSPIRV::emitFunction(llvm::Function& F) {
   }
 
   analyzeCFG(F);
+  buildMatColVals(F);
 
   // Pre-allocate ids for all basic blocks (for forward references in
   // branches/phis).
@@ -1762,7 +2138,7 @@ inline void IRToSPIRV::emitFunction(llvm::Function& F) {
   }
 
   // Compute reverse postorder so every block appears after its dominators.
-  // For our structured CFG this also keeps loop headers before their bodies
+  // For this structured CFG it also keeps loop headers before their bodies
   // and selection headers before then/else, which is required by SPIR-V.
   std::vector<BasicBlock*> rpo;
   {
@@ -1851,9 +2227,9 @@ inline std::vector<uint8_t> IRToSPIRV::emit() {
     if (stage == ShaderStage::Compute) em = SpvExecutionModelGLCompute;
     prefix.push_back((Word)em);
     prefix.push_back(entryFnID);
-    // OpEntryPoint name is encoded BEFORE interface ids; we use appendOpStr's
-    // prefix/suffix split. The interface ids are *after* the name string,
-    // so we'll hand-roll the encoding here.
+    // OpEntryPoint name is encoded BEFORE interface ids, mirroring appendOpStr's
+    // prefix/suffix split. The interface ids come *after* the name string,
+    // so the encoding is hand-rolled here.
     std::vector<Word> nameWords = packString("main");
     std::vector<Word> all = prefix;
     for (Word w : nameWords) all.push_back(w);
@@ -1878,12 +2254,16 @@ inline std::vector<uint8_t> IRToSPIRV::emit() {
     emitFunction(F);
   }
 
+  // An unsupported construct was hit — return no module so the driver fails
+  // rather than writing an invalid `.spv`.
+  if (emitFailed_) return {};
+
   // ── Stitch sections in the order required by the SPIR-V spec. ────────────
   std::vector<Word> stream;
   // Header: magic, version (1.0), generator, id-bound, schema(0)
   stream.push_back(SpvMagicNumber);
   stream.push_back(0x00010000);  // pin to SPIR-V 1.0 for Vulkan 1.0 compat
-  stream.push_back(0x474C534C);  // generator magic ("GLSL"-ish), our marker
+  stream.push_back(0x474C534C);  // generator magic ("GLSL"-ish), this emitter's marker
   stream.push_back(nextID);      // id bound (exclusive upper)
   stream.push_back(0);           // schema
 

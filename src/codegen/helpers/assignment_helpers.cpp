@@ -63,12 +63,12 @@ Value* MatrixColumnAssigner::codegen() {
     AllocaInst* alloca = it->second;
 
     Type* matTy = alloca->getAllocatedType();
-    if (!matTy->isArrayTy()) {
+    if (!isMatrixTy(matTy)) {
         logErrorAt(Object->loc,"Expected matrix type for swizzle assignment");
         return nullptr;
     }
 
-    auto* arrTy = cast<ArrayType>(matTy);
+    auto* arrTy = matrixArrayTy(matTy);
     auto* colTy = cast<FixedVectorType>(arrTy->getElementType());
     Type* elemTy = colTy->getElementType();
     unsigned rows = colTy->getNumElements();
@@ -112,9 +112,11 @@ Value* MatrixColumnAssigner::codegen() {
             comps.push_back(s);
     }
 
-    // GEP directly to the target column inside alloca — no full-matrix copy needed
+    // GEP directly to the target column inside alloca — no full-matrix copy
+    // needed. The matrix is %glsl.matCxR = { [C x <R x float>] }, so the column
+    // is two levels in: struct field 0, then array index colIdx.
     Value* zero   = ConstantInt::get(Type::getInt32Ty(*Context), 0);
-    Value* colPtr = Builder->CreateInBoundsGEP(matTy, alloca, {zero, colIdx}, "col.ptr");
+    Value* colPtr = Builder->CreateInBoundsGEP(matTy, alloca, {zero, zero, colIdx}, "col.ptr");
     Value* colVal = Builder->CreateLoad(colTy, colPtr, "col.old");
 
     Value* newCol = colVal;

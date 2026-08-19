@@ -1,0 +1,12 @@
+# Regression test: Ensures undeclared functions (e.g. 'wobble') trigger an immediate 
+# Sema error with source location, rather than silently slipping untyped into Codegen.
+
+uniform mat3 M;
+
+@entry @stage(vertex)
+fn void main() {
+    mat3 t = wobble(M);
+    gl_Position = vec4(t[0], 1.0);
+}
+
+# EXPECT-ERROR: call to undeclared function 'wobble'

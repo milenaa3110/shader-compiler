@@ -1,0 +1,105 @@
+# volume_fs.src — Volumetric ray-march through a sampler3D.
+#
+# The host bakes a tileable 64^3 RGBA volume: .w is FBM density, .xyz is the
+# pre-lit colour (colour ramp modulated by a host-traced sun occlusion), so the
+# per-step cost here is one trilinear 3D fetch plus the compositing math.
+#
+# Camera orbits the origin; the sample coordinate additionally drifts with
+# uTime, which is why the volume is generated periodic — the wrap in
+# __tex3d_sample (u - floor(u)) is then seamless.
+#
+# Density is windowed by a soft sphere so the cloud has a silhouette without a
+# ray/box intersection: no divide-by-near-zero on axis-aligned rays, and the
+# loop stays branch-free (accumulated transmittance replaces an early-out).
+
+layout(binding=0) uniform sampler3D uVol;
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+
+@entry @stage(fragment)
+fn void main() {
+    # ── Camera: orbits the cloud, bobbing slightly ───────────────────────────
+    float ang  = uTime * 0.45;
+    float camX = sin(ang) * 1.75;
+    float camY = 0.35 + sin(uTime * 0.31) * 0.30;
+    float camZ = cos(ang) * 1.75;
+
+    # Forward = normalize(-cam) — the cloud sits at the origin.
+    float fLen = sqrt(camX*camX + camY*camY + camZ*camZ);
+    float fwdX = -camX / fLen;
+    float fwdY = -camY / fLen;
+    float fwdZ = -camZ / fLen;
+
+    # Right = normalize(cross(fwd, (0,1,0))) = normalize(fwdZ, 0, -fwdX)
+    float rgtX = fwdZ;
+    float rgtZ = -fwdX;
+    float rLen = sqrt(rgtX*rgtX + rgtZ*rgtZ) + 0.0001;
+    rgtX = rgtX / rLen;
+    rgtZ = rgtZ / rLen;
+
+    # Up = cross(right, fwd); right.y == 0 drops two terms.
+    float upX = 0.0 - rgtZ * fwdY;
+    float upY = rgtZ * fwdX - rgtX * fwdZ;
+    float upZ = rgtX * fwdY;
+
+    # ── Ray through this pixel ───────────────────────────────────────────────
+    float su = (vUV.x - 0.5) * 0.90;
+    float sv = (vUV.y - 0.5) * 0.90;
+    float rdX = fwdX + su * rgtX + sv * upX;
+    float rdY = fwdY + sv * upY;
+    float rdZ = fwdZ + su * rgtZ + sv * upZ;
+    float rdLen = sqrt(rdX*rdX + rdY*rdY + rdZ*rdZ);
+    rdX = rdX / rdLen;
+    rdY = rdY / rdLen;
+    rdZ = rdZ / rdLen;
+
+    # ── March the slab that brackets the cloud sphere ────────────────────────
+    # Camera distance is fixed at ~1.78, the cloud radius is 0.62, so a fixed
+    # [fLen-0.75, fLen+0.75] window always contains it.
+    float dt = 1.5 / 64.0;
+    float t  = fLen - 0.75;
+
+    # Sample-space drift; the volume is periodic so this scrolls seamlessly.
+    float dx = uTime * 0.035;
+    float dz = uTime * -0.022;
+    float dy = uTime * 0.011;
+
+    float trans = 1.0;   # remaining transmittance
+    float cr = 0.0;
+    float cg = 0.0;
+    float cb = 0.0;
+
+    for (float i = 0.0; i < 64.0; i = i + 1.0) {
+        float px = camX + rdX * t;
+        float py = camY + rdY * t;
+        float pz = camZ + rdZ * t;
+
+        # Soft spherical window, squared for a gentler edge.
+        float rr   = sqrt(px*px + py*py + pz*pz);
+        float fall = clamp(1.0 - rr / 0.68, 0.0, 1.0);
+        fall = fall * fall;
+
+        # 0.8 maps the sphere into one period of the volume, so the drift above
+        # is the only thing that crosses a tile boundary.
+        vec4 s = texture(uVol, vec3(px * 0.8 + 0.5 + dx,
+                                    py * 0.8 + 0.5 + dy,
+                                    pz * 0.8 + 0.5 + dz));
+
+        float a = clamp(s.w * fall * 1.45, 0.0, 1.0);
+
+        cr = cr + trans * a * s.x;
+        cg = cg + trans * a * s.y;
+        cb = cb + trans * a * s.z;
+        trans = trans * (1.0 - a);
+
+        t = t + dt;
+    }
+
+    # ── Background showing through the remaining transmittance ───────────────
+    float bg = 0.04 + 0.14 * vUV.y;
+    FragColor = vec4(clamp(cr + trans * bg * 0.7, 0.0, 1.0),
+                     clamp(cg + trans * bg * 0.9, 0.0, 1.0),
+                     clamp(cb + trans * bg * 1.4, 0.0, 1.0),
+                     1.0);
+}

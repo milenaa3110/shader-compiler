@@ -22,6 +22,14 @@ void vs_invoke(int vid, int iid, float* flat_in, double* flat_in_d, float* flat_
 //   flat_out_d - fs_output_doubles elements (64-bit fragment outputs)
 void fs_invoke(float* fragcoord, float* varyings, float* flat_out, double* flat_out_d);
 
+// Fixed capacities of the rasterizer's per-thread scratch buffers. The emitter
+// checks a shader's varying/output counts against these at compile time, so the
+// two sides must agree — hence the shared definition rather than a copy in
+// pipeline_runtime.cpp. A matrix varying makes these easy to exceed: a mat4 is
+// 16 floats on its own.
+#define PIPELINE_MAX_VARYINGS 16
+#define PIPELINE_MAX_FS_OUT   8
+
 // Pipeline layout metrics emitted as global LLVM i32 constants
 extern int vs_total_floats;    // Size of gl_Position(4) + all f32 varyings
 extern int vs_varying_floats;  // Size of f32 varyings only (interpolated region)

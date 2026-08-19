@@ -90,11 +90,6 @@ SPIR-V bytecode word-by-word.
 | `emit_trampolines.h` | Emits `vs_invoke(vid, iid, flat_in, flat_in_d, flat_out)` / `fs_invoke(fragcoord, varyings, flat_out, flat_out_d)` trampolines plus the layout constants `vs_total_floats`, `vs_varying_floats`, `vs_input_floats`/`vs_input_doubles`, `fs_output_floats`/`fs_output_doubles` (the `_d` regions carry 64-bit `double` I/O on the non-interpolated surfaces). Also emits `cs_invoke` and `cs_dispatch_row` for compute shaders |
 | `emit_fs_packet.h` | **SPMD packetizer (Route B).** Emits a width-4 `fs_packet`/`vs_packet` that runs 4 fragments/vertices per call, one per SIMD lane (struct-of-arrays). Reuses one stage-agnostic engine: arithmetic, swizzles, math builtins, `if`/`else`+loops+`break`/`continue` via execution masks, `discard` (liveness side-channel), texture gather. Shaders outside the subset bail (no `*_packet` emitted) and the runtime uses the scalar path. Selected at run time by `SHADER_PACKET=1` |
 
-### `src/driver/`
-| File | Role |
-|------|------|
-| `main_codegen.cpp` | Entry point for the interactive `shader_codegen` tool — reads stdin, prints IR to stdout |
-
 ### `src/runtime/`
 | File | Role |
 |------|------|
@@ -202,7 +197,6 @@ Vulkan host programs — run on the host CPU, drive the GPU via the Vulkan API.
 ### `build/` (generated)
 | Path | Contents |
 |------|----------|
-| `build/shader_codegen` | Interactive IR dump tool |
 | `build/riscv/irgen_riscv` | Compiler binary — riscv64 IR + trampolines |
 | `build/riscv/` | RISC-V intermediates (`.ll`, `.gvn.ll`, `.opt.ll`, `.o`) and `.rv` binaries |
 | `build/spirv/irgen_spirv` | Compiler binary — SPIR-V emitter |

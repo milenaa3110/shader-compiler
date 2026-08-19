@@ -1,0 +1,26 @@
+# IR regression: a matrix's non-matrix operand must be widened to float before
+# lowering. commonOperandType has no matrix case, so the generic operand
+# promotion in sema never fires here — `mat4 * ivec4` (legal GLSL, verified
+# against glslangValidator) reached codegen as an integer vector and lowered to
+# `fmul <4 x float>, <4 x i32>`, which the LLVM verifier rejects. The same gap
+# applied to an int scalar, where only matScalarOp's castScalarTo backstop
+# happened to save it.
+
+uniform mat4 MVP;
+uniform mat3 NRM;
+out vec4 vC;
+
+@entry @stage(vertex)
+fn void main() {
+    ivec4 iv = ivec4(1, 2, 3, 4);
+    vC = MVP * iv;
+    mat3 scaled = NRM * 2;
+    gl_Position = vec4(scaled[0], 1.0);
+}
+
+# Every matrix multiply operand is float — no integer vector survives into the
+# arithmetic.
+# CHECK-LABEL: define{{.*}}@vs_main
+# CHECK-NOT: fmul <4 x i32>
+# CHECK-NOT: fmul <3 x i32>
+# CHECK: fmul <4 x float>

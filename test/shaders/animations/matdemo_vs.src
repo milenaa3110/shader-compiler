@@ -1,0 +1,37 @@
+# matdemo_vs.src — Makes spirv-val exercise the real OpTypeMatrix SPIR-V path.
+# Covers: uniform matrices, a constant/diagonal matrix, matrix builtins
+# (transpose, matrixCompMult, outerProduct), whole-matrix arithmetic, local
+# column indexing (m[i]), a matrix varying output, and a DYNAMIC column index on
+# a uniform matrix (uMVP[idx]) — lowered to a push-constant access chain with a
+# runtime index (uniformMatrixAccessChain); validates on both backends.
+
+in vec3 aPos;
+in vec3 aNormal;
+
+uniform mat4 uMVP;
+uniform mat3 uNormal;
+
+out mat3 vTBN;
+
+@entry @stage(vertex)
+fn void main() {
+    mat3 scale = mat3(2.0);
+    mat3 n = matrixCompMult(uNormal, scale) + transpose(uNormal);
+    mat3 stack[2];
+    stack[0] = n;
+    stack[1] = inverse(n);
+    vTBN = outerProduct(aNormal, aNormal) + stack[0];
+    vec3 dir = stack[0] * aPos + stack[1][1] + n[1];
+
+    # mat == mat in a bool context — exercises the OpLogicalAnd reduction.
+    float sym = 0.0;
+    if (uNormal == transpose(uNormal)) {
+        sym = 1.0;
+    }
+    # Dynamic column index on a uniform matrix — push-constant access chain with
+    # a runtime (non-constant) index.
+    int idx = int(aPos.x);
+    vec4 t = uMVP[idx];
+
+    gl_Position = uMVP * vec4(dir + t.xyz * sym, 1.0);
+}

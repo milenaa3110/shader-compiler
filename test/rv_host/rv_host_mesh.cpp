@@ -68,6 +68,7 @@ static Mesh loadMesh(const std::string& spec) {
 }
 
 int main(int argc, char** argv) {
+    report_vector_config();
     const char* name      = (argc > 1) ? argv[1] : ANIM_NAME;
     int          nframes  = (argc > 2) ? std::atoi(argv[2]) : NFRAMES;
     std::string  meshSpec = (argc > 3) ? argv[3] : "icosphere:3";

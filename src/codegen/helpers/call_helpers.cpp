@@ -18,118 +18,187 @@
 
 using namespace llvm;
 
+// Matrix spellings come from builtin_types.def, the same table the lexer,
+// parser, sema and resolveTypeByName use, so a constructor call and a
+// declaration of the same type can never disagree about which spellings exist.
 static bool parseMatDims(const std::string& callee, unsigned& cols, unsigned& rows) {
-    // Accept: mat2, mat3, mat4, mat2x3, mat3x4, mat4x2 ...
-    if (callee.rfind("mat", 0) != 0) return false;
-    if (callee.size() < 4) return false;
-
-    auto isDigit = [](char ch) { return ch >= '0' && ch <= '9'; };
-
-    // matN
-    if (callee.find('x') == std::string::npos) {
-        if (callee.size() != 4) return false;
-        if (!isDigit(callee[3])) return false;
-        cols = rows = static_cast<unsigned>(callee[3] - '0');
-        return (cols >= 2 && cols <= 4);
-    }
-
-    // matNxM
-    size_t x = callee.find('x');
-    if (x == std::string::npos) return false;
-    if (callee.size() != x + 2) return false;
-    if (x != 4) return false;
-
-    if (!isDigit(callee[3]) || !isDigit(callee[x + 1])) return false;
-
-    cols = static_cast<unsigned>(callee[3] - '0');
-    rows = static_cast<unsigned>(callee[x + 1] - '0');
-    return (cols >= 2 && cols <= 4 && rows >= 2 && rows <= 4);
+#define BTYPE_MATRIX(Tok, Spelling, Cols, Rows) \
+    if (callee == Spelling) { cols = Cols; rows = Rows; return true; }
+#include "../../frontend/ast/builtin_types.def"
+    return false;
 }
 
-llvm::Value* tryCodegenMatrixConstructor(const CallExprAST* call) {
+// Components a value contributes when flattened into a constructor argument
+// list: matrices count every element, vectors their lanes, scalars one.
+static unsigned valueComponentCount(llvm::Value* v) {
+    if (auto shape = matrixShapeOf(v->getType())) return shape->cols * shape->rows;
+    if (auto* vt = llvm::dyn_cast<llvm::FixedVectorType>(v->getType()))
+        return vt->getNumElements();
+    return 1;
+}
+
+// Append a value's scalar components to `out`, converting each to `elemTy`.
+// Shared by the vector and matrix constructors so the GLSL flattening rules
+// exist in exactly one place. Stops once `want` components have been collected
+// (GLSL narrows an over-long trailing argument rather than erroring).
+static bool accumulateComponents(llvm::Value* v, llvm::Type* elemTy, unsigned want,
+                                 std::vector<llvm::Value*>& out,
+                                 const CallExprAST* call) {
+    auto push = [&](llvm::Value* e) -> bool {
+        if (e->getType() != elemTy) {
+            e = castScalarTo(e, elemTy);
+            if (!e) {
+                logErrorFmtAt(call->loc, "Constructor {}: cannot convert an argument component",
+                              call->Callee);
+                return false;
+            }
+        }
+        out.push_back(e);
+        return true;
+    };
+
+    if (auto shape = matrixShapeOf(v->getType())) {
+        llvm::Value* colsVal = matrixColumns(v);
+        for (unsigned c = 0; c < shape->cols && out.size() < want; ++c) {
+            llvm::Value* col = Builder->CreateExtractValue(colsVal, c, "ctor.mcol");
+            for (unsigned r = 0; r < shape->rows && out.size() < want; ++r)
+                if (!push(Builder->CreateExtractElement(col, Builder->getInt32(r), "ctor.melem")))
+                    return false;
+        }
+        return true;
+    }
+    if (auto* vt = llvm::dyn_cast<llvm::FixedVectorType>(v->getType())) {
+        for (unsigned i = 0; i < vt->getNumElements() && out.size() < want; ++i)
+            if (!push(Builder->CreateExtractElement(v, Builder->getInt32(i), "ctor_comp")))
+                return false;
+        return true;
+    }
+    if (out.size() < want) return push(v);
+    return true;
+}
+
+CtorResult tryCodegenMatrixConstructor(const CallExprAST* call) {
     unsigned cols = 0, rows = 0;
-    if (!parseMatDims(call->Callee, cols, rows)) return nullptr;
+    if (!parseMatDims(call->Callee, cols, rows)) return CtorResult::notMine();
 
     Type* elemTy = Type::getFloatTy(*Context);
     auto* colTy  = FixedVectorType::get(elemTy, rows);
+    // The inner column array; the %glsl.matCxR wrapper goes on at each return.
     auto* matTy  = ArrayType::get(colTy, cols);
+    const unsigned diag = std::min(cols, rows);
 
-    // matN() / matNxM() -> identity (min(cols,rows)) on diagonal
-    if (call->Args.empty()) {
+    // Build a diagonal matrix from a single scalar (1.0 gives the identity).
+    auto diagonal = [&](Value* s) -> Value* {
         Value* mat = ConstantAggregateZero::get(matTy);
-        for (unsigned i = 0; i < std::min(cols, rows); ++i) {
-            Value* col = Builder->CreateExtractValue(mat, i, "col");
-            col = Builder->CreateInsertElement(
-                col,
-                ConstantFP::get(elemTy, 1.0),
-                Builder->getInt32(i),
-                "diagins");
-            mat = Builder->CreateInsertValue(mat, col, i, "colins");
-        }
-        return mat;
-    }
-
-    // matN(s) -> diagonal = s, rest 0
-    if (call->Args.size() == 1) {
-        Value* s = call->Args[0]->codegen();
-        if (!s) return nullptr;
-        if (s->getType() != elemTy) {
-            s = castScalarTo(s, elemTy);
-            if (!s) return nullptr;
-        }
-
-        Value* mat = ConstantAggregateZero::get(matTy);
-        for (unsigned i = 0; i < std::min(cols, rows); ++i) {
+        for (unsigned i = 0; i < diag; ++i) {
             Value* col = Builder->CreateExtractValue(mat, i, "col");
             col = Builder->CreateInsertElement(col, s, Builder->getInt32(i), "diagins");
             mat = Builder->CreateInsertValue(mat, col, i, "colins");
         }
-        return mat;
+        return matrixFromColumns(mat, cols, rows);
+    };
+
+    // matN() / matNxM() -> identity
+    if (call->Args.empty()) return CtorResult::ok(diagonal(ConstantFP::get(elemTy, 1.0)));
+
+    // Codegen every argument once, up front, so the dispatch below can look at
+    // their *types*. Choosing a form by argument count alone is ambiguous: for
+    // mat2, cols == 2 and cols*rows == 4, so `mat2(a, b)` with two scalars used
+    // to be forced down the column path and rejected.
+    std::vector<Value*> argVals;
+    argVals.reserve(call->Args.size());
+    for (auto& A : call->Args) {
+        Value* v = A->codegen();
+        if (!v) return CtorResult::failed();
+        argVals.push_back(v);
     }
 
-    // matNxM(col0, col1, ... col{cols-1}) each col is vec{rows} of float
-    if (call->Args.size() == cols) {
-        Value* mat = UndefValue::get(matTy);
-        for (unsigned c = 0; c < cols; ++c) {
-            Value* v = call->Args[c]->codegen();
-            if (!v) return nullptr;
-
-            if (!v->getType()->isVectorTy() || v->getType() != colTy) {
-                logErrorFmtAt(call->loc,"Matrix constructor {}: expects column {} to be vec{} of float",
-                           call->Callee, c, rows);
-                return nullptr;
-            }
-            mat = Builder->CreateInsertValue(mat, v, c, "colins");
-        }
-        return mat;
-    }
-
-    // matNxM(C*R scalars) column-major
-    if (call->Args.size() == cols * rows) {
-        Value* mat = UndefValue::get(matTy);
-        unsigned k = 0;
-
-        for (unsigned c = 0; c < cols; ++c) {
-            Value* col = UndefValue::get(colTy);
-            for (unsigned r = 0; r < rows; ++r, ++k) {
-                Value* a = call->Args[k]->codegen();
-                if (!a) return nullptr;
-                if (a->getType() != elemTy) {
-                    a = castScalarTo(a, elemTy);
-                    if (!a) return nullptr;
+    if (argVals.size() == 1) {
+        Value* a = argVals[0];
+        // matC2xR2(matCxR): copy the overlapping block, fill the rest from the
+        // identity. This is the basis of every normal-matrix idiom (mat3(MVP)).
+        if (auto src = matrixShapeOf(a->getType())) {
+            Value* srcCols = matrixColumns(a);
+            Value* mat = ConstantAggregateZero::get(matTy);
+            for (unsigned c = 0; c < cols; ++c) {
+                Value* col = Builder->CreateExtractValue(mat, c, "col");
+                for (unsigned r = 0; r < rows; ++r) {
+                    Value* e;
+                    if (c < src->cols && r < src->rows) {
+                        Value* sc = Builder->CreateExtractValue(srcCols, c, "src.col");
+                        e = Builder->CreateExtractElement(sc, Builder->getInt32(r), "src.elem");
+                    } else if (c == r) {
+                        e = ConstantFP::get(elemTy, 1.0);   // identity outside the copied block
+                    } else {
+                        continue;                            // already zero
+                    }
+                    col = Builder->CreateInsertElement(col, e, Builder->getInt32(r), "nar.ins");
                 }
-                col = Builder->CreateInsertElement(col, a, Builder->getInt32(r), "colelm");
+                mat = Builder->CreateInsertValue(mat, col, c, "colins");
             }
-            mat = Builder->CreateInsertValue(mat, col, c, "colins");
+            return CtorResult::ok(matrixFromColumns(mat, cols, rows));
         }
-        return mat;
+        // matN(s) -> diagonal = s
+        if (!a->getType()->isVectorTy()) {
+            Value* s = a;
+            if (s->getType() != elemTy) {
+                s = castScalarTo(s, elemTy);
+                if (!s) {
+                    logErrorFmtAt(call->loc, "Constructor {}: argument is not convertible to float",
+                                  call->Callee);
+                    return CtorResult::failed();
+                }
+            }
+            return CtorResult::ok(diagonal(s));
+        }
+        logErrorFmtAt(call->loc, "Constructor {}: a single argument must be a scalar or a matrix",
+                      call->Callee);
+        return CtorResult::failed();
     }
 
-    logErrorFmtAt(call->loc,"Matrix constructor: unsupported argument pattern for {}", call->Callee);
-    return nullptr;
+    // One vector per column: matCxR(vecR, vecR, ...).
+    bool allColumns = argVals.size() == cols;
+    for (Value* v : argVals)
+        if (v->getType() != colTy) allColumns = false;
+    if (allColumns) {
+        Value* mat = UndefValue::get(matTy);
+        for (unsigned c = 0; c < cols; ++c)
+            mat = Builder->CreateInsertValue(mat, argVals[c], c, "colins");
+        return CtorResult::ok(matrixFromColumns(mat, cols, rows));
+    }
+
+    // Otherwise flatten everything column-major and require exactly C*R
+    // components. Sharing accumulateComponents with the vector constructor is
+    // what makes mat2(vec2(1,2), 3.0, 4.0) work without a second copy of the
+    // GLSL flattening rules.
+    const unsigned want = cols * rows;
+    std::vector<Value*> comps;
+    comps.reserve(want);
+    unsigned supplied = 0;
+    for (Value* v : argVals) {
+        supplied += valueComponentCount(v);
+        if (!accumulateComponents(v, elemTy, want, comps, call))
+            return CtorResult::failed();
+    }
+    if (supplied != want) {
+        logErrorFmtAt(call->loc,
+                      "Constructor {}: expected {} columns of vec{} or {} components, got {}",
+                      call->Callee, cols, rows, want, supplied);
+        return CtorResult::failed();
+    }
+
+    Value* mat = UndefValue::get(matTy);
+    unsigned k = 0;
+    for (unsigned c = 0; c < cols; ++c) {
+        Value* col = UndefValue::get(colTy);
+        for (unsigned r = 0; r < rows; ++r, ++k)
+            col = Builder->CreateInsertElement(col, comps[k], Builder->getInt32(r), "colelm");
+        mat = Builder->CreateInsertValue(mat, col, c, "colins");
+    }
+    return CtorResult::ok(matrixFromColumns(mat, cols, rows));
 }
 
-llvm::Value* tryCodegenVectorConstructor(const CallExprAST* call) {
+CtorResult tryCodegenVectorConstructor(const CallExprAST* call) {
     const std::string& C = call->Callee;
     // vecN → float elements; ivecN / uvecN → i32 elements. N ∈ {2,3,4}. (int and
     // uint share the signless i32; the conversion of each component is what
@@ -141,14 +210,14 @@ llvm::Value* tryCodegenVectorConstructor(const CallExprAST* call) {
              C == "uvec2" || C == "uvec3" || C == "uvec4")
         elemTy = llvm::Type::getInt32Ty(*Context);
     else
-        return nullptr;
+        return CtorResult::notMine();
 
     const unsigned N = static_cast<unsigned>(C.back() - '0');
     auto* vecTy = llvm::FixedVectorType::get(elemTy, N);
 
     if (call->Args.empty()) {
         logErrorFmtAt(call->loc,"Constructor {} expects at least 1 argument", C);
-        return nullptr;
+        return CtorResult::failed();
     }
 
     // Codegen args once
@@ -156,64 +225,35 @@ llvm::Value* tryCodegenVectorConstructor(const CallExprAST* call) {
     argVals.reserve(call->Args.size());
     for (auto& A : call->Args) {
         llvm::Value* v = A->codegen();
-        if (!v) return nullptr;
+        if (!v) return CtorResult::failed();
         argVals.push_back(v);
     }
 
     // GLSL-like splat: vecN(s) => (s,s,...)
-    if (argVals.size() == 1 && !argVals[0]->getType()->isVectorTy()) {
+    if (argVals.size() == 1 && !argVals[0]->getType()->isVectorTy() &&
+        !isMatrixTy(argVals[0]->getType())) {
         llvm::Value* s = argVals[0];
         if (s->getType() != elemTy) {
             s = castScalarTo(s, elemTy);
-            if (!s) return nullptr;
+            if (!s) return CtorResult::failed();
         }
-        return splatScalarToVector(s, vecTy);
+        return CtorResult::ok(splatScalarToVector(s, vecTy));
     }
 
+    // Flatten each argument into scalar components. accumulateComponents is
+    // shared with the matrix constructor so the GLSL rules live in one place;
+    // it also covers a matrix argument.
     std::vector<llvm::Value*> comps;
     comps.reserve(N);
-
-    auto pushComp = [&](llvm::Value* e) -> bool {
-        if (e->getType() != elemTy) {
-            e = castScalarTo(e, elemTy);
-            if (!e) return false;
-        }
-        comps.push_back(e);
-        return true;
-    };
-
+    unsigned supplied = 0;
     for (size_t ai = 0; ai < argVals.size(); ++ai) {
-        llvm::Value* v = argVals[ai];
-
-        if (v->getType()->isVectorTy()) {
-            auto* vVecTy = llvm::dyn_cast<llvm::FixedVectorType>(v->getType());
-            if (!vVecTy) {
-                logErrorFmtAt(call->loc,"Constructor {}: only fixed-size vectors supported", C);
-                return nullptr;
-            }
-
-            unsigned m = vVecTy->getNumElements();
-            for (unsigned i = 0; i < m; ++i) {
-                if (comps.size() == N) {
-                    // Truncate extra components inside this vector argument (GLSL-like narrowing)
-                    break;
-                }
-                llvm::Value* e = Builder->CreateExtractElement(v, Builder->getInt32(i), "ctor_comp");
-                if (!pushComp(e)) return nullptr;
-            }
-        } else {
-            if (comps.size() == N) {
-                logErrorFmtAt(call->loc,"Constructor {}: too many components", C);
-                return nullptr;
-            }
-            if (!pushComp(v)) return nullptr;
-        }
-
-        // If we've filled N but still have remaining arguments, that's an error.
-        if (comps.size() == N && ai + 1 < argVals.size()) {
+        if (comps.size() == N) {
             logErrorFmtAt(call->loc,"Constructor {}: too many components", C);
-            return nullptr;
+            return CtorResult::failed();
         }
+        supplied += valueComponentCount(argVals[ai]);
+        if (!accumulateComponents(argVals[ai], elemTy, N, comps, call))
+            return CtorResult::failed();
     }
 
     // Fill missing components: default 0, but for a 4-vector missing w => 1.
@@ -229,59 +269,72 @@ llvm::Value* tryCodegenVectorConstructor(const CallExprAST* call) {
         if (N == 4) comps[3] = elemConst(1.0);  // missing w => 1
     }
 
-    return buildVectorFromScalars(comps, N);
+    return CtorResult::ok(buildVectorFromScalars(comps, N));
 }
 
-llvm::Value* tryCodegenScalarConstructor(const CallExprAST* call) {
+CtorResult tryCodegenScalarConstructor(const CallExprAST* call) {
     const std::string& C = call->Callee;
-    if (C != "float" && C != "double" && C != "int" && C != "uint" && C != "bool") return nullptr;
+    if (C != "float" && C != "double" && C != "int" && C != "uint" && C != "bool")
+        return CtorResult::notMine();
 
     if (call->Args.size() != 1) {
         logErrorFmtAt(call->loc,"Constructor {} expects exactly 1 argument", C);
-        return nullptr;
+        return CtorResult::failed();
     }
 
     Value* v = call->Args[0]->codegen();
-    if (!v) return nullptr;
+    if (!v) return CtorResult::failed();
 
     Type* dst = resolveTypeByName(C);
     if (!dst) {
         logErrorFmtAt(call->loc,"Unknown scalar constructor: {}", C);
-        return nullptr;
+        return CtorResult::failed();
+    }
+
+    // GLSL takes the first component of a composite: float(vec3) is v.x, and
+    // float(mat3) is m[0][0]. Confirmed against glslangValidator.
+    if (auto shape = matrixShapeOf(v->getType())) {
+        (void)shape;
+        Value* col = Builder->CreateExtractValue(matrixColumns(v), 0, "sc.col");
+        v = Builder->CreateExtractElement(col, Builder->getInt32(0), "sc.elem");
+    } else if (v->getType()->isVectorTy()) {
+        v = Builder->CreateExtractElement(v, Builder->getInt32(0), "sc.elem");
     }
 
     Value* cv = castScalarTo(v, dst);
     if (!cv) {
         logErrorFmtAt(call->loc,"Cannot cast to {}", C);
-        return nullptr;
+        return CtorResult::failed();
     }
-    return cv;
+    return CtorResult::ok(cv);
 }
 
-llvm::Value* tryCodegenStructConstructor(const CallExprAST* call) {
+CtorResult tryCodegenStructConstructor(const CallExprAST* call) {
     Type* ty = resolveTypeByName(call->Callee);
-    if (!ty) return nullptr;
+    if (!ty) return CtorResult::notMine();
 
     auto* st = dyn_cast<StructType>(ty);
-    if (!st) return nullptr;
+    // A matrix is a named struct (%glsl.matCxR) too, so it would otherwise be
+    // claimed here. It has its own constructor with GLSL's own rules.
+    if (!st || isMatrixTy(st)) return CtorResult::notMine();
 
     const unsigned numFields = st->getNumElements();
 
     if (call->Args.empty()) {
-        return ConstantAggregateZero::get(st);
+        return CtorResult::ok(ConstantAggregateZero::get(st));
     }
 
     if (call->Args.size() != numFields) {
         logErrorFmtAt(call->loc,"Struct constructor {} expects {} arguments, got {}",
                    call->Callee, numFields, call->Args.size());
-        return nullptr;
+        return CtorResult::failed();
     }
 
     Value* result = UndefValue::get(st);
 
     for (unsigned i = 0; i < numFields; ++i) {
         Value* argVal = call->Args[i]->codegen();
-        if (!argVal) return nullptr;
+        if (!argVal) return CtorResult::failed();
 
         Type* fieldTy = st->getElementType(i);
 
@@ -291,22 +344,22 @@ llvm::Value* tryCodegenStructConstructor(const CallExprAST* call) {
                 if (!vecTy) {
                     logErrorFmtAt(call->loc,"Struct constructor {}: only fixed-size vectors supported for field {}",
                                call->Callee, i);
-                    return nullptr;
+                    return CtorResult::failed();
                 }
                 Type* elemTy = vecTy->getElementType();
                 Value* scalar = castScalarTo(argVal, elemTy);
-                if (!scalar) return nullptr;
+                if (!scalar) return CtorResult::failed();
 
                 argVal = splatScalarToVector(scalar, vecTy);
-                if (!argVal) return nullptr;
+                if (!argVal) return CtorResult::failed();
             } else {
                 argVal = castScalarTo(argVal, fieldTy);
-                if (!argVal) return nullptr;
+                if (!argVal) return CtorResult::failed();
             }
         }
 
         result = Builder->CreateInsertValue(result, argVal, {i}, "fieldins");
     }
 
-    return result;
+    return CtorResult::ok(result);
 }
