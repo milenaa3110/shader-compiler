@@ -14,6 +14,8 @@ class VulkanBenchmarkTimer {
     float period = 0;
     double total = 0;
     bool failed = false;
+    const char* reason = "timestamp queries unsupported or failed";
+    int lastResult = 0;
 public:
     static uint64_t ticks(uint64_t begin, uint64_t end, uint32_t validBits) {
         return (end - begin) & (validBits >= 64 ? UINT64_MAX : ((uint64_t(1) << validBits) - 1));
@@ -31,11 +33,15 @@ public:
         vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, families.data());
         bits = families.at(family).timestampValidBits;
         period = props.limits.timestampPeriod;
-        if (!bits || period <= 0) return;
+        if (!bits)        { reason = "queue family reports timestampValidBits=0"; return; }
+        if (period <= 0)  { reason = "device reports timestampPeriod=0"; return; }
         VkQueryPoolCreateInfo ci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         ci.queryType = VK_QUERY_TYPE_TIMESTAMP;
         ci.queryCount = 2;
-        if (vkCreateQueryPool(device, &ci, nullptr, &pool) != VK_SUCCESS) failed = true;
+        if (vkCreateQueryPool(device, &ci, nullptr, &pool) != VK_SUCCESS) {
+            failed = true;
+            reason = "vkCreateQueryPool failed";
+        }
     }
     void begin(VkCommandBuffer cmd) {
         if (!pool) return;
@@ -48,14 +54,30 @@ public:
     void collect() {
         if (!pool) return;
         uint64_t values[4]{};
+        // WAIT_BIT is safe here — the caller already waited on the completion
+        // fence. Without it a driver that publishes results lazily returns
+        // VK_NOT_READY, which this used to record as a permanent failure.
         VkResult result = vkGetQueryPoolResults(device, pool, 0, 2, sizeof(values), values,
-            2 * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-        if (result != VK_SUCCESS || !values[1] || !values[3]) { failed = true; return; }
+            2 * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT
+                                | VK_QUERY_RESULT_WAIT_BIT);
+        if (result != VK_SUCCESS) {
+            failed = true; lastResult = int(result);
+            reason = "vkGetQueryPoolResults failed";
+            return;
+        }
+        if (!values[1] || !values[3]) {
+            failed = true;
+            reason = "timestamps never became available";
+            return;
+        }
         total += double(ticks(values[0], values[2], bits)) * period / 1e6;
     }
     void clear() { total = 0; }
     void report(int units, const char* unit) const {
-        if (!pool || failed) std::printf("Vulkan device avg: unavailable (timestamp queries unsupported or failed)\n");
+        if (!pool || failed) {
+            if (lastResult) std::printf("Vulkan device avg: unavailable (%s, VkResult=%d)\n", reason, lastResult);
+            else            std::printf("Vulkan device avg: unavailable (%s)\n", reason);
+        }
         else std::printf("Vulkan device avg: %.9f ms/%s\n", total / units, unit);
     }
     void close() { if (pool) vkDestroyQueryPool(device, pool, nullptr); pool = VK_NULL_HANDLE; }
