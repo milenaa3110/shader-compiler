@@ -2,7 +2,8 @@
 # run_packet_runtime.sh — packet-width RUNTIME gate (the part run_packet_test.sh
 # can't cover because it never links the runtime).
 #
-# Two checks, both under QEMU with the packet path active (SHADER_PACKET=1):
+# Two checks, both with the packet path active (SHADER_PACKET=1), run natively on
+# riscv64 hardware and under QEMU everywhere else:
 #   1. Banner smoke  — get_vlen_bits()/report_vector_config() print VLEN + the
 #                      compiled packet width, and a matching build does NOT trip
 #                      the build-width guard (no FATAL).
@@ -32,10 +33,19 @@ pass(){ echo -e "  ${GREEN}PASS${RST}  $*"; }
 bad(){  echo -e "  ${RED}FAIL${RST}  $*"; fail=1; }
 skip(){ echo -e "  ${YEL}SKIP${RST}  $*"; }
 
-CROSS_CXX="$(command -v riscv64-linux-gnu-g++ 2>/dev/null || true)"
-QEMU="$(command -v qemu-riscv64-static 2>/dev/null || command -v qemu-riscv64 2>/dev/null || true)"
-
-[ -n "$CROSS_CXX" ] && [ -n "$QEMU" ] || { skip "cross-cc or QEMU missing — packet runtime gate skipped"; exit 0; }
+# Native riscv64: the system g++ IS the target compiler and the binaries run
+# directly, so neither the cross toolchain nor QEMU is involved. RUN is the
+# launcher prefix — empty natively, the emulator + sysroot when cross-built.
+if [ "$(uname -m)" = "riscv64" ]; then
+    CROSS_CXX="$(command -v g++ 2>/dev/null || true)"
+    RUN=()
+    [ -n "$CROSS_CXX" ] || { skip "g++ missing — packet runtime gate skipped"; exit 0; }
+else
+    CROSS_CXX="$(command -v riscv64-linux-gnu-g++ 2>/dev/null || true)"
+    QEMU="$(command -v qemu-riscv64-static 2>/dev/null || command -v qemu-riscv64 2>/dev/null || true)"
+    [ -n "$CROSS_CXX" ] && [ -n "$QEMU" ] || { skip "cross-cc or QEMU missing — packet runtime gate skipped"; exit 0; }
+    RUN=("$QEMU" -L "$SYSROOT")
+fi
 [ -f "$RVO" ]     || { skip "no $RVO (build a shader first)"; exit 0; }
 
 # Compiled packet width baked into the shader (irgen_riscv's kW == the marker).
@@ -57,7 +67,7 @@ echo "Packet-width runtime gate (shader marker width = $W)"
 
 # ── 1. Banner smoke: matching runtime width → banner prints, no false abort ────
 if build_host "$W" "$TMP/match.rv"; then
-    out="$(SHADER_PACKET=1 "$QEMU" -L "$SYSROOT" "$TMP/match.rv" </dev/null 2>&1)"
+    out="$(SHADER_PACKET=1 "${RUN[@]}" "$TMP/match.rv" </dev/null 2>&1)"
     if grep -q "VLEN=" <<<"$out" \
        && grep -q "packet width=$W lanes" <<<"$out" \
        && ! grep -q "FATAL" <<<"$out"; then
@@ -71,7 +81,7 @@ fi
 
 # ── 2. Guard test: mismatched runtime width → loud abort, not silent garbage ───
 if build_host "$MIS" "$TMP/mis.rv"; then
-    out="$(SHADER_PACKET=1 "$QEMU" -L "$SYSROOT" "$TMP/mis.rv" </dev/null 2>&1)"; rc=$?
+    out="$(SHADER_PACKET=1 "${RUN[@]}" "$TMP/mis.rv" </dev/null 2>&1)"; rc=$?
     if grep -q "FATAL: SPMD packet-width mismatch" <<<"$out" && [ "$rc" -ne 0 ]; then
         pass "guard: marker=$W vs runtime=$MIS → loud abort (rc=$rc)"
     else

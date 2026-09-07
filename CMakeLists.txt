@@ -52,7 +52,13 @@ message(STATUS "  spirv-headers: ${SPIRV_HEADERS_INCLUDE_DIR}")
 # inside an unrelated custom command on -march=rv64gcv.
 if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^riscv64$")
     set(RISCV_NATIVE TRUE)
-    find_program(CROSS_CXX_BIN NAMES riscv64-linux-gnu-g++ g++ c++)
+    # System g++ FIRST natively. riscv64-linux-gnu-g++ may also be installed here
+    # (the cross package targets the same arch), but it builds against the
+    # /usr/riscv64-linux-gnu sysroot rather than the running system's. Preferring
+    # it would also disagree with bench_common.sh, which uses plain g++ natively —
+    # and those scripts compile pipeline_runtime.cpp against CMake-built shader
+    # objects, so both must go through the same toolchain.
+    find_program(CROSS_CXX_BIN NAMES g++ c++ riscv64-linux-gnu-g++)
 else()
     set(RISCV_NATIVE FALSE)
     find_program(CROSS_CXX_BIN NAMES riscv64-linux-gnu-g++)
@@ -81,15 +87,23 @@ endif()
 # How a built .rv binary is launched. Natively it is executed as-is; only a
 # cross build needs the emulator and its sysroot. RISCV_SIM is prepended to every
 # rv-* run target, so an empty value means "run it directly".
+#
+# Deliberately NOT a cache variable. It is derived from RISCV_NATIVE/QEMU_RISCV,
+# and `set(... CACHE ...)` is a no-op once the entry exists — so a build tree
+# first configured while QEMU was installed would keep prepending that emulator
+# path forever, even after this file learned to detect native hardware, and the
+# STATUS line below would cheerfully report "native" while the run targets tried
+# to exec something else. unset() clears the entry left behind by older configures.
 find_program(QEMU_RISCV    NAMES qemu-riscv64-static qemu-riscv64)
+unset(RISCV_SIM CACHE)
 if(RISCV_NATIVE)
-    set(RISCV_SIM "" CACHE STRING "launcher prefix for .rv binaries")
+    set(RISCV_SIM "")
     message(STATUS "  RISC-V execution: native (no emulator)")
 elseif(QEMU_RISCV)
-    set(RISCV_SIM "${QEMU_RISCV};-L;/usr/riscv64-linux-gnu" CACHE STRING "launcher prefix for .rv binaries")
+    set(RISCV_SIM "${QEMU_RISCV}" "-L" "/usr/riscv64-linux-gnu")
     message(STATUS "  RISC-V execution: ${QEMU_RISCV} (emulated)")
 else()
-    set(RISCV_SIM "" CACHE STRING "launcher prefix for .rv binaries")
+    set(RISCV_SIM "")
     message(STATUS "  RISC-V execution: qemu-riscv64 not found (rv-* run targets will skip)")
 endif()
 
