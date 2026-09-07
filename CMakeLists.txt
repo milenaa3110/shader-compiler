@@ -71,7 +71,7 @@ endif()
 find_program(CLANG_CXX_BIN NAMES clang++-${LLVM_VERSION_MAJOR} clang++-18 clang++-17 clang++)
 if(CROSS_CXX_BIN AND NOT CLANG_CXX_BIN)
     message(FATAL_ERROR
-        "clang++ not found but a RISC-V target compiler is available.\n"
+        "clang++ not found but RISC-V cross-compile is enabled.\n"
         "Install clang-18 (or matching LLVM version) so tex_inline.cpp can\n"
         "be compiled to bitcode for the shader-IR link step.")
 endif()
@@ -115,8 +115,8 @@ if(CROSS_CXX_BIN)
             "${CROSS_CXX_BIN} rejects '-march=${RV_MARCH} -mabi=${RV_MABI}':\n"
             "${_rv_arch_err}\n"
             "On native RISC-V hardware this usually means the system GCC predates\n"
-            "RVV 1.0 support — install a newer g++ (GCC 13+) and select it with\n"
-            "-DCROSS_CXX_BIN=/path/to/g++.\n"
+            "RVV 1.0 support — install a newer g++ (GCC 13+), or point the build at\n"
+            "one with -DCMAKE_PREFIX_PATH / -DCROSS_CXX_BIN=/path/to/g++.\n"
             "Overriding with -DRV_MARCH=rv64gc drops the V extension: the packet\n"
             "path is then lowered to scalar code and the vector-return ABI shared\n"
             "with the shader object no longer holds.")
@@ -554,7 +554,7 @@ function(rv_compile_animation name)
         add_custom_command(
             OUTPUT  ${rvbin}
             COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp
-                    ${RV_ARCH_FLAGS}
+                    -march=rv64gcv -mabi=lp64d
                     -I${PIPELINE_DIR}
                     -DANIM_NAME="${name}" -DNFRAMES=300 -DWIDTH=512 -DHEIGHT=512
                     -DSHADER_PACKET_WIDTH=${_PKT_W}
@@ -739,7 +739,7 @@ if(CROSS_CXX_BIN)
     add_custom_command(
         OUTPUT  ${_tl_bin}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O2 -static -fopenmp
-                ${RV_ARCH_FLAGS} -DSHADER_PACKET_WIDTH=${_PKT_W}
+                -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
                 ${_tl_host} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_tl_o} -o ${_tl_bin}
         DEPENDS ${_tl_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_tl_host}
         COMMENT "[rv]  texlayer.rv"
@@ -811,7 +811,7 @@ if(CROSS_CXX_BIN)
     add_custom_command(
         OUTPUT  ${_vol_bin}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O2 -static -fopenmp
-                ${RV_ARCH_FLAGS} -DSHADER_PACKET_WIDTH=${_PKT_W}
+                -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
                 -DANIM_NAME="volume" -DNFRAMES=90 -DWIDTH=256 -DHEIGHT=256
                 ${_vol_host} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_vol_o} -o ${_vol_bin}
         DEPENDS ${_vol_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_vol_host} ${CMAKE_SOURCE_DIR}/test/benchmark_options.h
@@ -881,7 +881,7 @@ if(CROSS_CXX_BIN)
     add_custom_command(
         OUTPUT  ${_vcs_bin}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O2 -static -fopenmp
-                ${RV_ARCH_FLAGS} -DSHADER_PACKET_WIDTH=${_PKT_W}
+                -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
                 -DANIM_NAME="volume_cs" -DNFRAMES=90 -DWIDTH=256 -DHEIGHT=256
                 ${_vcs_host} ${_vcs_o} -o ${_vcs_bin}
         DEPENDS ${_vcs_o} ${_vcs_host} ${CMAKE_SOURCE_DIR}/test/benchmark_options.h
@@ -998,7 +998,7 @@ function(rv_mesh_target target_name spec_name spec_value)
     add_custom_command(
         OUTPUT  ${_bin}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp
-                ${RV_ARCH_FLAGS}
+                -march=rv64gcv -mabi=lp64d
                 -DANIM_NAME="${target_name}" -DNFRAMES=300 -DWIDTH=768 -DHEIGHT=768
                 -DSHADER_PACKET_WIDTH=${_PKT_W}
                 ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_mesh.cpp
@@ -1071,7 +1071,7 @@ if(CROSS_CXX_BIN)
     add_custom_command(
         OUTPUT  ${_terrain_rv}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp
-                ${RV_ARCH_FLAGS}
+                -march=rv64gcv -mabi=lp64d
                 -I${PIPELINE_DIR}
                 -DANIM_NAME="terrain" -DNFRAMES=300 -DWIDTH=512 -DHEIGHT=512 -DVERT_COUNT=6144
                 -DSHADER_PACKET_WIDTH=${_PKT_W}
@@ -1111,7 +1111,7 @@ foreach(cs life blur)
     if(CROSS_CXX_BIN)
         set(cs_binary ${RISCV_DIR}/${cs}.rv)
         add_custom_command(OUTPUT ${cs_binary}
-            COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp ${RV_ARCH_FLAGS}
+            COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp -march=rv64gcv -mabi=lp64d
                     ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_${cs_host}.cpp
                     ${RISCV_DIR}/${cs}_cs_rv.o -o ${cs_binary}
             DEPENDS ${cs}_cs_rv.o ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_${cs_host}.cpp
