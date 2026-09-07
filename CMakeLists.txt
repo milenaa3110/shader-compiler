@@ -40,8 +40,30 @@ find_path(SPIRV_HEADERS_INCLUDE_DIR
     REQUIRED)
 message(STATUS "  spirv-headers: ${SPIRV_HEADERS_INCLUDE_DIR}")
 
-# RISC-V cross compiler (optional — only needed for `rv-*` targets).
-find_program(CROSS_CXX_BIN NAMES riscv64-linux-gnu-g++ g++)
+# ── RISC-V target toolchain ──────────────────────────────────────────────────
+# Two supported modes:
+#   native — configured ON riscv64 hardware (e.g. Banana Pi F3). The system
+#            compiler IS the RISC-V compiler, .rv binaries are executed directly,
+#            and no QEMU or /usr/riscv64-linux-gnu sysroot is involved.
+#   cross  — configured on another host. Needs riscv64-linux-gnu-g++, and QEMU
+#            to run anything that was built.
+# The plain `g++` fallback is valid ONLY natively. Accepting it on an x86 host
+# would silently pick the host compiler for every rv-* target and then fail deep
+# inside an unrelated custom command on -march=rv64gcv.
+if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^riscv64$")
+    set(RISCV_NATIVE TRUE)
+    find_program(CROSS_CXX_BIN NAMES riscv64-linux-gnu-g++ g++ c++)
+else()
+    set(RISCV_NATIVE FALSE)
+    find_program(CROSS_CXX_BIN NAMES riscv64-linux-gnu-g++)
+endif()
+if(CROSS_CXX_BIN AND RISCV_NATIVE)
+    message(STATUS "  RISC-V target: native (${CROSS_CXX_BIN})")
+elseif(CROSS_CXX_BIN)
+    message(STATUS "  RISC-V target: cross (${CROSS_CXX_BIN})")
+else()
+    message(STATUS "  RISC-V target: no compiler found (rv-* targets disabled)")
+endif()
 
 # clang is used to compile `src/runtime/tex_inline.cpp` to RV LLVM bitcode for
 # linking into shader modules (eliminates the per-fragment cross-TU call to
@@ -49,20 +71,57 @@ find_program(CROSS_CXX_BIN NAMES riscv64-linux-gnu-g++ g++)
 find_program(CLANG_CXX_BIN NAMES clang++-${LLVM_VERSION_MAJOR} clang++-18 clang++-17 clang++)
 if(CROSS_CXX_BIN AND NOT CLANG_CXX_BIN)
     message(FATAL_ERROR
-        "clang++ not found but RISC-V cross-compile is enabled.\n"
+        "clang++ not found but a RISC-V target compiler is available.\n"
         "Install clang-18 (or matching LLVM version) so tex_inline.cpp can\n"
         "be compiled to bitcode for the shader-IR link step.")
 endif()
 if(CLANG_CXX_BIN)
     message(STATUS "  clang++:   ${CLANG_CXX_BIN}")
 endif()
+# How a built .rv binary is launched. Natively it is executed as-is; only a
+# cross build needs the emulator and its sysroot. RISCV_SIM is prepended to every
+# rv-* run target, so an empty value means "run it directly".
 find_program(QEMU_RISCV    NAMES qemu-riscv64-static qemu-riscv64)
-if(QEMU_RISCV)
-    set(RISCV_SIM "${QEMU_RISCV};-L;/usr/riscv64-linux-gnu" CACHE STRING "")
-    message(STATUS "  qemu-riscv64: ${QEMU_RISCV}")
+if(RISCV_NATIVE)
+    set(RISCV_SIM "" CACHE STRING "launcher prefix for .rv binaries")
+    message(STATUS "  RISC-V execution: native (no emulator)")
+elseif(QEMU_RISCV)
+    set(RISCV_SIM "${QEMU_RISCV};-L;/usr/riscv64-linux-gnu" CACHE STRING "launcher prefix for .rv binaries")
+    message(STATUS "  RISC-V execution: ${QEMU_RISCV} (emulated)")
 else()
-    set(RISCV_SIM "" CACHE STRING "")
-    message(STATUS "  qemu-riscv64: not found (rv-* targets will skip)")
+    set(RISCV_SIM "" CACHE STRING "launcher prefix for .rv binaries")
+    message(STATUS "  RISC-V execution: qemu-riscv64 not found (rv-* run targets will skip)")
+endif()
+
+# ── RISC-V arch/ABI flags for the target compiler ────────────────────────────
+# The V extension is not optional here: pipeline_runtime.cpp and the compiled
+# shader object exchange `<4 x float>` in v-registers (see __tex2d_sample), so
+# host and shader must agree on it. A toolchain that rejects rv64gcv would build
+# an ABI-incompatible runtime, so this is checked at configure time rather than
+# left to fail — or worse, silently mismatch — much later in the build.
+set(RV_MARCH "rv64gcv" CACHE STRING "-march for the RISC-V target compiler")
+set(RV_MABI  "lp64d"   CACHE STRING "-mabi for the RISC-V target compiler")
+set(RV_ARCH_FLAGS -march=${RV_MARCH} -mabi=${RV_MABI})
+if(CROSS_CXX_BIN)
+    set(_rv_probe_src ${CMAKE_BINARY_DIR}/_rv_arch_probe.cpp)
+    set(_rv_probe_obj ${CMAKE_BINARY_DIR}/_rv_arch_probe.o)
+    file(WRITE ${_rv_probe_src} "int main(){return 0;}\n")
+    execute_process(
+        COMMAND ${CROSS_CXX_BIN} ${RV_ARCH_FLAGS} -c ${_rv_probe_src} -o ${_rv_probe_obj}
+        RESULT_VARIABLE _rv_arch_rc ERROR_VARIABLE _rv_arch_err OUTPUT_QUIET)
+    file(REMOVE ${_rv_probe_src} ${_rv_probe_obj})
+    if(NOT _rv_arch_rc EQUAL 0)
+        message(FATAL_ERROR
+            "${CROSS_CXX_BIN} rejects '-march=${RV_MARCH} -mabi=${RV_MABI}':\n"
+            "${_rv_arch_err}\n"
+            "On native RISC-V hardware this usually means the system GCC predates\n"
+            "RVV 1.0 support — install a newer g++ (GCC 13+) and select it with\n"
+            "-DCROSS_CXX_BIN=/path/to/g++.\n"
+            "Overriding with -DRV_MARCH=rv64gc drops the V extension: the packet\n"
+            "path is then lowered to scalar code and the vector-return ABI shared\n"
+            "with the shader object no longer holds.")
+    endif()
+    message(STATUS "  RISC-V arch flags: ${RV_MARCH} / ${RV_MABI}")
 endif()
 
 # ── SPMD packet width (f32 lanes) — adapts to the target RVV VLEN ────────────
@@ -74,11 +133,11 @@ set(SHADER_PACKET_WIDTH "auto" CACHE STRING
     "SPMD f32 lane count: 'auto' = VLEN/32 on native RISC-V else 4, or an integer.")
 if(SHADER_PACKET_WIDTH STREQUAL "auto")
     set(_PKT_W 4)
-    if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "riscv64" AND CROSS_CXX_BIN)
+    if(RISCV_NATIVE AND CROSS_CXX_BIN)
         file(WRITE ${CMAKE_BINARY_DIR}/_vlenb_probe.cpp
 "#include <cstdio>\nint main(){unsigned long v;__asm__ volatile(\"csrr %0, vlenb\":\"=r\"(v));printf(\"%lu\\n\",v*8);return 0;}\n")
         execute_process(
-            COMMAND ${CROSS_CXX_BIN} -O2 -static -march=rv64gcv -mabi=lp64d
+            COMMAND ${CROSS_CXX_BIN} -O2 ${RV_ARCH_FLAGS}
                     ${CMAKE_BINARY_DIR}/_vlenb_probe.cpp -o ${CMAKE_BINARY_DIR}/_vlenb_probe
             RESULT_VARIABLE _probe_cc)
         if(_probe_cc EQUAL 0)
@@ -398,7 +457,7 @@ if(CLANG_CXX_BIN)
         OUTPUT  ${TEX_INLINE_BC}
         COMMAND ${CLANG_CXX_BIN} -O1 -emit-llvm -c -std=c++20
                 --target=riscv64-linux-gnu
-                -march=rv64gcv -mabi=lp64d
+                ${RV_ARCH_FLAGS}
                 -I${PIPELINE_DIR}
                 ${TEX_INLINE_SRC}
                 -o ${TEX_INLINE_BC}
@@ -495,7 +554,7 @@ function(rv_compile_animation name)
         add_custom_command(
             OUTPUT  ${rvbin}
             COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp
-                    -march=rv64gcv -mabi=lp64d
+                    ${RV_ARCH_FLAGS}
                     -I${PIPELINE_DIR}
                     -DANIM_NAME="${name}" -DNFRAMES=300 -DWIDTH=512 -DHEIGHT=512
                     -DSHADER_PACKET_WIDTH=${_PKT_W}
@@ -680,7 +739,7 @@ if(CROSS_CXX_BIN)
     add_custom_command(
         OUTPUT  ${_tl_bin}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O2 -static -fopenmp
-                -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
+                ${RV_ARCH_FLAGS} -DSHADER_PACKET_WIDTH=${_PKT_W}
                 ${_tl_host} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_tl_o} -o ${_tl_bin}
         DEPENDS ${_tl_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_tl_host}
         COMMENT "[rv]  texlayer.rv"
@@ -752,7 +811,7 @@ if(CROSS_CXX_BIN)
     add_custom_command(
         OUTPUT  ${_vol_bin}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O2 -static -fopenmp
-                -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
+                ${RV_ARCH_FLAGS} -DSHADER_PACKET_WIDTH=${_PKT_W}
                 -DANIM_NAME="volume" -DNFRAMES=90 -DWIDTH=256 -DHEIGHT=256
                 ${_vol_host} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_vol_o} -o ${_vol_bin}
         DEPENDS ${_vol_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_vol_host} ${CMAKE_SOURCE_DIR}/test/benchmark_options.h
@@ -822,7 +881,7 @@ if(CROSS_CXX_BIN)
     add_custom_command(
         OUTPUT  ${_vcs_bin}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O2 -static -fopenmp
-                -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
+                ${RV_ARCH_FLAGS} -DSHADER_PACKET_WIDTH=${_PKT_W}
                 -DANIM_NAME="volume_cs" -DNFRAMES=90 -DWIDTH=256 -DHEIGHT=256
                 ${_vcs_host} ${_vcs_o} -o ${_vcs_bin}
         DEPENDS ${_vcs_o} ${_vcs_host} ${CMAKE_SOURCE_DIR}/test/benchmark_options.h
@@ -939,7 +998,7 @@ function(rv_mesh_target target_name spec_name spec_value)
     add_custom_command(
         OUTPUT  ${_bin}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp
-                -march=rv64gcv -mabi=lp64d
+                ${RV_ARCH_FLAGS}
                 -DANIM_NAME="${target_name}" -DNFRAMES=300 -DWIDTH=768 -DHEIGHT=768
                 -DSHADER_PACKET_WIDTH=${_PKT_W}
                 ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_mesh.cpp
@@ -951,7 +1010,7 @@ function(rv_mesh_target target_name spec_name spec_value)
         COMMENT "[rv]  ${target_name}.rv"
         VERBATIM)
     add_custom_target(${target_name}.rv DEPENDS ${_bin})
-    if(QEMU_RISCV OR CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "riscv64")
+    if(QEMU_RISCV OR RISCV_NATIVE)
         # 300 frames @ 30fps = 10s animation, matching the GPU mesh targets
         # (vk-mesh* use nframes=300). Same length keeps cross-backend
         # comparison meaningful.
@@ -1012,7 +1071,7 @@ if(CROSS_CXX_BIN)
     add_custom_command(
         OUTPUT  ${_terrain_rv}
         COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp
-                -march=rv64gcv -mabi=lp64d
+                ${RV_ARCH_FLAGS}
                 -I${PIPELINE_DIR}
                 -DANIM_NAME="terrain" -DNFRAMES=300 -DWIDTH=512 -DHEIGHT=512 -DVERT_COUNT=6144
                 -DSHADER_PACKET_WIDTH=${_PKT_W}
@@ -1052,7 +1111,7 @@ foreach(cs life blur)
     if(CROSS_CXX_BIN)
         set(cs_binary ${RISCV_DIR}/${cs}.rv)
         add_custom_command(OUTPUT ${cs_binary}
-            COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp -march=rv64gcv -mabi=lp64d
+            COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp ${RV_ARCH_FLAGS}
                     ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_${cs_host}.cpp
                     ${RISCV_DIR}/${cs}_cs_rv.o -o ${cs_binary}
             DEPENDS ${cs}_cs_rv.o ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_${cs_host}.cpp
