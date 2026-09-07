@@ -9,6 +9,7 @@
 //       mandelbrot_riscv.o -o mandelbrot.rv
 //   OMP_NUM_THREADS=8 qemu-riscv64-static -L /usr/riscv64-linux-gnu ./mandelbrot.rv
 
+#include "../benchmark_options.h"
 #include "../../src/runtime/pipeline_runtime.h"
 #include "../../src/runtime/pipeline_abi.h"
 #include "../../src/common/error_utils.h"
@@ -45,7 +46,9 @@ extern "C" float uTime;
 #define VERT_COUNT 6
 #endif
 
-int main() {
+int main(int argc, char** argv) {
+    BenchmarkWallTime wallTime;
+    BenchmarkOptions options(argc, argv);
     report_vector_config();
     constexpr int W = WIDTH, H = HEIGHT;
     mkdir("result", 0755);
@@ -73,11 +76,11 @@ int main() {
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         total_ms += ms;
 
-        if (!ffpipe) {
+        if (options.video && !ffpipe) {
             ffpipe = popen(ff_cmd, "w");
             if (!ffpipe) { logError("Cannot open ffmpeg pipe"); return 1; }
         }
-        std::fwrite(img.data(), 1, W * H * 3, ffpipe);
+        if (ffpipe) std::fwrite(img.data(), 1, W * H * 3, ffpipe);
         std::cout << "[" ANIM_NAME "] frame " << frame
                   << " t=" << uTime << "  " << ms << " ms\n";
     }
@@ -87,7 +90,7 @@ int main() {
     double avg = total_ms / NFRAMES;
     std::cout << "[" ANIM_NAME "] RISC-V avg: " << avg << " ms/frame  ("
               << (1000.0 / avg) << " fps simulated)\n";
-    std::cout << "[" ANIM_NAME "] MP4: result/" ANIM_NAME "_rv.mp4\n";
+    if (options.video) std::cout << "[" ANIM_NAME "] MP4: result/" ANIM_NAME "_rv.mp4\n";
 
     return 0;
 }

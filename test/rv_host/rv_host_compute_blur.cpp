@@ -10,6 +10,7 @@
 // Run:
 //   OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu ./blur.rv
 
+#include "../benchmark_options.h"
 #include <vector>
 #include <fstream>
 #include <iostream>
@@ -61,7 +62,9 @@ static void writePPM(const char* path, const std::vector<float>& rgba) {
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    BenchmarkWallTime wallTime;
+    BenchmarkOptions options(argc, argv);
     mkdir("result", 0755);
 
     // Generate same synthetic noise as GPU host
@@ -112,7 +115,7 @@ int main() {
     std::cout << "[blur] Throughput: "
               << (W * H / avg / 1000.0) << " Mpixels/ms\n";
 
-    writePPM("result/blur_cpu.ppm", outBuf);
-    std::cout << "[blur] Output: result/blur_cpu.ppm\n";
+    if (options.video) writePPM("result/blur_cpu.ppm", outBuf);
+    if (options.video) std::cout << "[blur] Output: result/blur_cpu.ppm\n";
     return 0;
 }

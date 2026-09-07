@@ -12,6 +12,8 @@
 //
 // Defaults: name=mesh, nframes=300, mesh-spec=icosphere:3 (1280 tris)
 
+#include "vk_benchmark_timer.h"
+#include "../benchmark_options.h"
 #include "icosphere.h"
 #include "mesh_data.h"
 #include "obj_loader.h"
@@ -87,6 +89,8 @@ static Mesh loadMesh(const std::string& spec) {
 }
 
 int main(int argc, char** argv) {
+    BenchmarkWallTime wallTime;
+    BenchmarkOptions options(argc, argv);
     const char* vertSpv  = (argc > 1) ? argv[1] : "build/spirv/mesh.vert.spv";
     const char* fragSpv  = (argc > 2) ? argv[2] : "build/spirv/mesh.frag.spv";
     const char* animName = (argc > 3) ? argv[3] : "mesh";
@@ -135,6 +139,7 @@ int main(int argc, char** argv) {
     VkDevice device;
     VK(vkCreateDevice(phys, &dCI, nullptr, &device));
     VkQueue queue; vkGetDeviceQueue(device, qFamilyIdx, 0, &queue);
+    VulkanBenchmarkTimer gpuTimer(phys, device, qFamilyIdx);
 
     VkPhysicalDeviceMemoryProperties memProps;
     vkGetPhysicalDeviceMemoryProperties(phys, &memProps);
@@ -622,6 +627,7 @@ int main(int argc, char** argv) {
         rpBegin.renderArea  = {{0,0},{(uint32_t)W,(uint32_t)H}};
         rpBegin.clearValueCount = 2; rpBegin.pClearValues = clearVals;
 
+        gpuTimer.begin(cmd);
         vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         VkDeviceSize off = 0;
@@ -652,11 +658,12 @@ int main(int argc, char** argv) {
             }
         }
         vkCmdEndRenderPass(cmd);
+        gpuTimer.end(cmd);
 
         VkBufferImageCopy region{};
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.imageExtent      = {(uint32_t)W, (uint32_t)H, 1};
-        vkCmdCopyImageToBuffer(cmd, colorImg,
+        if (options.video) vkCmdCopyImageToBuffer(cmd, colorImg,
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                readBuf, 1, &region);
         VK(vkEndCommandBuffer(cmd));
@@ -670,33 +677,36 @@ int main(int argc, char** argv) {
 
         auto t1 = std::chrono::high_resolution_clock::now();
         total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        gpuTimer.collect();
 
-        void* mapped;
-        VK(vkMapMemory(device, readMem, 0, readSz, 0, &mapped));
-        std::memcpy(pixels.data(), mapped, pixels.size());
-        vkUnmapMemory(device, readMem);
+        if (options.video) {
+            void* mapped;
+            VK(vkMapMemory(device, readMem, 0, readSz, 0, &mapped));
+            std::memcpy(pixels.data(), mapped, pixels.size());
+            vkUnmapMemory(device, readMem);
 
-        if (!ffpipe) ffpipe = popen(ff_cmd, "w");
-        if (ffpipe)
-            for (int i = 0; i < W * H; ++i) std::fwrite(pixels.data() + i*4, 1, 3, ffpipe);
+            if (!ffpipe) ffpipe = popen(ff_cmd, "w");
+            if (ffpipe)
+                for (int i = 0; i < W * H; ++i) std::fwrite(pixels.data() + i*4, 1, 3, ffpipe);
 
-        // Write PPM at a fixed frame index so cross-backend comparisons land
-        // on the same rotation regardless of NFRAMES (RV defaults to 60, GPU
-        // to 300). Falls back to NFRAMES/2 for very short runs.
-        int ppm_frame = (NFRAMES >= 60) ? 30 : (NFRAMES / 2);
-        if (frame == ppm_frame) {
-            char ppm[256];
-            std::snprintf(ppm, sizeof(ppm), "result/%s.ppm", animName);
-            writePPM(ppm, W, H, pixels.data());
+            // Write PPM at a fixed frame index so cross-backend comparisons land
+            // on the same rotation regardless of NFRAMES (RV defaults to 60, GPU
+            // to 300). Falls back to NFRAMES/2 for very short runs.
+            int ppm_frame = (NFRAMES >= 60) ? 30 : (NFRAMES / 2);
+            if (frame == ppm_frame) {
+                char ppm[256];
+                std::snprintf(ppm, sizeof(ppm), "result/%s.ppm", animName);
+                writePPM(ppm, W, H, pixels.data());
+            }
         }
     }
     if (ffpipe) pclose(ffpipe);
 
     std::cout << "[" << animName << "] tris: " << mesh.triangleCount()
               << ", verts: " << mesh.vertices.size()
-              << ", avg: " << total_ms / NFRAMES << " ms/frame  ("
+              << ", Vulkan host avg: " << total_ms / NFRAMES << " ms/frame  ("
               << 1000.0 * NFRAMES / total_ms << " fps)\n";
-    std::cout << "[" << animName << "] Output: " << mp4 << "\n";
+    if (options.video) std::cout << "[" << animName << "] Output: " << mp4 << "\n";
 
     // Cleanup (omit per-frame destroy ordering — process exit will reclaim).
     vkDestroyFence(device, fence, nullptr);
@@ -705,6 +715,16 @@ int main(int argc, char** argv) {
     vkDestroyPipelineLayout(device, pipeLayout, nullptr);
     vkDestroyShaderModule(device, vsMod, nullptr);
     vkDestroyShaderModule(device, fsMod, nullptr);
+    vkDestroyDescriptorPool(device, descPool, nullptr);
+    vkDestroyDescriptorSetLayout(device, dsLayout, nullptr);
+    vkDestroySampler(device, sampler, nullptr);
+    auto destroyMaterial = [&](const MatGPU& material) {
+        vkDestroyImageView(device, material.view, nullptr);
+        vkDestroyImage(device, material.img, nullptr);
+        vkFreeMemory(device, material.mem, nullptr);
+    };
+    for (const auto& material : matGPU) destroyMaterial(material);
+    destroyMaterial(defaultMat);
     vkDestroyFramebuffer(device, framebuffer, nullptr);
     vkDestroyRenderPass(device, renderPass, nullptr);
     vkDestroyImageView(device, depthView, nullptr);
@@ -715,6 +735,8 @@ int main(int argc, char** argv) {
     vkDestroyBuffer(device, vbo, nullptr);       vkFreeMemory(device, vboMem, nullptr);
     vkDestroyBuffer(device, ibo, nullptr);       vkFreeMemory(device, iboMem, nullptr);
     vkDestroyBuffer(device, staging, nullptr);   vkFreeMemory(device, stagingMem, nullptr);
+    gpuTimer.report(NFRAMES, "frame");
+    gpuTimer.close();
     vkDestroyDevice(device, nullptr);
     vkDestroyInstance(instance, nullptr);
     return 0;

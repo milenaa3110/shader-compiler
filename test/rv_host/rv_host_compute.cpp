@@ -14,6 +14,7 @@
 // Run:
 //   OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu ./life.rv
 
+#include "../benchmark_options.h"
 #include <vector>
 #include <iostream>
 #include <fstream>
@@ -62,8 +63,11 @@ static void writePPM(const char* path, int W, int H, const uint32_t* cells) {
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    BenchmarkWallTime wallTime;
+    BenchmarkOptions options(argc, argv);
     constexpr int W = GRID, H = GRID, N = NGENERATIONS;
+    const int snapEvery = options.video ? (SNAP_EVERY > 0 ? SNAP_EVERY : 1) : 0;
     std::cout << "Game of Life: " << W << "x" << H
               << " grid, " << N << " generations\n";
 #ifdef _OPENMP
@@ -78,18 +82,19 @@ int main() {
         curBuf[i] = (rng() % 10 < 3) ? 1u : 0u;
 
     mkdir("result", 0755);
-    if (SNAP_EVERY > 0)
+    if (snapEvery > 0)
         std::cout << "[life-cpu] Animation mode: saving frame every "
-                  << SNAP_EVERY << " generations\n";
+                  << snapEvery << " generations\n";
 
     // Set push constants once (grid size doesn't change)
     width  = (uint32_t)W;
     height = (uint32_t)H;
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+    double render_ms = 0;
     int frameIdx = 0;
 
     for (int gen = 0; gen < N; gen++) {
+        auto t0 = std::chrono::high_resolution_clock::now();
         src = (void*)curBuf.data();
         dst = (void*)nxtBuf.data();
 
@@ -98,16 +103,16 @@ int main() {
             cs_dispatch_row((uint32_t)y, (uint32_t)W);
 
         std::swap(curBuf, nxtBuf);
+        render_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
 
-        if constexpr (SNAP_EVERY > 0) if (gen % SNAP_EVERY == 0) {
+        if (snapEvery > 0 && (gen + 1) % snapEvery == 0) {
             char path[256];
             std::snprintf(path, sizeof(path), "result/life_cpu_%04d.ppm", frameIdx++);
             writePPM(path, W, H, curBuf.data());
         }
     }
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double total_ms = render_ms;
     double per_gen  = total_ms / N;
     double mpx_ms   = (double)W * H / 1e6 / per_gen;
 
@@ -117,13 +122,13 @@ int main() {
               << "  " << mpx_ms << " Mpx/ms\n";
 
     // Save final state (only in non-animation mode)
-    if (SNAP_EVERY == 0) {
+    if (options.video && snapEvery == 0) {
         writePPM("result/life_cpu.ppm", W, H, curBuf.data());
         std::cout << "[life-cpu] Final state: result/life_cpu.ppm\n";
     }
 
     // Encode MP4 if animation frames were saved, then delete PPMs
-    if (SNAP_EVERY > 0 && frameIdx > 1) {
+    if (snapEvery > 0 && frameIdx > 1) {
         char cmd_str[512];
         std::snprintf(cmd_str, sizeof(cmd_str),
             "ffmpeg -y -framerate 30 -i result/life_cpu_%%04d.ppm "

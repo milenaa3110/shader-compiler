@@ -10,6 +10,8 @@
 //
 // Build: g++ -std=c++20 -O2 test/vk_host/vk_host_compute.cpp -o build/spirv/spirv_vulkan_life_host -lvulkan
 
+#include "vk_benchmark_timer.h"
+#include "../benchmark_options.h"
 #include <vulkan/vulkan.h>
 #include "../../src/common/error_utils_fmt.h"
 #include "vk_pick_device.h"
@@ -46,10 +48,12 @@ static std::vector<uint32_t> readSpv(const char* path) {
 }
 
 int main(int argc, char** argv) {
+    BenchmarkWallTime wallTime;
+    BenchmarkOptions options(argc, argv);
     const char* spvPath  = (argc > 1) ? argv[1] : "result/life.comp.spv";
     int NGENERATIONS     = (argc > 2) ? std::atoi(argv[2]) : 1000;
     int GRID             = (argc > 3) ? std::atoi(argv[3]) : 256;
-    int SNAP_EVERY       = (argc > 4) ? std::atoi(argv[4]) : 0;  // 0 = no animation
+    int SNAP_EVERY       = options.video ? ((argc > 4) ? std::atoi(argv[4]) : 1) : 0;  // 0 = no animation
 
     std::cout << "Game of Life: " << GRID << "x" << GRID
               << " grid, " << NGENERATIONS << " generations\n";
@@ -101,6 +105,7 @@ int main(int argc, char** argv) {
     devCI.queueCreateInfoCount = 1; devCI.pQueueCreateInfos = &qCI;
     VkDevice device; VK(vkCreateDevice(physDev, &devCI, nullptr, &device));
     VkQueue queue; vkGetDeviceQueue(device, qFamilyIdx, 0, &queue);
+    VulkanBenchmarkTimer gpuTimer(physDev, device, qFamilyIdx);
 
     // ── Ping-pong storage buffers ─────────────────────────────────────────────
     VkDeviceSize bufSz = (VkDeviceSize)GRID * GRID * sizeof(uint32_t);
@@ -232,10 +237,14 @@ int main(int argc, char** argv) {
     genBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     genBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
+    double render_ms = 0;
+    std::chrono::high_resolution_clock::time_point submitStart;
     auto recordBatch = [&](int startGen, int count) {
+        submitStart = std::chrono::high_resolution_clock::now();
         VkCommandBufferBeginInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         VK(vkBeginCommandBuffer(cmd, &bi));
+        gpuTimer.begin(cmd);
         for (int i = 0; i < count; i++) {
             int gen = startGen + i;
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
@@ -250,6 +259,7 @@ int main(int argc, char** argv) {
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     0, 1, &genBarrier, 0, nullptr, 0, nullptr);
         }
+        gpuTimer.end(cmd);
         VK(vkEndCommandBuffer(cmd));
     };
 
@@ -259,6 +269,8 @@ int main(int argc, char** argv) {
         si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
         VK(vkQueueSubmit(queue, 1, &si, fence));
         VK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+        render_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - submitStart).count();
+        gpuTimer.collect();
         VK(vkResetFences(device, 1, &fence));
         VK(vkResetCommandBuffer(cmd, 0));
     };
@@ -277,21 +289,17 @@ int main(int argc, char** argv) {
         vkUnmapMemory(device, mems[bufIdx]);
     };
 
-    // ── Warmup (2 generations, barriers, one submit) ──────────────────────────
-    recordBatch(0, 2);
-    submitAndWait();
+    // Fresh seeded state for each invocation; runner handles warmup.
 
     mkdir("result", 0755);
 
     // ── Timed run ─────────────────────────────────────────────────────────────
-    // Warmup used gens 0-1 (even count), so timed run starts at gen 2.
-    // Because 2 is even, descSets[gen&1] indexing is unchanged.
-    auto t0 = std::chrono::high_resolution_clock::now();
+    // Start from the original seeded state on every invocation.
     int frameIdx = 0;
 
     if (SNAP_EVERY == 0) {
         // Benchmark: all generations in one command buffer, one submit
-        recordBatch(2, NGENERATIONS);
+        recordBatch(0, NGENERATIONS);
         submitAndWait();
     } else {
         // Animation: batch SNAP_EVERY gens per submit so we can readback frames
@@ -299,26 +307,25 @@ int main(int argc, char** argv) {
                   << SNAP_EVERY << " generations\n";
         for (int base = 0; base < NGENERATIONS; base += SNAP_EVERY) {
             int batch = std::min(SNAP_EVERY, NGENERATIONS - base);
-            recordBatch(2 + base, batch);
+            recordBatch(base, batch);
             submitAndWait();
             char path[256];
             std::snprintf(path, sizeof(path), "result/life_gpu_%04d.ppm", frameIdx++);
-            saveFrame((2 + base + batch) & 1, path);
+            saveFrame((base + batch) & 1, path);
         }
     }
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double total_ms = render_ms;
     double per_gen  = total_ms / NGENERATIONS;
     double mpx_ms   = (double)GRID * GRID / 1e6 / per_gen;
 
     std::cout << "[life-gpu] " << NGENERATIONS << " generations in " << total_ms << " ms\n";
-    std::cout << "[life-gpu] avg: " << per_gen << " ms/gen"
+    std::cout << "[life-gpu] Vulkan host avg: " << per_gen << " ms/gen"
               << "  (" << 1000.0 / per_gen << " gen/s)"
               << "  " << mpx_ms << " Mpx/ms\n";
 
     // Save final state (only in non-animation mode)
-    if (SNAP_EVERY == 0) {
+    if (options.video && SNAP_EVERY == 0) {
         saveFrame(NGENERATIONS & 1, "result/life_gpu.ppm");
         std::cout << "[life-gpu] Final state: result/life_gpu.ppm\n";
     }
@@ -352,6 +359,8 @@ int main(int argc, char** argv) {
         vkDestroyBuffer(device, bufs[b], nullptr);
         vkFreeMemory(device, mems[b], nullptr);
     }
+    gpuTimer.report(NGENERATIONS, "gen");
+    gpuTimer.close();
     vkDestroyDevice(device, nullptr);
     vkDestroyInstance(instance, nullptr);
     return 0;

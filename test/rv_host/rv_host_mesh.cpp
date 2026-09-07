@@ -8,6 +8,7 @@
 //     icosphere:N   — generated unit icosphere (N subdivision levels)
 //     <path.obj>    — Wavefront OBJ (positions + normals; missing normals computed)
 
+#include "../benchmark_options.h"
 #include "../vk_host/icosphere.h"
 #include "../vk_host/mesh_data.h"
 #include "../vk_host/obj_loader.h"
@@ -68,6 +69,8 @@ static Mesh loadMesh(const std::string& spec) {
 }
 
 int main(int argc, char** argv) {
+    BenchmarkWallTime wallTime;
+    BenchmarkOptions options(argc, argv);
     report_vector_config();
     const char* name      = (argc > 1) ? argv[1] : ANIM_NAME;
     int          nframes  = (argc > 2) ? std::atoi(argv[2]) : NFRAMES;
@@ -208,14 +211,14 @@ int main(int argc, char** argv) {
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         total_ms += ms;
 
-        if (!ffpipe) ffpipe = popen(ff_cmd, "w");
+        if (options.video && !ffpipe) ffpipe = popen(ff_cmd, "w");
         if (ffpipe) std::fwrite(img.data(), 1, img.size(), ffpipe);
 
         // Write PPM at a fixed frame index so cross-backend comparisons land
         // on the same rotation regardless of NFRAMES (RV defaults to 60, GPU
         // to 300). Falls back to nframes/2 for very short runs.
         int ppm_frame = (nframes >= 60) ? 30 : (nframes / 2);
-        if (frame == ppm_frame) {
+        if (options.video && frame == ppm_frame) {
             char ppm[256];
             std::snprintf(ppm, sizeof(ppm), "result/%s_rv.ppm", name);
             FILE* f = std::fopen(ppm, "wb");
@@ -232,6 +235,6 @@ int main(int argc, char** argv) {
               << ", verts: " << mesh.vertices.size()
               << ", RISC-V avg: " << total_ms / nframes << " ms/frame ("
               << 1000.0 * nframes / total_ms << " fps simulated)\n";
-    std::cout << "[" << name << "] MP4: result/" << name << "_rv.mp4\n";
+    if (options.video) std::cout << "[" << name << "] MP4: result/" << name << "_rv.mp4\n";
     return 0;
 }

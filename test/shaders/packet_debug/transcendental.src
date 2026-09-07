@@ -1,0 +1,8 @@
+uniform float uTime;
+in vec2 vUV;
+out vec4 FragColor;
+@entry @stage(fragment) fn void main() {
+    float a = sin(vUV.x + uTime);
+    float b = cos(vUV.y + uTime);
+    FragColor = vec4(a, b, a * b, 1.0);
+}

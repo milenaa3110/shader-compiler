@@ -238,6 +238,14 @@ add_test(NAME packet_runtime
 # self-contained. Needs python3 (the SPIR-V opcode counter); skipped if absent.
 # ─────────────────────────────────────────────────────────────────────────────
 find_program(PYTHON3_EXE NAMES python3)
+if(PYTHON3_EXE AND UNIX)
+    add_test(NAME packet_benchmark_harness
+        COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/test/script/test_packet_benchmark.py)
+    set_tests_properties(packet_benchmark_harness PROPERTIES TIMEOUT 180)
+    add_test(NAME benchmark_modes
+        COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/test/script/test_benchmark_modes.py)
+    set_tests_properties(benchmark_modes PROPERTIES TIMEOUT 60)
+endif()
 if(PYTHON3_EXE)
     add_test(NAME compare_backends
              COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target compare-backends)
@@ -474,7 +482,7 @@ function(rv_compile_animation name)
         COMMAND ${LLVM_OPT_BIN} -O3 --enable-unsafe-fp-math --fp-contract=fast -S
                 ${ll} -o ${gvnll}
         COMMAND ${LLVM_OPT_BIN} -load-pass-plugin=${SINCOS_PLUGIN_PATH}
-                -passes=sincos-opt,mem2reg,instcombine -S ${gvnll} -o ${optll}
+                -passes=sincos-opt -S ${gvnll} -o ${optll}
         COMMAND ${LLVM_LLC_BIN} -O3 --fp-contract=fast -filetype=obj
                 -relocation-model=pic -mtriple=riscv64-unknown-linux-gnu
                 -mattr=+m,+a,+f,+d,+v ${optll} -o ${obj}
@@ -493,7 +501,7 @@ function(rv_compile_animation name)
                     -DSHADER_PACKET_WIDTH=${_PKT_W}
                     ${RV_HOST_SRC} ${PIPELINE_DIR}/pipeline_runtime.cpp
                     ${obj} -o ${rvbin}
-            DEPENDS ${obj} ${PIPELINE_DIR}/pipeline_runtime.cpp ${RV_HOST_SRC}
+            DEPENDS ${obj} ${PIPELINE_DIR}/pipeline_runtime.cpp ${RV_HOST_SRC} ${CMAKE_SOURCE_DIR}/test/benchmark_options.h
             COMMENT "[rv]  ${name}.rv"
             VERBATIM)
         add_custom_target(${name}.rv DEPENDS ${rvbin})
@@ -514,13 +522,38 @@ spv_compile_vertex(quad ${ANIM_SHADER_DIR}/quad_vs.src)
 # (uniform/constant matrices, matrix builtins, whole-matrix arithmetic).
 spv_compile_vertex(matdemo ${ANIM_SHADER_DIR}/matdemo_vs.src)
 
+# Every run target is no-video by default; video is a separate explicit target.
+function(add_benchmark_run_target name)
+    cmake_parse_arguments(RUN "VERBATIM" "WORKING_DIRECTORY" "COMMAND;DEPENDS" ${ARGN})
+    if(name MATCHES "^rv-" AND NOT name MATCHES "^rv-(life|blur|volume-cs)$")
+        foreach(mode scalar packet)
+            add_custom_target(${name}-${mode}
+                COMMAND ${RUN_COMMAND} --no-video --packet-mode ${mode}
+                DEPENDS ${RUN_DEPENDS}
+                WORKING_DIRECTORY ${RUN_WORKING_DIRECTORY} VERBATIM USES_TERMINAL)
+        endforeach()
+        add_custom_target(${name} DEPENDS ${name}-packet)
+        set(video_mode --packet-mode packet)
+    else()
+        add_custom_target(${name}
+            COMMAND ${RUN_COMMAND} --no-video
+            DEPENDS ${RUN_DEPENDS}
+            WORKING_DIRECTORY ${RUN_WORKING_DIRECTORY} VERBATIM USES_TERMINAL)
+        set(video_mode)
+    endif()
+    add_custom_target(${name}-video
+        COMMAND ${RUN_COMMAND} --video ${video_mode}
+        DEPENDS ${RUN_DEPENDS}
+        WORKING_DIRECTORY ${RUN_WORKING_DIRECTORY} VERBATIM USES_TERMINAL)
+endfunction()
+
 # Per-animation Vulkan fragment + RISC-V object/binary.
 foreach(anim ${ANIMATIONS_PROC})
     spv_compile_fragment(${anim} ${ANIM_SHADER_DIR}/${anim}_fs.src)
     rv_compile_animation(${anim})
 
     # Render targets matching the old Makefile's vk-<name> / rv-<name>.
-    add_custom_target(vk-${anim}
+    add_benchmark_run_target(vk-${anim}
         COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_host>
                 ${SPV_DIR}/quad.vert.spv ${SPV_DIR}/${anim}.frag.spv
                 ${anim} 300 512 512
@@ -528,7 +561,7 @@ foreach(anim ${ANIMATIONS_PROC})
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         VERBATIM)
     if(CROSS_CXX_BIN)
-        add_custom_target(rv-${anim}
+        add_benchmark_run_target(rv-${anim}
             COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}" "SHADER_PACKET=1"
                     ${RISCV_SIM} ${RISCV_DIR}/${anim}.rv
             DEPENDS ${anim}.rv
@@ -536,6 +569,12 @@ foreach(anim ${ANIMATIONS_PROC})
             VERBATIM)
     endif()
 endforeach()
+
+add_benchmark_run_target(vk-texture
+    COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_texture_host>
+            ${SPV_DIR}/quad.vert.spv ${SPV_DIR}/texture_test.frag.spv texture_test 300 512 512
+    DEPENDS spirv_vulkan_texture_host quad.vert.spv texture_test.frag.spv
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} VERBATIM)
 
 # texture_test only has a RISC-V variant in the old Makefile.
 rv_compile_animation(texture_test)
@@ -566,7 +605,7 @@ foreach(cs life blur)
         COMMAND ${LLVM_OPT_BIN} -O3 --enable-unsafe-fp-math --fp-contract=fast -S
                 ${ll} -o ${gvnll}
         COMMAND ${LLVM_OPT_BIN} -load-pass-plugin=${SINCOS_PLUGIN_PATH}
-                -passes=sincos-opt,mem2reg,instcombine -S ${gvnll} -o ${optll}
+                -passes=sincos-opt -S ${gvnll} -o ${optll}
         COMMAND ${LLVM_LLC_BIN} -O3 --fp-contract=fast -filetype=obj
                 -relocation-model=pic -mtriple=riscv64-unknown-linux-gnu
                 -mattr=+m,+a,+f,+d,+v ${optll} -o ${obj}
@@ -670,7 +709,7 @@ spv_compile_fragment(volume ${ANIM_SHADER_DIR}/volume_fs.src)
 
 # GPU render: uploads the same baked volume as a VK_IMAGE_TYPE_3D and binds it
 # to the combined image sampler the shader declares at set 0 binding 0.
-add_custom_target(vk-volume
+add_benchmark_run_target(vk-volume
     COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_volume_host>
             ${SPV_DIR}/quad.vert.spv ${SPV_DIR}/volume.frag.spv
             volume 90 256 256
@@ -716,14 +755,13 @@ if(CROSS_CXX_BIN)
                 -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
                 -DANIM_NAME="volume" -DNFRAMES=90 -DWIDTH=256 -DHEIGHT=256
                 ${_vol_host} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_vol_o} -o ${_vol_bin}
-        DEPENDS ${_vol_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_vol_host}
+        DEPENDS ${_vol_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${_vol_host} ${CMAKE_SOURCE_DIR}/test/benchmark_options.h
         COMMENT "[rv]  volume.rv"
         VERBATIM)
     add_custom_target(volume.rv DEPENDS ${_vol_bin})
 
-    # Scalar render: the packetizer has no vec3-sampler path, so a packet build
-    # would fall back per-pixel anyway.
-    add_custom_target(rv-volume
+    # Packet mode reports partial support when the FS sampler path falls back.
+    add_benchmark_run_target(rv-volume
         COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}"
                 ${RISCV_SIM} ${RISCV_DIR}/volume.rv
         DEPENDS volume.rv
@@ -744,7 +782,7 @@ endif()
 # ─────────────────────────────────────────────────────────────────────────────
 spv_compile_compute(volume ${ANIM_SHADER_DIR}/volume_cs.src)
 
-add_custom_target(vk-volume-cs
+add_benchmark_run_target(vk-volume-cs
     COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_volume_cs_host>
             ${SPV_DIR}/volume.comp.spv volume_cs 90 256 256
     DEPENDS spirv_vulkan_volume_cs_host volume.comp.spv
@@ -787,12 +825,12 @@ if(CROSS_CXX_BIN)
                 -march=rv64gcv -mabi=lp64d -DSHADER_PACKET_WIDTH=${_PKT_W}
                 -DANIM_NAME="volume_cs" -DNFRAMES=90 -DWIDTH=256 -DHEIGHT=256
                 ${_vcs_host} ${_vcs_o} -o ${_vcs_bin}
-        DEPENDS ${_vcs_o} ${_vcs_host}
+        DEPENDS ${_vcs_o} ${_vcs_host} ${CMAKE_SOURCE_DIR}/test/benchmark_options.h
         COMMENT "[rv]  volume_cs.rv"
         VERBATIM)
     add_custom_target(volume_cs.rv DEPENDS ${_vcs_bin})
 
-    add_custom_target(rv-volume-cs
+    add_benchmark_run_target(rv-volume-cs
         COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}"
                 ${RISCV_SIM} ${RISCV_DIR}/volume_cs.rv
         DEPENDS volume_cs.rv
@@ -812,35 +850,35 @@ spv_compile_fragment(mesh ${ANIM_SHADER_DIR}/mesh_fs.src)
 
 # Default `vk-mesh` runs an icosphere with subdivision level 3 (1280 triangles).
 # Override with: cmake --build build --target vk-mesh-bunny  (loads test/assets/bunny.obj)
-add_custom_target(vk-mesh
+add_benchmark_run_target(vk-mesh
     COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             mesh 300 icosphere:3
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     VERBATIM)
-add_custom_target(vk-mesh-hi
+add_benchmark_run_target(vk-mesh-hi
     COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             mesh_hi 300 icosphere:5
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     VERBATIM)
-add_custom_target(vk-mesh-bunny
+add_benchmark_run_target(vk-mesh-bunny
     COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             bunny 300 ${CMAKE_SOURCE_DIR}/test/assets/bunny.obj
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     VERBATIM)
-add_custom_target(vk-mesh-jeep
+add_benchmark_run_target(vk-mesh-jeep
     COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             jeep 300 ${CMAKE_SOURCE_DIR}/test/assets/Jeep_Renegade_2016.obj
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     VERBATIM)
-add_custom_target(vk-mesh-teddy
+add_benchmark_run_target(vk-mesh-teddy
     COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             teddy 300 ${CMAKE_SOURCE_DIR}/test/assets/teddy-bear/teddy-bear.obj
@@ -850,7 +888,7 @@ add_custom_target(vk-mesh-teddy
 # OBJ filename has a space ("Rumba Dancing.obj") — quote at expansion time so
 # the shell gets one argument. obj_loader resolves map_Kd relative to the OBJ
 # dir, so the texture is picked up automatically.
-add_custom_target(vk-mesh-boss
+add_benchmark_run_target(vk-mesh-boss
     COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_mesh_host>
             ${SPV_DIR}/mesh.vert.spv ${SPV_DIR}/mesh.frag.spv
             boss 300 "${CMAKE_SOURCE_DIR}/test/assets/boss/Rumba Dancing.obj"
@@ -884,7 +922,7 @@ add_custom_command(
     COMMAND ${LLVM_OPT_BIN} -O3 --enable-unsafe-fp-math --fp-contract=fast -S
             ${_mesh_ll} -o ${_mesh_gvnll}
     COMMAND ${LLVM_OPT_BIN} -load-pass-plugin=${SINCOS_PLUGIN_PATH}
-            -passes=sincos-opt,mem2reg,instcombine -S ${_mesh_gvnll} -o ${_mesh_optll}
+            -passes=sincos-opt -S ${_mesh_gvnll} -o ${_mesh_optll}
     COMMAND ${LLVM_LLC_BIN} -O3 --fp-contract=fast -filetype=obj
             -relocation-model=pic -mtriple=riscv64-unknown-linux-gnu
             -mattr=+m,+a,+f,+d,+v ${_mesh_optll} -o ${_mesh_o}
@@ -909,14 +947,15 @@ function(rv_mesh_target target_name spec_name spec_value)
                 ${_mesh_o} -o ${_bin}
         DEPENDS ${_mesh_o} ${PIPELINE_DIR}/pipeline_runtime.cpp
                 ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_mesh.cpp
+                ${CMAKE_SOURCE_DIR}/test/benchmark_options.h
         COMMENT "[rv]  ${target_name}.rv"
         VERBATIM)
     add_custom_target(${target_name}.rv DEPENDS ${_bin})
-    if(QEMU_RISCV)
+    if(QEMU_RISCV OR CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "riscv64")
         # 300 frames @ 30fps = 10s animation, matching the GPU mesh targets
         # (vk-mesh* use nframes=300). Same length keeps cross-backend
         # comparison meaningful.
-        add_custom_target(rv-${target_name}
+        add_benchmark_run_target(rv-${target_name}
             COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}" "SHADER_PACKET=1"
                     ${RISCV_SIM} ${_bin} ${target_name} 300 ${spec_value}
             DEPENDS ${_bin}
@@ -961,7 +1000,7 @@ add_custom_command(
     COMMAND ${LLVM_OPT_BIN} -O3 --enable-unsafe-fp-math --fp-contract=fast -S
             ${_terrain_ll} -o ${_terrain_gvnll}
     COMMAND ${LLVM_OPT_BIN} -load-pass-plugin=${SINCOS_PLUGIN_PATH}
-            -passes=sincos-opt,mem2reg,instcombine -S ${_terrain_gvnll} -o ${_terrain_optll}
+            -passes=sincos-opt -S ${_terrain_gvnll} -o ${_terrain_optll}
     COMMAND ${LLVM_LLC_BIN} -O3 --fp-contract=fast -filetype=obj
             -relocation-model=pic -mtriple=riscv64-unknown-linux-gnu
             -mattr=+m,+a,+f,+d,+v ${_terrain_optll} -o ${_terrain_o}
@@ -979,12 +1018,52 @@ if(CROSS_CXX_BIN)
                 -DSHADER_PACKET_WIDTH=${_PKT_W}
                 ${RV_HOST_SRC} ${PIPELINE_DIR}/pipeline_runtime.cpp
                 ${_terrain_o} -o ${_terrain_rv}
-        DEPENDS ${_terrain_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${RV_HOST_SRC}
+        DEPENDS ${_terrain_o} ${PIPELINE_DIR}/pipeline_runtime.cpp ${RV_HOST_SRC} ${CMAKE_SOURCE_DIR}/test/benchmark_options.h
         VERBATIM)
     add_custom_target(terrain.rv DEPENDS ${_terrain_rv})
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
+add_benchmark_run_target(vk-terrain
+    COMMAND ${VK_RUN_ENV} $<TARGET_FILE:spirv_vulkan_host>
+            ${SPV_DIR}/terrain.vert.spv ${SPV_DIR}/terrain.frag.spv terrain 300 512 512 6144
+    DEPENDS spirv_vulkan_host terrain.vert.spv terrain.frag.spv
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} VERBATIM)
+if(CROSS_CXX_BIN)
+    add_benchmark_run_target(rv-terrain
+        COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}"
+                ${RISCV_SIM} ${RISCV_DIR}/terrain.rv
+        DEPENDS terrain.rv WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} VERBATIM)
+endif()
+
+foreach(cs life blur)
+    if(cs STREQUAL "life")
+        set(cs_host compute)
+        set(vk_host spirv_vulkan_life_host)
+        set(vk_args 1000 256)
+    else()
+        set(cs_host compute_blur)
+        set(vk_host spirv_vulkan_compute_host)
+        set(vk_args blur 100)
+    endif()
+    add_benchmark_run_target(vk-${cs}
+        COMMAND ${VK_RUN_ENV} $<TARGET_FILE:${vk_host}> ${SPV_DIR}/${cs}.comp.spv ${vk_args}
+        DEPENDS ${vk_host} ${cs}.comp.spv WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} VERBATIM)
+    if(CROSS_CXX_BIN)
+        set(cs_binary ${RISCV_DIR}/${cs}.rv)
+        add_custom_command(OUTPUT ${cs_binary}
+            COMMAND ${CROSS_CXX_BIN} -std=c++20 -O3 -static -fopenmp -march=rv64gcv -mabi=lp64d
+                    ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_${cs_host}.cpp
+                    ${RISCV_DIR}/${cs}_cs_rv.o -o ${cs_binary}
+            DEPENDS ${cs}_cs_rv.o ${CMAKE_SOURCE_DIR}/test/rv_host/rv_host_${cs_host}.cpp
+                    ${CMAKE_SOURCE_DIR}/test/benchmark_options.h VERBATIM)
+        add_custom_target(${cs}.rv DEPENDS ${cs_binary})
+        add_benchmark_run_target(rv-${cs}
+            COMMAND ${CMAKE_COMMAND} -E env "OMP_NUM_THREADS=${NTHREADS}" ${RISCV_SIM} ${cs_binary}
+            DEPENDS ${cs}.rv WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} VERBATIM)
+    endif()
+endforeach()
+
 # Phony aggregation targets (mirror the old Makefile)
 # ─────────────────────────────────────────────────────────────────────────────
 # `all-vk`: build every Vulkan animation .spv, render each via the host.
@@ -1035,47 +1114,47 @@ add_custom_target(check
     USES_TERMINAL)
 
 add_custom_target(benchmark-fragment
-    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+    COMMAND ${CMAKE_COMMAND} -E env "BUILD_DIR=${CMAKE_BINARY_DIR}" "NTHREADS=${NTHREADS}"
             bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_fragment.sh
     DEPENDS irgen_riscv spirv_vulkan_host quad.vert.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
 
 add_custom_target(benchmark-fragment-quick
-    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+    COMMAND ${CMAKE_COMMAND} -E env "BUILD_DIR=${CMAKE_BINARY_DIR}" "NTHREADS=${NTHREADS}"
             bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_fragment.sh --quick
     DEPENDS irgen_riscv spirv_vulkan_host quad.vert.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
 
 add_custom_target(benchmark-compute
-    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_compute.sh --tiny
+    COMMAND ${CMAKE_COMMAND} -E env "BUILD_DIR=${CMAKE_BINARY_DIR}" "NTHREADS=${NTHREADS}" bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_compute.sh --tiny
     DEPENDS spirv_vulkan_life_host life.comp.spv life_cs_rv.o
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
 
 add_custom_target(benchmark-compute-blur
-    COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_compute_blur.sh
+    COMMAND ${CMAKE_COMMAND} -E env "BUILD_DIR=${CMAKE_BINARY_DIR}" "NTHREADS=${NTHREADS}" bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_compute_blur.sh
     DEPENDS spirv_vulkan_compute_host blur.comp.spv blur_cs_rv.o
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
 
 add_custom_target(benchmark-vertex
-    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+    COMMAND ${CMAKE_COMMAND} -E env "BUILD_DIR=${CMAKE_BINARY_DIR}" "NTHREADS=${NTHREADS}"
             bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_vertex.sh
     DEPENDS spirv_vulkan_host terrain.vert.spv terrain.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
 
 add_custom_target(benchmark-mesh
-    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+    COMMAND ${CMAKE_COMMAND} -E env "BUILD_DIR=${CMAKE_BINARY_DIR}" "NTHREADS=${NTHREADS}"
             bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_mesh.sh
     DEPENDS spirv_vulkan_mesh_host mesh.vert.spv mesh.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
 
 add_custom_target(benchmark-diverge
-    COMMAND ${CMAKE_COMMAND} -E env "SHADER_PACKET=1"
+    COMMAND ${CMAKE_COMMAND} -E env "BUILD_DIR=${CMAKE_BINARY_DIR}" "NTHREADS=${NTHREADS}"
             bash ${CMAKE_SOURCE_DIR}/test/script/run_benchmark_diverge.sh
     DEPENDS spirv_vulkan_host irgen_riscv quad.vert.spv mandelbrot.frag.spv diverge.frag.spv
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -1117,6 +1196,18 @@ add_custom_target(compare-backends
 # rather than needing to be remembered here.
 # ─────────────────────────────────────────────────────────────────────────────
 get_property(SPV_MODULES GLOBAL PROPERTY SPV_MODULES)
+if(PYTHON3_EXE)
+    set(PACKET_BENCH_DEPS mesh_rv.o)
+    foreach(anim ${ANIMATIONS_PROC})
+        list(APPEND PACKET_BENCH_DEPS ${anim}_rv.o)
+    endforeach()
+    add_custom_target(benchmark-packet-pipeline
+        COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/test/script/bench_packet_pipeline.py
+                --build-dir ${CMAKE_BINARY_DIR} --existing-objects
+        DEPENDS ${PACKET_BENCH_DEPS}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        USES_TERMINAL)
+endif()
 add_custom_target(spirv-validate
     COMMAND bash ${CMAKE_SOURCE_DIR}/test/script/run_spirv_val.sh --no-build
     DEPENDS ${SPV_MODULES}

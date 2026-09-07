@@ -93,6 +93,12 @@ static void check_packet_width() {
 // Print the detected VLEN and the compiled packet width, warning on a suboptimal
 // or mismatched pairing. Called from the RISC-V host startup banners.
 void report_vector_config() {
+    const bool requested = std::getenv("SHADER_PACKET") != nullptr;
+    std::fprintf(stderr, "[pipeline] mode=%s VS=%s FS=%s packet_width=%d fallback=%s\n",
+        requested ? "packet" : "scalar", requested && vs_packet ? "packet" : "scalar",
+        requested && fs_packet ? "packet" : "scalar", PACKET_W,
+        !requested ? "none" : (!vs_packet && !fs_packet) ? "all-scalar" :
+        (!vs_packet || !fs_packet) ? "mixed" : "none");
     unsigned vlen = get_vlen_bits();
     if (vlen == 0) {
         std::fprintf(stderr, "[pipeline] packet width=%d lanes (VLEN unknown — non-V build)\n",
@@ -288,7 +294,15 @@ void render_pipeline(const PipelineDesc& desc, unsigned char* rgb_out) {
     }
 
     // Parallel Per-Tile Rasterization & Fragment Execution
+#ifdef SHADER_PACKET_BENCH
+    // Benchmark-only selection holds VS execution fixed and captures real FS batches.
+    extern bool packet_bench_enabled;
+    extern bool packet_bench_capture;
+    extern void packet_bench_record(int, int, const float*, const float*);
+    const bool packetMode = (fs_packet != nullptr) && packet_bench_enabled;
+#else
     const bool packetMode = (fs_packet != nullptr) && (std::getenv("SHADER_PACKET") != nullptr);
+#endif
     if (packetMode) check_packet_width();
 
     #pragma omp parallel
@@ -319,6 +333,9 @@ void render_pipeline(const PipelineDesc& desc, unsigned char* rgb_out) {
                 for (int k = 0; k < nvar; ++k) b_vary[k * PACKET_W + l] = b_vary[k * PACKET_W];
                 for (int c = 0; c < 4; ++c)    b_frag[c * PACKET_W + l] = b_frag[c * PACKET_W];
             }
+#ifdef SHADER_PACKET_BENCH
+            if (packet_bench_capture) packet_bench_record(bn, nvar, b_vary, b_frag);
+#endif
             fs_packet(b_vary, b_frag, osoa, live);
             for (int l = 0; l < bn; ++l) {
                 if (!live[l]) continue;

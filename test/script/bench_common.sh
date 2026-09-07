@@ -14,9 +14,9 @@ BOLD="\033[1m"
 RESET="\033[0m"
 
 # ── Host environment ─────────────────────────────────────────────────────────
-NTHREADS="$(nproc)"
+NTHREADS="${NTHREADS:-$(nproc)}"
 SYSROOT="/usr/riscv64-linux-gnu"
-BUILD_DIR="build"
+BUILD_DIR="${BUILD_DIR:-build}"
 HOST_ARCH="$(uname -m)"
 
 # ── Build helpers (CMake) ────────────────────────────────────────────────────
@@ -24,13 +24,11 @@ HOST_ARCH="$(uname -m)"
 # build_all                      — build everything (configure if needed)
 build_target() {
     [[ -d "$BUILD_DIR" ]] || cmake -S . -B "$BUILD_DIR" >/dev/null
-    cmake --build "$BUILD_DIR" -j"$NTHREADS" --target "$@" 2>&1 \
-        | grep -E "^(g\+\+|riscv|error)" || true
+    cmake --build "$BUILD_DIR" -j"$NTHREADS" --target "$@"
 }
 build_all() {
     [[ -d "$BUILD_DIR" ]] || cmake -S . -B "$BUILD_DIR" >/dev/null
-    cmake --build "$BUILD_DIR" -j"$NTHREADS" 2>&1 \
-        | grep -E "^(g\+\+|riscv|error)" || true
+    cmake --build "$BUILD_DIR" -j"$NTHREADS"
 }
 
 # ── RISC-V execution: native hardware or QEMU emulation ──────────────────────
@@ -83,7 +81,10 @@ fi
 # Works for: spirv_vulkan_host ("avg: X"), bench_host ("RISC-V avg: X"),
 #            spirv_vulkan_life_host ("avg: X"), life_host ("avg: X").
 parse_avg() {
-    echo "$1" | grep -oE 'avg: [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "N/A"
+    local label='avg:' value
+    if [[ "$1" == *"Vulkan device:"* ]]; then label='Vulkan device avg:'; fi
+    value=$(printf '%s\n' "$1" | sed -nE "s/.*${label} ([0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?) ms.*/\\1/p" | head -1)
+    printf '%s\n' "${value:-N/A}"
 }
 
 # ── median_of <runs> <command…> ───────────────────────────────────────────────

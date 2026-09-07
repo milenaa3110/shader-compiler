@@ -6,6 +6,7 @@
 #include "../../frontend/sema/sema.h"
 #include "../codegen_state/codegen_state.h"
 #include "../../common/error_utils_fmt.h"
+#include "../../common/compile_profile.h"
 
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/FileSystem.h>
@@ -30,10 +31,12 @@ static void InitializeModule() {
 }
 
 int main(int argc, char* argv[]) {
+    CompileProfile profile;
     const char* outPath = (argc >= 2) ? argv[1] : "module.spv";
 
     InitializeModule();
     NamedValues.clear();
+    profile.mark("initialize");
 
     // Slurp the whole shader from stdin; the source string must outlive
     // ParseProgram (the lexer views into it).
@@ -41,8 +44,10 @@ int main(int argc, char* argv[]) {
                         std::istreambuf_iterator<char>());
     diag::setSource(source);  // enable caret diagnostics for parse/sema/codegen
 
+    profile.mark("read_source");
     ASTContext astCtx;
     auto nodes = ParseProgram(astCtx, source);
+    profile.mark("lex_parse");
     if (nodes.empty()) {
         logError("[irgen_spirv] Parse failed or empty program");
         return 1;
@@ -54,6 +59,8 @@ int main(int argc, char* argv[]) {
         logError("[irgen_spirv] Semantic analysis failed");
         return 1;
     }
+
+    profile.mark("sema");
 
     // Forward-declare all structs so codegen handles out-of-order field
     // references — see main_lib_riscv.cpp.
@@ -68,6 +75,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+
+    profile.mark("llvm_codegen");
 
     if (llvm::verifyModule(*TheModule, &llvm::errs())) {
         logError("[irgen_spirv] Invalid LLVM module");
@@ -91,6 +100,8 @@ int main(int argc, char* argv[]) {
         TheModule->print(llvm::errs(), nullptr);
     }
 
+    profile.mark("verify_stage");
+
     // Translate LLVM IR -> SPIR-V binary directly.
     std::vector<uint8_t> spv = emitSPIRVFromIR(*TheModule, stage);
     if (spv.empty()) {
@@ -98,17 +109,22 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    profile.mark("spirv_emit");
+
     std::ofstream out(outPath, std::ios::binary);
     if (!out) {
         logErrorFmt("[irgen_spirv] Cannot write {}", outPath);
         return 1;
     }
     out.write(reinterpret_cast<const char*>(spv.data()), spv.size());
+    out.flush();
     if (!out) {
         logErrorFmt("[irgen_spirv] Write failed for {}", outPath);
         return 1;
     }
 
+    profile.mark("write_output");
+    profile.report();
     std::cout << "Wrote " << outPath << " (" << spv.size() << " bytes)\n";
     return 0;
 }

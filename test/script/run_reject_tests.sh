@@ -65,6 +65,8 @@ run_reject() {
     # Every EXPECT-ERROR substring must appear in the diagnostics.
     local missing=0 pattern
     while IFS= read -r pattern; do
+        # EXPECT-ERROR directives may come from a Windows CRLF checkout.
+        pattern="${pattern%$'\r'}"
         [ -n "$pattern" ] || continue
         if ! grep -qF -- "$pattern" <<<"$out"; then
             log "  ${RED}FAIL${RESET}  ${name}  (missing expected diagnostic: ${pattern})"

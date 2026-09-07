@@ -15,6 +15,8 @@
 //   set 0 binding 1  storage image,          OpTypeImage %float 2D  (Sampled=2)
 //   local size 16x16x1
 
+#include "vk_benchmark_timer.h"
+#include "../benchmark_options.h"
 #include <sys/stat.h>
 #include <vulkan/vulkan.h>
 
@@ -74,6 +76,8 @@ struct PushConsts {
 };
 
 int main(int argc, char** argv) {
+  BenchmarkWallTime wallTime;
+  BenchmarkOptions options(argc, argv);
   const char* compSpv = (argc > 1) ? argv[1] : "result/volume.comp.spv";
   const char* animName = (argc > 2) ? argv[2] : "volume_cs";
   if (argc > 3) NFRAMES = std::atoi(argv[3]);
@@ -146,6 +150,7 @@ int main(int argc, char** argv) {
   VK(vkCreateDevice(pd, &dci, nullptr, &dev));
   VkQueue queue;
   vkGetDeviceQueue(dev, qfi, 0, &queue);
+  VulkanBenchmarkTimer gpuTimer(pd, dev, qfi);
 
   VkCommandPool cmdPool;
   {
@@ -460,6 +465,7 @@ int main(int argc, char** argv) {
   for (int frame = 0; frame < NFRAMES; frame++) {
     PushConsts pc{frame / FPS, (uint32_t)W, (uint32_t)H};
 
+    auto t0 = std::chrono::high_resolution_clock::now();
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd, &cbbi);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
@@ -467,7 +473,9 @@ int main(int argc, char** argv) {
                             1, &ds, 0, nullptr);
     vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(pc), &pc);
-    vkCmdDispatch(cmd, gx, gy, 1);
+    gpuTimer.begin(cmd);
+        vkCmdDispatch(cmd, gx, gy, 1);
+    gpuTimer.end(cmd);
 
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -483,11 +491,10 @@ int main(int argc, char** argv) {
     VkBufferImageCopy bic{};
     bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     bic.imageExtent = {(uint32_t)W, (uint32_t)H, 1};
-    vkCmdCopyImageToBuffer(cmd, outImg, VK_IMAGE_LAYOUT_GENERAL, readBuf, 1,
+    if (options.video) vkCmdCopyImageToBuffer(cmd, outImg, VK_IMAGE_LAYOUT_GENERAL, readBuf, 1,
                            &bic);
     vkEndCommandBuffer(cmd);
 
-    auto t0 = std::chrono::high_resolution_clock::now();
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
@@ -495,34 +502,37 @@ int main(int argc, char** argv) {
     VK(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
     auto t1 = std::chrono::high_resolution_clock::now();
     total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    gpuTimer.collect();
 
     vkResetFences(dev, 1, &fence);
     vkResetCommandBuffer(cmd, 0);
 
-    float* ptr;
-    VK(vkMapMemory(dev, readMem, 0, readSize, 0, (void**)&ptr));
-    for (int i = 0; i < W * H; ++i)
-      for (int c = 0; c < 3; ++c) {
-        float v = ptr[(size_t)i * 4 + c];
-        v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
-        rgb[(size_t)i * 3 + c] = (uint8_t)(v * 255.f + 0.5f);
-      }
-    vkUnmapMemory(dev, readMem);
+    if (options.video) {
+      float* ptr;
+      VK(vkMapMemory(dev, readMem, 0, readSize, 0, (void**)&ptr));
+      for (int i = 0; i < W * H; ++i)
+        for (int c = 0; c < 3; ++c) {
+          float v = ptr[(size_t)i * 4 + c];
+          v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+          rgb[(size_t)i * 3 + c] = (uint8_t)(v * 255.f + 0.5f);
+        }
+      vkUnmapMemory(dev, readMem);
 
-    if (!ffpipe) {
-      ffpipe = popen(ff_cmd, "w");
-      if (!ffpipe) { logError("Cannot open ffmpeg pipe"); return 1; }
+      if (!ffpipe) {
+        ffpipe = popen(ff_cmd, "w");
+        if (!ffpipe) { logError("Cannot open ffmpeg pipe"); return 1; }
+      }
+      std::fwrite(rgb.data(), 1, rgb.size(), ffpipe);
     }
-    std::fwrite(rgb.data(), 1, rgb.size(), ffpipe);
     std::cout << "[" << animName << "] frame " << frame << " (t=" << pc.uTime
               << ")\n";
   }
   if (ffpipe) pclose(ffpipe);
 
   double avg = total_ms / NFRAMES;
-  std::cout << "[" << animName << "] Vulkan avg: " << avg << " ms/frame  ("
+  std::cout << "[" << animName << "] Vulkan host avg: " << avg << " ms/frame  ("
             << (1000.0 / avg) << " fps)\n";
-  std::cout << "[" << animName << "] MP4: result/" << animName << ".mp4\n";
+  if (options.video) std::cout << "[" << animName << "] MP4: result/" << animName << ".mp4\n";
 
   vkDestroyFence(dev, fence, nullptr);
   vkDestroyPipeline(dev, pipeline, nullptr);
@@ -542,6 +552,8 @@ int main(int argc, char** argv) {
   vkDestroyBuffer(dev, stageBuf, nullptr);
   vkFreeMemory(dev, stageMem, nullptr);
   vkDestroyCommandPool(dev, cmdPool, nullptr);
+  gpuTimer.report(NFRAMES, "frame");
+  gpuTimer.close();
   vkDestroyDevice(dev, nullptr);
   vkDestroyInstance(instance, nullptr);
   return 0;

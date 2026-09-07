@@ -8,6 +8,7 @@
 #include "../../frontend/sema/sema.h"
 #include "../codegen_state/codegen_state.h"
 #include "../../common/error_utils_fmt.h"
+#include "../../common/compile_profile.h"
 
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/FileSystem.h>
@@ -29,9 +30,11 @@ static void InitializeModule() {
 }
 
 int main(int argc, char* argv[]) {
+    CompileProfile profile;
     const char* outPath = (argc >= 2) ? argv[1] : "module.ll";
     InitializeModule();
     NamedValues.clear();
+    profile.mark("initialize");
 
     // Slurp the whole shader from stdin;
     std::string source((std::istreambuf_iterator<char>(std::cin)),
@@ -39,13 +42,17 @@ int main(int argc, char* argv[]) {
     diag::setSource(source);  // enable diagnostics for parse/sema/codegen
 
     // Per-compilation arena. Drop after codegen finishes.
+    profile.mark("read_source");
     ASTContext astCtx;
     auto nodes = ParseProgram(astCtx, source);
+    profile.mark("lex_parse");
     if (nodes.empty()) { logError("Parse failed or program is empty"); return 1; }
 
     // Post-parse semantic pass
     SemanticAnalyzer sema(astCtx);
     if (sema.run(nodes) != 0) { logError("Semantic analysis failed"); return 1; }
+
+    profile.mark("sema");
 
     // Forward-declare all structs so codegen can resolve out-of-order
     for (auto* n : nodes) {
@@ -57,6 +64,8 @@ int main(int argc, char* argv[]) {
         if (n && !n->codegen()) { logError("Codegen failed"); return 1; }
     }
 
+    profile.mark("llvm_codegen");
+
     // Emit pipeline trampolines for stage-entry shaders
     bool hasStageEntry = false;
     for (auto& F : *TheModule)
@@ -65,6 +74,8 @@ int main(int argc, char* argv[]) {
         logError("Pipeline trampoline emission failed");
         return 1;
     }
+
+    profile.mark("trampolines");
 
     // Route B: emit a width-W SPMD `fs_packet` variant of the fragment shader
     // when it is within the packetizer's supported subset. Always attempted (the
@@ -80,6 +91,8 @@ int main(int argc, char* argv[]) {
                       << (ok ? std::to_string(fspacket::kW) + ")" : "unsupported constructs)")
                       << "\n";
     }
+
+    profile.mark("packetize");
 
     // Build-width marker: the runtime checks this against its PACKET_W. A width
     // mismatch would silently corrupt the SoA stride, so make it a loud failure.
@@ -111,10 +124,15 @@ int main(int argc, char* argv[]) {
         logError("Invalid LLVM module"); return 1;
     }
 
+    profile.mark("target_verify");
+
     std::error_code EC;
     llvm::raw_fd_ostream OS(outPath, EC, llvm::sys::fs::OF_Text);
     if (EC) { logErrorFmt("Cannot open {}: {}", outPath, EC.message()); return 1; }
     TheModule->print(OS, nullptr);
+    OS.flush();
+    profile.mark("write_output");
+    profile.report();
     std::cout << "Wrote " << outPath << " (RISC-V + RVV target)\n";
     return 0;
 }

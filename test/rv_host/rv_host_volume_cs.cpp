@@ -16,6 +16,7 @@
 // globals that a pure compute module does not emit. The only things this host
 // needs from it are the sampler/image slot tables that tex_inline.cpp resolves
 // against, so it defines those directly instead of dragging in the rasterizer.
+#include "../benchmark_options.h"
 #include "../../src/runtime/tex_inline.h"
 #include "../../src/common/error_utils.h"
 #include "../volume_data.h"
@@ -61,7 +62,9 @@ extern "C" void cs_dispatch_row(uint32_t y, uint32_t width);
 
 static constexpr int N = voldata::kN;
 
-int main() {
+int main(int argc, char** argv) {
+    BenchmarkWallTime wallTime;
+    BenchmarkOptions options(argc, argv);
     constexpr int W = WIDTH, H = HEIGHT;
     mkdir("result", 0755);
 
@@ -106,6 +109,7 @@ int main() {
         total_ms += ms;
 
 #if !BENCH_ONLY
+        if (options.video) {
         for (int i = 0; i < W * H; ++i) {
             const float* p = &out[(size_t)i * 4];
             for (int c = 0; c < 3; ++c) {
@@ -113,11 +117,12 @@ int main() {
                 rgb[(size_t)i * 3 + c] = (unsigned char)(v * 255.f + 0.5f);
             }
         }
-        if (!ffpipe) {
+        if (options.video && !ffpipe) {
             ffpipe = popen(ff_cmd, "w");
             if (!ffpipe) { logError("Cannot open ffmpeg pipe"); return 1; }
         }
-        std::fwrite(rgb.data(), 1, rgb.size(), ffpipe);
+        if (ffpipe) std::fwrite(rgb.data(), 1, rgb.size(), ffpipe);
+        }
 #endif
         std::cout << "[" ANIM_NAME "] frame " << frame
                   << " t=" << uTime << "  " << ms << " ms\n";
@@ -131,7 +136,7 @@ int main() {
     std::cout << "[" ANIM_NAME "] RISC-V avg: " << avg << " ms/frame  ("
               << (1000.0 / avg) << " fps simulated)\n";
 #if !BENCH_ONLY
-    std::cout << "[" ANIM_NAME "] MP4: result/" ANIM_NAME "_rv.mp4\n";
+    if (options.video) std::cout << "[" ANIM_NAME "] MP4: result/" ANIM_NAME "_rv.mp4\n";
 #endif
     return 0;
 }

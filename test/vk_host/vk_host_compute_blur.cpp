@@ -13,6 +13,8 @@
 // Build: g++ -std=c++20 -O2 -o build/spirv/spirv_vulkan_compute_host \
 //            test/vk_host/vk_host_compute_blur.cpp -lvulkan
 
+#include "vk_benchmark_timer.h"
+#include "../benchmark_options.h"
 #include <vulkan/vulkan.h>
 #include "../../src/common/error_utils_fmt.h"
 #include "vk_pick_device.h"
@@ -93,6 +95,8 @@ static void writePPM(const char* path, int w, int h, const float* rgba) {
 }
 
 int main(int argc, char** argv) {
+    BenchmarkWallTime wallTime;
+    BenchmarkOptions options(argc, argv);
     const char* compSpv  = (argc > 1) ? argv[1] : "result/blur.comp.spv";
     const char* outName  = (argc > 2) ? argv[2] : "blur";
     if (argc > 3) NRUNS  = std::atoi(argv[3]);
@@ -141,6 +145,7 @@ int main(int argc, char** argv) {
 
     VkQueue queue;
     vkGetDeviceQueue(dev, qfi, 0, &queue);
+    VulkanBenchmarkTimer gpuTimer(pd, dev, qfi);
 
     // ── Buffers: inBuf, outBuf (host-visible for easy read/write) ─────────────
     VkDeviceSize bufSize = (VkDeviceSize)W * H * 4 * sizeof(float);
@@ -282,34 +287,37 @@ int main(int argc, char** argv) {
 
     double total_ms = 0.0;
     for (int run = 0; run < NRUNS; run++) {
-        VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        auto t0 = std::chrono::high_resolution_clock::now();
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         vkBeginCommandBuffer(cmd, &cbbi);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &ds, 0, nullptr);
         vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, pushData);
+        gpuTimer.begin(cmd);
         vkCmdDispatch(cmd, gx, gy, 1);
+        gpuTimer.end(cmd);
         vkEndCommandBuffer(cmd);
 
-        auto t0 = std::chrono::high_resolution_clock::now();
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
         VK(vkQueueSubmit(queue, 1, &si, fence));
         VK(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
         auto t1 = std::chrono::high_resolution_clock::now();
 
         total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    gpuTimer.collect();
         vkResetFences(dev, 1, &fence);
         vkResetCommandBuffer(cmd, 0);
     }
 
     double avg = total_ms / NRUNS;
-    std::cout << "[" << outName << "] GPU avg: " << avg << " ms/run  ("
+    std::cout << "[" << outName << "] Vulkan host avg: " << avg << " ms/run  ("
               << (1000.0 / avg) << " runs/s)\n";
     std::cout << "[" << outName << "] Throughput: "
               << (W * H / avg / 1000.0) << " Mpixels/ms\n";
 
     // ── Read back and save PPM ────────────────────────────────────────────────
-    {
+    if (options.video) {
         float* ptr;
         VK(vkMapMemory(dev, outMem, 0, bufSize, 0, (void**)&ptr));
         char path[256];
@@ -329,6 +337,8 @@ int main(int argc, char** argv) {
     vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
     vkDestroyBuffer(dev, inBuf, nullptr); vkFreeMemory(dev, inMem, nullptr);
     vkDestroyBuffer(dev, outBuf, nullptr); vkFreeMemory(dev, outMem, nullptr);
+    gpuTimer.report(NRUNS, "run");
+    gpuTimer.close();
     vkDestroyDevice(dev, nullptr);
     vkDestroyInstance(instance, nullptr);
     return 0;

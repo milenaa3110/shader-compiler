@@ -1,10 +1,10 @@
 # GLSL Compiler — RISC-V + Vulkan SPIR-V
 
-A research compiler for a GLSL-inspired language that compiles shaders to two targets:
-- **RISC-V LLVM IR** — runs on CPU via QEMU, parallelised with OpenMP, with optional RVV (RISC-V Vector Extension) auto-vectorisation
-- **Vulkan SPIR-V** — runs on GPU via the Vulkan API (LavaPipe software renderer or real GPU)
+A research compiler for a GLSL-inspired language in which shaders are compiled to two targets:
+- **RISC-V LLVM IR** — run on CPU via QEMU, parallelised with OpenMP, with optional RVV (RISC-V Vector Extension) auto-vectorisation
+- **Vulkan SPIR-V** — run on GPU via the Vulkan API (LavaPipe software renderer or real GPU)
 
-The primary goal is to compare GPU and CPU execution of the same shader logic, measure GPU dispatch overhead, observe OpenMP thread scaling, and demonstrate RVV vectorisation.
+The primary goal is that GPU and CPU execution of the same shader logic is compared, GPU dispatch overhead is measured, OpenMP thread scaling is observed, and RVV vectorisation is demonstrated.
 
 ---
 
@@ -32,7 +32,7 @@ The primary goal is to compare GPU and CPU execution of the same shader logic, m
 │   │   ├── rv_host_compute.cpp       Game of Life CPU host
 │   │   ├── rv_host_compute_blur.cpp  Gaussian blur CPU host
 │   │   └── rv_host_mesh.cpp          indexed mesh CPU host
-│   ├── vk_host/        Vulkan host programs (run on the host, drive the GPU)
+│   ├── vk_host/        Vulkan host programs (run on the host, driving the GPU)
 │   │   ├── vk_host_fragment.cpp      offscreen animation renderer
 │   │   ├── vk_host_compute.cpp       Game of Life Vulkan host
 │   │   ├── vk_host_compute_blur.cpp  Gaussian blur Vulkan host
@@ -74,11 +74,11 @@ sudo apt install ffmpeg
 
 ## Build
 
-The project uses CMake. A one-time configure populates `build/`, after which any incremental rebuild is `cmake --build build`:
+CMake is used by the project. `build/` is populated by a one-time configure, after which any incremental rebuild is `cmake --build build`:
 
 ```bash
-# First-time configure (Release by default)
-cmake -S . -B build
+# First-time configure with optimization enabled
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
 # Build everything: build/{riscv/irgen_riscv, spirv/irgen_spirv,
 #                          spirv/spirv_vulkan_*, llvm/sincos_opt.so}
@@ -95,7 +95,7 @@ cmake --build build --target benchmark-fragment
 rm -rf build result
 ```
 
-Configuration discovers LLVM 18 (or 17), libfmt, Vulkan, spirv-headers, the RISC-V cross compiler (`riscv64-linux-gnu-g++`), and `qemu-riscv64-static`. Each is auto-detected — only LLVM, fmt, Vulkan, and spirv-headers are strictly required.
+LLVM 18 (or 17), libfmt, Vulkan, spirv-headers, the RISC-V cross compiler (`riscv64-linux-gnu-g++`), and `qemu-riscv64-static` are discovered during configuration. Each is auto-detected — only LLVM, fmt, Vulkan, and spirv-headers are strictly required.
 
 ---
 
@@ -117,7 +117,7 @@ shader_fs.src
                               vk_host_fragment + Vulkan API (LavaPipe) → frames → MP4
 ```
 
-The sincos pass fuses `sin(x) + cos(x)` pairs into a single `sincosf(x, &s, &c)` call after `opt -O3` has unified duplicate arguments via GVN.
+`sin(x) + cos(x)` pairs are fused by the sincos pass into a single `sincosf(x, &s, &c)` call after duplicate arguments have been unified by `opt -O3` via GVN.
 
 ---
 
@@ -125,19 +125,19 @@ The sincos pass fuses `sin(x) + cos(x)` pairs into a single `sincosf(x, &s, &c)`
 
 All targets are invoked via `cmake --build build --target <name>`. The naming pattern:
 
-- **`vk-<shader>` / `rv-<shader>`** — render one animation on the GPU (Vulkan) or
-  CPU (RISC-V via QEMU) → `result/<shader>.mp4`. `all-vk` / `all-rv` build every one.
+- **`vk-<shader>` / `rv-<shader>`** — one animation is rendered on the GPU (Vulkan) or
+  CPU (RISC-V via QEMU) → `result/<shader>.mp4`. Every one is built by `all-vk` / `all-rv`.
 - **`vk-mesh*` / `rv-mesh*`** — the indexed-mesh demo (procedural icosphere or a
-  Wavefront OBJ: bunny, jeep, teddy, boss). Same `mesh_vs.src` + `mesh_fs.src` for
-  both backends; textured OBJs draw one `usemtl` range at a time with the matching
-  `map_Kd` bound, sampled through the `llvm-link`'d bilinear sampler in
-  `tex_inline.cpp`. The RISC-V rasterizer is two-pass tile-based, so it scales to
-  the 1.5M-tri teddy without a per-triangle barrier. Renders 768×768.
+  Wavefront OBJ: bunny, jeep, teddy, boss). The same `mesh_vs.src` + `mesh_fs.src` are
+  used for both backends; for textured OBJs one `usemtl` range is drawn at a time with
+  the matching `map_Kd` bound, sampled through the `llvm-link`'d bilinear sampler in
+  `tex_inline.cpp`. The RISC-V rasterizer is two-pass tile-based, so the 1.5M-tri teddy
+  is handled without a per-triangle barrier. Rendered at 768×768.
 - **`benchmark-*` / `cpu-scaling`** — GPU-vs-CPU benchmarks (fragment, vertex,
   mesh, compute, compute-blur, diverge) and the OpenMP/RVV scaling analysis.
-- **`check`** — compiler unit tests (compile all test shaders, validate IR with `llvm-as`).
+- **`check`** — compiler unit tests (all test shaders are compiled, IR is validated with `llvm-as`).
 
-See **[TESTING.md](TESTING.md)** for the full target list, benchmark options, and what each measures.
+The full target list, benchmark options, and what each measures are given in **[TESTING.md](TESTING.md)**.
 
 ---
 
@@ -156,7 +156,7 @@ See **[TESTING.md](TESTING.md)** for the full target list, benchmark options, an
 - Logical: `&&`, `||`, `!` — with short-circuit evaluation via conditional branches and phi nodes
 
 ### Control flow
-`if` / `else`, `while`, `for`, `break`, `return`. Every basic block has an explicit terminator; `void` functions without an explicit `return` get `ret void` automatically.
+`if` / `else`, `while`, `for`, `break`, `return`. An explicit terminator is emitted for every basic block; `ret void` is added automatically to `void` functions without an explicit `return`.
 
 ### Built-in functions
 `sin`, `cos`, `sqrt`, `floor`, `fract`, `dot`, `length`, `normalize`, `mix`, `clamp`, `min`, `max`, `mod`
@@ -179,7 +179,7 @@ uniform vec3  lightPos;
 uniform mat4x4 MVP;
 ```
 
-`vec3` uniforms require 16-byte alignment — host structs must add a `_pad` field:
+16-byte alignment is required for `vec3` uniforms — a `_pad` field must be added to host structs:
 ```cpp
 struct Vec3Uniform { float x, y, z, _pad; };
 ```
@@ -202,7 +202,7 @@ opt-18 -O3 --enable-unsafe-fp-math --fp-contract=fast -S combined.ll -o opt.ll
 
 # 4. sincos pass
 opt-18 --load-pass-plugin=build/llvm/sincos_opt.so \
-       -passes='sincos-opt,mem2reg,instcombine' -S opt.ll -o final.ll
+       -passes='sincos-opt' -S opt.ll -o final.ll
 
 # 5. Compile to RISC-V object
 llc-18 -O3 --fp-contract=fast -filetype=obj \
@@ -220,7 +220,7 @@ OMP_NUM_THREADS=$(nproc) qemu-riscv64-static -L /usr/riscv64-linux-gnu ./mandelb
 
 ### SPIR-V path
 
-The SPIR-V path is a single C++ translation unit ([emit_spirv_from_ir.h](src/codegen/emit/emit_spirv_from_ir.h)) that walks the LLVM IR and writes SPIR-V opcodes directly using the Khronos `spirv-headers`. No glslang, no `llvm-spirv`, no LLVM SPIR-V backend target — just a hand-rolled module-walker (~750 lines) that maps:
+The SPIR-V path is a single C++ translation unit ([emit_spirv_from_ir.h](src/codegen/emit/emit_spirv_from_ir.h)) in which the LLVM IR is walked and SPIR-V opcodes are written directly using the Khronos `spirv-headers`. No glslang, no `llvm-spirv`, no LLVM SPIR-V backend target — just a hand-rolled module-walker (~750 lines), in which the following are mapped:
 
 - `fadd/fsub/fmul/fdiv` → `OpFAdd / OpFSub / OpFMul / OpFDiv`
 - `fcmp/icmp/select` → `OpFOrd* / OpS* / OpSelect`
@@ -231,7 +231,7 @@ The SPIR-V path is a single C++ translation unit ([emit_spirv_from_ir.h](src/cod
 - `br i1` → `OpBranchConditional` preceded by `OpSelectionMerge` or `OpLoopMerge` (recovered from block-name patterns: `for.cond`, `then`/`ifend`, `logical.rhs`/`logical.merge`)
 - External float globals → packed into a `Block`-decorated struct in `PushConstant` storage; loads rewritten to `OpAccessChain + OpLoad`
 - Function args (`gl_FragCoord`, `vUV`, …) → `Input` `OpVariable`s with `BuiltIn` / `Location` decorations
-- The `_out` trampoline pointer chain that `ast.cpp` codegens for the RISC-V ABI is detected and elided
+- The `_out` trampoline pointer chain codegen'd by `ast.cpp` for the RISC-V ABI is detected and elided
 
 ```bash
 # 1. Compile shader → .spv (no glslang involved)
@@ -249,7 +249,7 @@ spirv-val shader.frag.spv
 
 ## Error handling
 
-All errors are routed through the helpers in [error_utils.h](src/common/error_utils.h) (basic logger, no fmt dependency — safe for cross-compiled riscv64 sources) and [error_utils_fmt.h](src/common/error_utils_fmt.h) (adds `logErrorFmt` / `logErrorContext`, requires `fmt::fmt` to be linked). Every error message is written to `stderr` with a `[ERROR]` prefix; `stdout` carries normal program output and benchmark results.
+All errors are routed through the helpers in [error_utils.h](src/common/error_utils.h) (basic logger, no fmt dependency — safe for cross-compiled riscv64 sources) and [error_utils_fmt.h](src/common/error_utils_fmt.h) (`logErrorFmt` / `logErrorContext` are added; `fmt::fmt` must be linked). Every error message is written to `stderr` with a `[ERROR]` prefix; normal program output and benchmark results are carried on `stdout`.
 
 Caught categories include:
 - Syntax errors, type mismatches
@@ -261,5 +261,5 @@ Caught categories include:
 
 ---
 
-For benchmark details and test categories see [TESTING.md](TESTING.md).
-For source layout and design decisions see [ARCHITECTURE.md](ARCHITECTURE.md).
+Benchmark details and test categories are covered in [TESTING.md](TESTING.md).
+Source layout and design decisions are covered in [ARCHITECTURE.md](ARCHITECTURE.md).
