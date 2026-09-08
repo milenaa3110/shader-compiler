@@ -11,6 +11,7 @@
 #include <llvm/IR/Intrinsics.h>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,11 @@ class PacketEmitter {
     struct LocalVar {
         std::vector<AllocaInst*> slots;
         const glsl::Type* ty = nullptr;
+        // Uniform locals hold ONE scalar per component instead of <W x T>. Reads
+        // splat it back, so every consumer stays unchanged; the splat/extract
+        // round-trip folds away in InstCombine, leaving scalar arithmetic that
+        // SCEV can actually reason about.
+        bool uniform = false;
     };
     std::map<std::string, LocalVar> localVars_;
     std::map<std::string, std::vector<AllocaInst*>> outAlloca_;
@@ -115,10 +121,233 @@ class PacketEmitter {
     PacketValue emitTexture(CallExprAST* c);
     PacketValue emitBuiltin(CallExprAST* c);
 
+    // ── Uniformity (divergence) analysis ─────────────────────────────────────
+    // Values that provably hold the same result in every lane do not need to be
+    // vectorized, and a loop whose trip count is lane-independent does not need
+    // the mask/or-reduce latch. That latch is what hides the trip count from
+    // SCEV: the exit test becomes a reduction over a loop-carried mask instead
+    // of an affine expression, so LLVM cannot unroll and nothing constant-folds.
+    //
+    // The analysis is a maximal fixpoint: every local starts optimistically
+    // uniform and divergence is propagated until the set stops growing. It only
+    // ever grows over a finite set of names, so the loop terminates.
+    std::set<std::string> divergentVars_;    // locals proven lane-dependent
+    std::set<const ExprAST*> uniformLoops_;  // loops with a lane-independent trip count
+
+    bool isUniformExpr(const ExprAST* e) const;
+    bool hasBreakOrContinue(const ExprAST* s) const;
+    void scanUniformity(const ExprAST* s, bool divergentCF, bool& changed);
+    void analyzeUniformity(const ExprAST* body);
+
+    // ── Branch-on-any-active ─────────────────────────────────────────────────
+    // If-conversion computes both arms unconditionally and blends. That is the
+    // right trade for a couple of arithmetic ops, but not for an arm holding
+    // transcendentals or a loop that no lane in this packet even wants.
+    bool containsDiscard(const ExprAST* s) const;
+    bool armWorthBranching(const ExprAST* s) const;
+
     // Structural generation passes
     void emitStmt(ExprAST* s);
-    void emitLoop(ExprAST* cond, ExprAST* body, ExprAST* incr);
+    void emitMaskedArm(ExprAST* arm, const char* tag);
+    void emitLoop(const ExprAST* node, ExprAST* cond, ExprAST* body, ExprAST* incr);
+    void emitUniformLoop(ExprAST* cond, ExprAST* body, ExprAST* incr);
 };
+
+// An expression is uniform when nothing lane-dependent reaches it. Anything the
+// switch does not model is reported divergent, so a new node kind degrades to
+// today's behaviour rather than to a miscompile.
+inline bool PacketEmitter::isUniformExpr(const ExprAST* e) const {
+    if (!e) return true;
+    using K = ExprAST::Kind;
+    switch (e->getKind()) {
+        case K::Number:
+        case K::Boolean:
+            return true;
+        case K::Variable: {
+            const auto* v = llvm::cast<VariableExprAST>(e);
+            // Per-lane sources: shader inputs, the fragment/vertex position
+            // builtins, and outputs (written through masked blends).
+            if (varyings_.count(v->Name) || outputs_.count(v->Name)) return false;
+            if (v->Name == "gl_FragCoord" || v->Name == "gl_VertexID") return false;
+            // gl_InstanceID and module-level `uniform`s are lane-invariant.
+            return !divergentVars_.count(v->Name);
+        }
+        case K::Unary:
+            return isUniformExpr(llvm::cast<UnaryExprAST>(e)->Operand);
+        case K::Binary: {
+            const auto* b = llvm::cast<BinaryExprAST>(e);
+            return isUniformExpr(b->LHS) && isUniformExpr(b->RHS);
+        }
+        case K::Ternary: {
+            const auto* t = llvm::cast<TernaryExprAST>(e);
+            return isUniformExpr(t->Cond) && isUniformExpr(t->ThenExpr) &&
+                   isUniformExpr(t->ElseExpr);
+        }
+        case K::MemberAccess:
+            return isUniformExpr(llvm::cast<MemberAccessExprAST>(e)->Object);
+        case K::Call: {
+            const auto* c = llvm::cast<CallExprAST>(e);
+            for (const ExprAST* a : c->Args)
+                if (!isUniformExpr(a)) return false;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+// Break/continue make the trip count lane-dependent once they sit under a
+// divergent condition. Rather than prove that case, any loop carrying either is
+// left on the masked path. Nested loops own their own, so they are not searched.
+inline bool PacketEmitter::hasBreakOrContinue(const ExprAST* s) const {
+    if (!s) return false;
+    using K = ExprAST::Kind;
+    switch (s->getKind()) {
+        case K::Break:
+        case K::Continue:
+            return true;
+        case K::Block:
+            for (const ExprAST* st : llvm::cast<BlockExprAST>(s)->Statements)
+                if (hasBreakOrContinue(st)) return true;
+            return false;
+        case K::If: {
+            const auto* i = llvm::cast<IfExprAST>(s);
+            return hasBreakOrContinue(i->ThenExpr) || hasBreakOrContinue(i->ElseExpr);
+        }
+        default:
+            return false;
+    }
+}
+
+inline void PacketEmitter::scanUniformity(const ExprAST* s, bool divergentCF, bool& changed) {
+    if (!s) return;
+    using K = ExprAST::Kind;
+    auto markDivergent = [&](const std::string& n) {
+        if (divergentVars_.insert(n).second) changed = true;
+    };
+    switch (s->getKind()) {
+        case K::Block:
+            for (const ExprAST* st : llvm::cast<BlockExprAST>(s)->Statements)
+                scanUniformity(st, divergentCF, changed);
+            return;
+        case K::Assignment: {
+            const auto* a = llvm::cast<AssignmentExprAST>(s);
+            if (divergentCF || !isUniformExpr(a->Init)) markDivergent(a->VarName);
+            return;
+        }
+        case K::If: {
+            // Assignments inside either arm keep their masked select, which a
+            // scalar slot cannot express — so both arms count as divergent
+            // control flow even when the condition itself is uniform.
+            const auto* i = llvm::cast<IfExprAST>(s);
+            scanUniformity(i->ThenExpr, true, changed);
+            scanUniformity(i->ElseExpr, true, changed);
+            return;
+        }
+        case K::For: {
+            const auto* f = llvm::cast<ForExprAST>(s);
+            scanUniformity(f->Init, divergentCF, changed);
+            const bool uni =
+                !divergentCF && isUniformExpr(f->Condition) && !hasBreakOrContinue(f->Body);
+            if (uni) uniformLoops_.insert(s);
+            else uniformLoops_.erase(s);
+            scanUniformity(f->Body, !uni, changed);
+            scanUniformity(f->Increment, !uni, changed);
+            return;
+        }
+        case K::While: {
+            const auto* w = llvm::cast<WhileExprAST>(s);
+            const bool uni =
+                !divergentCF && isUniformExpr(w->Condition) && !hasBreakOrContinue(w->Body);
+            if (uni) uniformLoops_.insert(s);
+            else uniformLoops_.erase(s);
+            scanUniformity(w->Body, !uni, changed);
+            return;
+        }
+        default:
+            // MemberAssignment only ever targets outputs, which are lane-dependent
+            // regardless; everything else declares nothing.
+            return;
+    }
+}
+
+inline void PacketEmitter::analyzeUniformity(const ExprAST* body) {
+    divergentVars_.clear();
+    uniformLoops_.clear();
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        scanUniformity(body, false, changed);
+    }
+}
+
+// `discard` updates live_, which is a plain SSA value rather than an alloca, so
+// a definition inside a conditionally-executed block would not dominate the
+// merge. Arms containing one keep the unconditional blended form.
+inline bool PacketEmitter::containsDiscard(const ExprAST* s) const {
+    if (!s) return false;
+    using K = ExprAST::Kind;
+    switch (s->getKind()) {
+        case K::Discard:
+            return true;
+        case K::Block:
+            for (const ExprAST* st : llvm::cast<BlockExprAST>(s)->Statements)
+                if (containsDiscard(st)) return true;
+            return false;
+        case K::If: {
+            const auto* i = llvm::cast<IfExprAST>(s);
+            return containsDiscard(i->ThenExpr) || containsDiscard(i->ElseExpr);
+        }
+        case K::For:
+            return containsDiscard(llvm::cast<ForExprAST>(s)->Body);
+        case K::While:
+            return containsDiscard(llvm::cast<WhileExprAST>(s)->Body);
+        default:
+            return false;
+    }
+}
+
+// Guarding costs a mask reduction plus a branch, so it only pays when the arm
+// holds real work: a call (transcendental, sqrt, texture fetch) or a loop. A
+// handful of arithmetic ops stays cheaper as a straight blend.
+inline bool PacketEmitter::armWorthBranching(const ExprAST* s) const {
+    if (!s) return false;
+    using K = ExprAST::Kind;
+    switch (s->getKind()) {
+        case K::Call:
+        case K::For:
+        case K::While:
+            return true;
+        case K::Block:
+            for (const ExprAST* st : llvm::cast<BlockExprAST>(s)->Statements)
+                if (armWorthBranching(st)) return true;
+            return false;
+        case K::Assignment:
+            return armWorthBranching(llvm::cast<AssignmentExprAST>(s)->Init);
+        case K::MemberAssignment:
+            return armWorthBranching(llvm::cast<MemberAssignmentExprAST>(s)->Init);
+        case K::If: {
+            const auto* i = llvm::cast<IfExprAST>(s);
+            return armWorthBranching(i->Condition) || armWorthBranching(i->ThenExpr) ||
+                   armWorthBranching(i->ElseExpr);
+        }
+        case K::Unary:
+            return armWorthBranching(llvm::cast<UnaryExprAST>(s)->Operand);
+        case K::Binary: {
+            const auto* b = llvm::cast<BinaryExprAST>(s);
+            return armWorthBranching(b->LHS) || armWorthBranching(b->RHS);
+        }
+        case K::Ternary: {
+            const auto* t = llvm::cast<TernaryExprAST>(s);
+            return armWorthBranching(t->Cond) || armWorthBranching(t->ThenExpr) ||
+                   armWorthBranching(t->ElseExpr);
+        }
+        case K::MemberAccess:
+            return armWorthBranching(llvm::cast<MemberAccessExprAST>(s)->Object);
+        default:
+            return false;
+    }
+}
 
 inline Type* PacketEmitter::velem(const glsl::Type* t) {
     const glsl::Type* e = t->isVector() ? t->elementType() : t;
@@ -186,9 +415,18 @@ inline PacketValue PacketEmitter::emitNumber(NumberExprAST* n) {
 inline PacketValue PacketEmitter::emitVariable(VariableExprAST* v) {
     if (auto it = localVars_.find(v->Name); it != localVars_.end()) {
         LocalVar& lv = it->second;
-        Type* et = vty(velem(lv.ty));
         PacketValue pv;
         pv.ty = lv.ty;
+        if (lv.uniform) {
+            // Scalar slot, splatted back so every consumer sees the usual
+            // <W x T>. The splat is folded away wherever the result is only
+            // used uniformly again.
+            Type* st = velem(lv.ty);
+            for (AllocaInst* a : lv.slots)
+                pv.comps.push_back(splat(Builder->CreateLoad(st, a, "uload")));
+            return pv;
+        }
+        Type* et = vty(velem(lv.ty));
         for (AllocaInst* a : lv.slots)
             pv.comps.push_back(Builder->CreateLoad(et, a, "lload"));
         return pv;
@@ -751,18 +989,30 @@ inline void PacketEmitter::emitStmt(ExprAST* s) {
             LocalVar& lv = localVars_[a->VarName];
             if (lv.slots.empty()) {
                 lv.ty = v.ty;
-                Type* et = vty(velem(v.ty));
+                lv.uniform = !divergentVars_.count(a->VarName);
+                Type* et = lv.uniform ? velem(v.ty) : static_cast<Type*>(vty(velem(v.ty)));
                 for (unsigned c = 0; c < v.comps.size(); ++c) {
-                    AllocaInst* slot = allocaEntry(et, "loc");
+                    AllocaInst* slot = allocaEntry(et, lv.uniform ? "uloc" : "loc");
                     // Zero-init like the output allocas (see below): a masked-off
                     // lane in a boundary packet blends against the slot's prior
                     // value, which must be a defined 0, not undef.
-                    Builder->CreateStore(ConstantAggregateZero::get(et), slot);
+                    Builder->CreateStore(Constant::getNullValue(et), slot);
                     lv.slots.push_back(slot);
                 }
             }
             if (lv.slots.size() != v.comps.size()) {
                 bail();
+                return;
+            }
+            if (lv.uniform) {
+                // The analysis only marks a local uniform when every assignment
+                // to it sits outside any `if` and outside any divergent loop, so
+                // the mask is all-ones here and no blend is needed. Lane 0 is
+                // representative because the value is lane-invariant.
+                for (unsigned c = 0; c < v.comps.size(); ++c)
+                    Builder->CreateStore(
+                        Builder->CreateExtractElement(v.comps[c], Builder->getInt32(0), "uni"),
+                        lv.slots[c]);
                 return;
             }
             Type* et = vty(velem(lv.ty));
@@ -811,11 +1061,11 @@ inline void PacketEmitter::emitStmt(ExprAST* s) {
             Value* condMask = cond.comps[0];
             Value* saved = mask_;
             mask_ = Builder->CreateAnd(saved, condMask, "then.mask");
-            emitStmt(iff->ThenExpr);
+            emitMaskedArm(iff->ThenExpr, "then");
             if (iff->ElseExpr) {
                 mask_ =
                     Builder->CreateAnd(saved, Builder->CreateNot(condMask, "ncond"), "else.mask");
-                emitStmt(iff->ElseExpr);
+                emitMaskedArm(iff->ElseExpr, "else");
             }
             mask_ = saved;
             return;
@@ -827,12 +1077,12 @@ inline void PacketEmitter::emitStmt(ExprAST* s) {
         case K::For: {
             auto* f = llvm::cast<ForExprAST>(s);
             emitStmt(f->Init);
-            emitLoop(f->Condition, f->Body, f->Increment);
+            emitLoop(s, f->Condition, f->Body, f->Increment);
             return;
         }
         case K::While: {
             auto* w = llvm::cast<WhileExprAST>(s);
-            emitLoop(w->Condition, w->Body, nullptr);
+            emitLoop(s, w->Condition, w->Body, nullptr);
             return;
         }
         case K::Break: {
@@ -864,8 +1114,68 @@ inline void PacketEmitter::emitStmt(ExprAST* s) {
     }
 }
 
-inline void PacketEmitter::emitLoop(ExprAST* cond, ExprAST* body, ExprAST* incr) {
+// Emits one arm of an `if`. Every store inside is select(mask, new, old), which
+// is a no-op for an all-false mask — so when no lane wants the arm, the whole
+// block can be jumped over and the result is observationally identical. The
+// guard uses effMask(): break/continue and nested ifs only ever clear bits, so
+// an all-false mask here stays all-false throughout the arm.
+inline void PacketEmitter::emitMaskedArm(ExprAST* arm, const char* tag) {
+    if (!arm || bailed_ || containsDiscard(arm) || !armWorthBranching(arm)) {
+        emitStmt(arm);
+        return;
+    }
+    Function* F = entryBB_->getParent();
+    auto* runBB = BasicBlock::Create(*Context, std::string(tag) + ".run", F);
+    auto* skipBB = BasicBlock::Create(*Context, std::string(tag) + ".skip", F);
+    Builder->CreateCondBr(Builder->CreateOrReduce(effMask()), runBB, skipBB);
+
+    Builder->SetInsertPoint(runBB);
+    emitStmt(arm);
+    if (!Builder->GetInsertBlock()->getTerminator()) Builder->CreateBr(skipBB);
+
+    Builder->SetInsertPoint(skipBB);
+}
+
+// Lane-independent trip count: no per-iteration mask, no or-reduce latch. The
+// condition is still emitted as <W x i1> (every consumer expects that shape) but
+// the branch takes lane 0, and InstCombine folds extractelement(splat cmp, 0)
+// back to a scalar compare over the scalar induction variable. That is the whole
+// point — SCEV can then compute the trip count and LoopFullUnroll can fire,
+// which is what makes the per-iteration constants fold.
+inline void PacketEmitter::emitUniformLoop(ExprAST* cond, ExprAST* body, ExprAST* incr) {
+    Function* F = entryBB_->getParent();
+    auto* hdr = BasicBlock::Create(*Context, "uloop.header", F);
+    auto* bodyBB = BasicBlock::Create(*Context, "uloop.body", F);
+    auto* exitBB = BasicBlock::Create(*Context, "uloop.exit", F);
+    Builder->CreateBr(hdr);
+
+    Builder->SetInsertPoint(hdr);
+    PacketValue c = emit(cond);
+    if (bailed_ || !c.valid() || c.comps.size() != 1) {
+        bail();
+        return;
+    }
+    Builder->CreateCondBr(
+        Builder->CreateExtractElement(c.comps[0], Builder->getInt32(0), "uni.cond"), bodyBB,
+        exitBB);
+
+    // mask_ is deliberately left alone: every lane runs every iteration, so the
+    // enclosing mask already describes exactly who is executing.
+    Builder->SetInsertPoint(bodyBB);
+    emitStmt(body);
+    if (incr) emitStmt(incr);
+    if (!Builder->GetInsertBlock()->getTerminator()) Builder->CreateBr(hdr);
+
+    Builder->SetInsertPoint(exitBB);
+}
+
+inline void PacketEmitter::emitLoop(const ExprAST* node, ExprAST* cond, ExprAST* body,
+                                    ExprAST* incr) {
     if (bailed_) return;
+    if (uniformLoops_.count(node)) {
+        emitUniformLoop(cond, body, incr);
+        return;
+    }
     Value* enterMask = mask_;
     AllocaInst* la = allocaEntry(vty(i1_), "loop.active");
     AllocaInst* em = allocaEntry(vty(i1_), "loop.iter");
@@ -1005,6 +1315,10 @@ inline bool PacketEmitter::run(const std::vector<ExprAST*>& program) {
             slots.push_back(a);
         }
     }
+
+    // Needs varyings_/outputs_ populated (the divergent roots) and must run
+    // before any slot is allocated, since it decides scalar vs vector storage.
+    analyzeUniformity(entry->Body);
 
     emitStmt(entry->Body);
 
