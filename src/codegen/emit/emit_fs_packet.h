@@ -672,11 +672,24 @@ inline PacketValue PacketEmitter::emitBuiltin(CallExprAST* c) {
         const glsl::Type* et = p.ty->isVector() ? p.ty->elementType() : p.ty;
         return et->isFloat() || et->isDouble();
     };
+    // Every `unary` caller below passes the single argument c->Args[0], so this
+    // is exactly the question "is the operand lane-invariant".
+    const bool uniformArg = c->Args.size() == 1 && isUniformExpr(c->Args[0]);
     auto unary = [&](Intrinsic::ID id) -> PacketValue {
         PacketValue r;
         r.ty = a[0].ty;
-        for (Value* cc : a[0].comps)
-            r.comps.push_back(Builder->CreateUnaryIntrinsic(id, cc));
+        for (Value* cc : a[0].comps) {
+            if (uniformArg) {
+                // Lane-invariant transcendental: compute it once on a scalar and
+                // splat. The vector form is a trap on this backend — there is no
+                // vector libm, so llvm.sin.v4f32 is scalarized into W separate
+                // __sinf calls, W-1 of which recompute the same number.
+                Value* s = Builder->CreateExtractElement(cc, Builder->getInt32(0), "uni.arg");
+                r.comps.push_back(splat(Builder->CreateUnaryIntrinsic(id, s)));
+            } else {
+                r.comps.push_back(Builder->CreateUnaryIntrinsic(id, cc));
+            }
+        }
         return r;
     };
     auto binop = [&](auto make) -> PacketValue {
