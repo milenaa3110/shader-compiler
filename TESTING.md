@@ -25,6 +25,8 @@ sudo apt install libfmt-dev libvulkan-dev mesa-vulkan-drivers vulkan-tools \
 # Optional: MP4 output and Vulkan API validation
 sudo apt install ffmpeg vulkan-validationlayers
 
+sudo apt install lldb-18
+
 # Cross-compiling RISC-V from an x86 host (QEMU) — not needed on RISC-V hardware
 sudo apt install gcc-riscv64-linux-gnu g++-riscv64-linux-gnu qemu-user-static
 ```
@@ -41,6 +43,13 @@ Notes:
 - ffmpeg is unnecessary for normal benchmark runs. A working `perf` is required
   for native profiling with `--perf`; its executable is selected with
   `--perf-bin /path/to/perf`.
+- `lldb` is only needed when a compiler tool or a host binary is being debugged.
+  The version should match the detected LLVM, since the pass plugin and the tools
+  are built against it. `irgen_riscv` reads the shader from stdin, so a session is
+  started as `lldb -- build/riscv/irgen_riscv out.ll` and the source is redirected
+  once inside with `process launch -i shader.src`. Natively built `.rv` hosts are
+  debugged directly; under QEMU they need `qemu-riscv64-static -g <port>` plus
+  `gdb-remote <port>`.
 
 ## Build
 

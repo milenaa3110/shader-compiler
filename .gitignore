@@ -1,6 +1,8 @@
 /.cache
 /.idea
 /build/
+/build-debug/
 /result/
+__pycache__/
 /module.bc
 *.pdf

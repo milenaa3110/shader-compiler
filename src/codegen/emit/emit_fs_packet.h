@@ -574,6 +574,23 @@ inline PacketValue PacketEmitter::emitBinary(BinaryExprAST* b) {
         case TokenKind::NotEqual:
             cmp(CmpInst::FCMP_ONE, CmpInst::ICMP_NE);
             break;
+        case TokenKind::And:
+        case TokenKind::Or: {
+            // Vector logical AND/OR (no short-circuiting). 
+            // Since all expressions are pure and lanes may diverge, branching is 
+            // inefficient. Both sides are fully evaluated, and the results are 
+            // combined using bitwise operations.
+            if (!et->isBool()) {
+                bail();
+                return {};
+            }
+            for (unsigned c = 0; c < n; ++c)
+                out.comps.push_back(b->Op == TokenKind::And
+                                        ? Builder->CreateAnd(l.comps[c], r.comps[c], "vand")
+                                        : Builder->CreateOr(l.comps[c], r.comps[c], "vor"));
+            out.ty = b->getType();
+            break;
+        }
         default:
             bail();
             return {};
@@ -727,6 +744,21 @@ inline PacketValue PacketEmitter::emitBuiltin(CallExprAST* c) {
     if (F == "exp" && a.size() == 1) return unary(Intrinsic::exp);
     if (F == "log" && a.size() == 1) return unary(Intrinsic::log);
     if (F == "abs" && a.size() == 1) return unary(Intrinsic::fabs);
+    // sign(x): -1 / 0 / +1, per GLSL. Two compares and two selects rather than
+    // copysign, because copysign(1, -0.0) is -1 while GLSL requires 0.
+    if (F == "sign" && a.size() == 1 && isF(a[0])) {
+        PacketValue r;
+        r.ty = a[0].ty;
+        for (Value* cc : a[0].comps) {
+            Type* vt = cc->getType();
+            Value* zero = Constant::getNullValue(vt);
+            Value* gt = Builder->CreateFCmpOGT(cc, zero, "sgn.gt");
+            Value* lt = Builder->CreateFCmpOLT(cc, zero, "sgn.lt");
+            Value* lo = Builder->CreateSelect(lt, ConstantFP::get(vt, -1.0), zero, "sgn.lo");
+            r.comps.push_back(Builder->CreateSelect(gt, ConstantFP::get(vt, 1.0), lo, "sign"));
+        }
+        return r;
+    }
     if (F == "fract" && a.size() == 1) {
         PacketValue r;
         r.ty = a[0].ty;
