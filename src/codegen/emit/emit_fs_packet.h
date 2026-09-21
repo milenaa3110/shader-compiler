@@ -350,6 +350,9 @@ inline bool PacketEmitter::armWorthBranching(const ExprAST* s) const {
 }
 
 inline Type* PacketEmitter::velem(const glsl::Type* t) {
+    // Matrices are held as rows*cols separate <W x float> slots, column-major,
+    // so their element type is just float.
+    if (t->isMatrix()) return f32_;
     const glsl::Type* e = t->isVector() ? t->elementType() : t;
     if (e->isFloat() || e->isDouble()) return f32_;
     if (e->isBool()) return i1_;
@@ -360,6 +363,9 @@ inline unsigned PacketEmitter::compCount(const glsl::Type* t) {
     if (!t) return 0;
     if (t->isScalar()) return 1;
     if (t->isVector()) return t->vectorSize();
+    // Column-major flat layout: element (row, col) lives at comps[col*rows + row],
+    // matching the order GLSL passes columns to the constructor.
+    if (t->isMatrix()) return t->matrixRows() * t->matrixCols();
     return 0;
 }
 
@@ -516,6 +522,76 @@ inline PacketValue PacketEmitter::emitBinary(BinaryExprAST* b) {
         return {};
     }
 
+    // ── Matrix products ──────────────────────────────────────────────────────
+    // These are contractions, not element-wise pairings, so they have to be
+    // intercepted before the broadcast/zip below — which would otherwise turn
+    // mat3*mat3 into nine independent multiplies and silently give the wrong
+    // answer. Matrix +/- matrix and matrix*scalar ARE element-wise and fall
+    // through to the generic path unchanged.
+    //
+    // Layout is column-major: element (row, col) is comps[col*rows + row].
+    // The dot products are emitted as fmul + fadd chains; each link consumes the
+    // previous result, so the register allocator overlaps them instead of
+    // keeping every slot of both operands live at once.
+    if (b->Op == TokenKind::Multiply && (l.ty->isMatrix() || r.ty->isMatrix())) {
+        auto at = [](const PacketValue& m, unsigned rows, unsigned row, unsigned col) {
+            return m.comps[col * rows + row];
+        };
+        auto dot = [&](auto&& lhs, auto&& rhs, unsigned n) {
+            Value* acc = nullptr;
+            for (unsigned k = 0; k < n; ++k) {
+                Value* p = Builder->CreateFMul(lhs(k), rhs(k), "mmul");
+                acc = acc ? Builder->CreateFAdd(acc, p, "macc") : p;
+            }
+            return acc;
+        };
+        PacketValue out2;
+        out2.ty = b->getType();
+
+        if (l.ty->isMatrix() && r.ty->isMatrix()) {
+            const unsigned lr = l.ty->matrixRows(), lc = l.ty->matrixCols();
+            const unsigned rr = r.ty->matrixRows(), rc = r.ty->matrixCols();
+            if (lc != rr || l.comps.size() != lr * lc || r.comps.size() != rr * rc) {
+                bail();
+                return {};
+            }
+            out2.comps.resize(lr * rc);
+            for (unsigned col = 0; col < rc; ++col)
+                for (unsigned row = 0; row < lr; ++row)
+                    out2.comps[col * lr + row] =
+                        dot([&](unsigned k) { return at(l, lr, row, k); },
+                            [&](unsigned k) { return at(r, rr, k, col); }, lc);
+            return out2;
+        }
+        if (l.ty->isMatrix() && r.ty->isVector()) {
+            const unsigned lr = l.ty->matrixRows(), lc = l.ty->matrixCols();
+            if (lc != r.comps.size() || l.comps.size() != lr * lc) {
+                bail();
+                return {};
+            }
+            out2.comps.resize(lr);
+            for (unsigned row = 0; row < lr; ++row)
+                out2.comps[row] = dot([&](unsigned k) { return at(l, lr, row, k); },
+                                      [&](unsigned k) { return r.comps[k]; }, lc);
+            return out2;
+        }
+        if (l.ty->isVector() && r.ty->isMatrix()) {
+            // Row-vector product: result[col] = sum_k v[k] * M(k, col).
+            const unsigned rr = r.ty->matrixRows(), rc = r.ty->matrixCols();
+            if (rr != l.comps.size() || r.comps.size() != rr * rc) {
+                bail();
+                return {};
+            }
+            out2.comps.resize(rc);
+            for (unsigned col = 0; col < rc; ++col)
+                out2.comps[col] = dot([&](unsigned k) { return l.comps[k]; },
+                                      [&](unsigned k) { return at(r, rr, k, col); }, rr);
+            return out2;
+        }
+        // Remaining shape is matrix * scalar, which is element-wise; let the
+        // generic broadcast below handle it.
+    }
+
     auto broadcast = [](PacketValue& a, unsigned n) {
         if (a.comps.size() == 1 && n > 1) a.comps.assign(n, a.comps[0]);
     };
@@ -528,7 +604,10 @@ inline PacketValue PacketEmitter::emitBinary(BinaryExprAST* b) {
     }
 
     const glsl::Type* et = l.ty->isVector() ? l.ty->elementType() : l.ty;
-    bool isFloat = et->isFloat() || et->isDouble();
+    // Matrix slots are floats. Without this, mat+mat or mat*scalar — which are
+    // element-wise and deliberately fall through to the generic path above —
+    // would pick the integer opcode and emit an integer add on float vectors.
+    bool isFloat = et->isFloat() || et->isDouble() || l.ty->isMatrix() || r.ty->isMatrix();
 
     PacketValue out;
     auto cmp = [&](CmpInst::Predicate fp, CmpInst::Predicate ip) {
@@ -643,8 +722,19 @@ inline PacketValue PacketEmitter::emitCtor(CallExprAST* c) {
                     : (C == "vec2") ? 2
                     : (C == "vec3") ? 3
                     : (C == "vec4") ? 4
+                    : (C == "mat2") ? 4
+                    : (C == "mat3") ? 9
+                    : (C == "mat4") ? 16
                                     : 0;
     if (want == 0) {
+        bail();
+        return {};
+    }
+    // mat3(x) in GLSL is x on the diagonal, not x everywhere, so the
+    // splat-a-single-scalar shortcut below would silently produce the wrong
+    // matrix. Nothing in the suite uses it; refuse rather than guess.
+    const bool isMat = (C == "mat2" || C == "mat3" || C == "mat4");
+    if (isMat && c->Args.size() == 1) {
         bail();
         return {};
     }
@@ -686,6 +776,10 @@ inline PacketValue PacketEmitter::emitBuiltin(CallExprAST* c) {
         if (p.comps.size() == 1 && n > 1) p.comps.assign(n, p.comps[0]);
     };
     auto isF = [&](const PacketValue& p) {
+        // A matrix is held as float slots, so it passes the float-argument gate
+        // below. Without this, transpose/determinant/inverse are rejected by
+        // that gate before the matrix block further down ever runs.
+        if (p.ty->isMatrix()) return true;
         const glsl::Type* et = p.ty->isVector() ? p.ty->elementType() : p.ty;
         return et->isFloat() || et->isDouble();
     };
@@ -776,6 +870,79 @@ inline PacketValue PacketEmitter::emitBuiltin(CallExprAST* c) {
     if (F == "exp" && a.size() == 1) return uniformArg ? unary(Intrinsic::exp) : veclib("__vexpf");
     if (F == "log" && a.size() == 1) return uniformArg ? unary(Intrinsic::log) : veclib("__vlogf");
     if (F == "abs" && a.size() == 1) return unary(Intrinsic::fabs);
+
+    // ── Matrix builtins ──────────────────────────────────────────────────────
+    // Written out on the column-major slots rather than reusing the scalar
+    // codegen: every element here is genuinely per-lane (matrix_fs builds its
+    // matrices from cos/sin of vUV), so there is no uniform matrix to compute
+    // once and splat. determinant/inverse are given for mat2 and mat3 only;
+    // mat4 inverse is ~100 operations and nothing in the suite asks for it.
+    if ((F == "transpose" || F == "determinant" || F == "inverse") && a.size() == 1 &&
+        a[0].ty && a[0].ty->isMatrix()) {
+        const unsigned rows = a[0].ty->matrixRows(), cols = a[0].ty->matrixCols();
+        if (a[0].comps.size() != rows * cols) {
+            bail();
+            return {};
+        }
+        auto m = [&](unsigned row, unsigned col) { return a[0].comps[col * rows + row]; };
+        auto mul = [&](Value* x, Value* y) { return Builder->CreateFMul(x, y, "mm"); };
+        auto sub = [&](Value* x, Value* y) { return Builder->CreateFSub(x, y, "ms"); };
+        auto add = [&](Value* x, Value* y) { return Builder->CreateFAdd(x, y, "ma"); };
+        // 2x2 minor, i.e. m(r0,c0)*m(r1,c1) - m(r0,c1)*m(r1,c0).
+        auto minor2 = [&](unsigned r0, unsigned r1, unsigned c0, unsigned c1) {
+            return sub(mul(m(r0, c0), m(r1, c1)), mul(m(r0, c1), m(r1, c0)));
+        };
+
+        if (F == "transpose") {
+            PacketValue t;
+            t.ty = c->getType();
+            t.comps.resize(rows * cols);
+            for (unsigned col = 0; col < cols; ++col)
+                for (unsigned row = 0; row < rows; ++row)
+                    t.comps[row * cols + col] = m(row, col);
+            return t;
+        }
+        if (rows != cols || (rows != 2 && rows != 3)) {
+            bail();
+            return {};
+        }
+        Value* det = rows == 2 ? minor2(0, 1, 0, 1)
+                               : add(sub(mul(m(0, 0), minor2(1, 2, 1, 2)),
+                                         mul(m(0, 1), minor2(1, 2, 0, 2))),
+                                     mul(m(0, 2), minor2(1, 2, 0, 1)));
+        if (F == "determinant") return { { det }, c->getType() };
+
+        // inverse = adjugate / det; the adjugate is the transposed cofactor
+        // matrix, so the (row, col) entry below reads cofactor (col, row).
+        PacketValue inv;
+        inv.ty = c->getType();
+        inv.comps.resize(rows * cols);
+        // One reciprocal, then multiplies. Dividing each cofactor separately
+        // would emit rows*cols vfdiv.vv, and vector divide is not pipelined on
+        // this target the way multiply is — nine divides for one is a bad trade.
+        Value* invDet =
+            Builder->CreateFDiv(ConstantFP::get(det->getType(), 1.0), det, "mrcp");
+        auto put = [&](unsigned row, unsigned col, Value* v) {
+            inv.comps[col * rows + row] = Builder->CreateFMul(v, invDet, "minv");
+        };
+        if (rows == 2) {
+            put(0, 0, m(1, 1));
+            put(0, 1, Builder->CreateFNeg(m(0, 1), "mneg"));
+            put(1, 0, Builder->CreateFNeg(m(1, 0), "mneg"));
+            put(1, 1, m(0, 0));
+        } else {
+            put(0, 0, minor2(1, 2, 1, 2));
+            put(0, 1, sub(mul(m(0, 2), m(2, 1)), mul(m(0, 1), m(2, 2))));
+            put(0, 2, minor2(0, 1, 1, 2));
+            put(1, 0, sub(mul(m(1, 2), m(2, 0)), mul(m(1, 0), m(2, 2))));
+            put(1, 1, minor2(0, 2, 0, 2));
+            put(1, 2, sub(mul(m(0, 2), m(1, 0)), mul(m(0, 0), m(1, 2))));
+            put(2, 0, minor2(1, 2, 0, 1));
+            put(2, 1, sub(mul(m(0, 1), m(2, 0)), mul(m(0, 0), m(2, 1))));
+            put(2, 2, minor2(0, 1, 0, 1));
+        }
+        return inv;
+    }
     // sign(x): -1 / 0 / +1, per GLSL. Two compares and two selects rather than
     // copysign, because copysign(1, -0.0) is -1 while GLSL requires 0.
     if (F == "sign" && a.size() == 1 && isF(a[0])) {
@@ -956,18 +1123,39 @@ inline PacketValue PacketEmitter::emitTexture(CallExprAST* c) {
         return {};
     }
     PacketValue uv = emit(c->Args[1]);
-    if (bailed_ || !uv.valid() || uv.comps.size() != 2) {
+    if (bailed_ || !uv.valid() || (uv.comps.size() != 2 && uv.comps.size() != 3)) {
         bail();
         return {};
     }
 
+    // A vec3 coordinate is ambiguous on its own — sampler3D, samplerCube and
+    // sampler2DArray all take one — so the sampler's own type decides, exactly
+    // as codegen_state.cpp does for the scalar path. Anything else (shadow
+    // samplers, a sampler passed as a parameter rather than named) is refused
+    // rather than guessed at.
+    const char* fname = "__tex2d_sample";
+    if (uv.comps.size() == 3) {
+        const glsl::Type* st = c->Args[0]->getType();
+        const std::string sn = st ? st->toString() : std::string();
+        if (sn == "sampler3D") fname = "__tex3d_sample";
+        else if (sn == "samplerCube") fname = "__texcube_sample";
+        else if (sn == "sampler2DArray") fname = "__tex2darray_sample";
+        else {
+            bail();
+            return {};
+        }
+    }
+
     auto* ptrTy = PointerType::getUnqual(*Context);
     auto* voidTy = Type::getVoidTy(*Context);
-    // Signature matches codegen_state.cpp: (sampler, i32 slot, u, v, out).
-    Function* fn = TheModule->getFunction("__tex2d_sample");
+    // Signature matches codegen_state.cpp: (sampler, i32 slot, coords..., out).
+    Function* fn = TheModule->getFunction(fname);
     if (!fn) {
-        auto* FT = FunctionType::get(voidTy, { ptrTy, i32_, f32_, f32_, ptrTy }, false);
-        fn = Function::Create(FT, Function::ExternalLinkage, "__tex2d_sample", TheModule.get());
+        std::vector<Type*> params = { ptrTy, i32_, f32_, f32_ };
+        if (uv.comps.size() == 3) params.push_back(f32_);
+        params.push_back(ptrTy);
+        auto* FT = FunctionType::get(voidTy, params, false);
+        fn = Function::Create(FT, Function::ExternalLinkage, fname, TheModule.get());
     }
     // Binding slot of the sampler uniform, so the runtime reads the right texture.
     int slot = 0;
@@ -986,9 +1174,13 @@ inline PacketValue PacketEmitter::emitTexture(CallExprAST* c) {
     for (unsigned k = 0; k < 4; ++k)
         r.comps.push_back(UndefValue::get(vty(f32_)));
     for (unsigned l = 0; l < kW; ++l) {
-        Value* u = Builder->CreateExtractElement(uv.comps[0], Builder->getInt32(l), "u");
-        Value* v = Builder->CreateExtractElement(uv.comps[1], Builder->getInt32(l), "v");
-        Builder->CreateCall(fn, { nullSampler, slotV, u, v, tmp });
+        // The sampler is scalar, so each lane is fetched separately and the
+        // results are reassembled — the same shape the 2D path already used.
+        std::vector<Value*> args = { nullSampler, slotV };
+        for (Value* comp : uv.comps)
+            args.push_back(Builder->CreateExtractElement(comp, Builder->getInt32(l), "tc"));
+        args.push_back(tmp);
+        Builder->CreateCall(fn, args);
         Value* rgba = Builder->CreateLoad(vec4Ty, tmp, "rgba");
         for (unsigned k = 0; k < 4; ++k)
             r.comps[k] = Builder->CreateInsertElement(
@@ -1025,7 +1217,9 @@ inline PacketValue PacketEmitter::emit(ExprAST* e) {
             auto* c = llvm::cast<CallExprAST>(e);
             const std::string& F = c->Callee;
             if (F == "texture") return emitTexture(c);
-            if (F == "float" || F == "vec2" || F == "vec3" || F == "vec4") return emitCtor(c);
+            if (F == "float" || F == "vec2" || F == "vec3" || F == "vec4" || F == "mat2" ||
+                F == "mat3" || F == "mat4")
+                return emitCtor(c);
             return emitBuiltin(c);  // math builtins; bails if unknown
         }
         case K::ImplicitCast: {
