@@ -479,6 +479,33 @@ if(CLANG_CXX_BIN)
         COMMENT "[bc]  tex_inline.bc"
         VERBATIM)
     add_custom_target(tex_inline.bc DEPENDS ${TEX_INLINE_BC})
+
+    # vec_math.bc — vector sin/cos as plain arithmetic. RVV has no vector libm,
+    # so llvm.sin.vNf32 is scalarized by llc into W separate sinf calls: the
+    # packet path then issues exactly as many libm calls as the scalar path and
+    # pays the pack/unpack on top. Linked in the same way as tex_inline.bc, but
+    # it MUST also get -DSHADER_PACKET_WIDTH — its vector width has to match the
+    # emitter's kW, whereas tex_inline works on scalars and does not care.
+    set(VEC_MATH_SRC ${PIPELINE_DIR}/vec_math.cpp)
+    set(VEC_MATH_BC  ${LLVM_DIR_}/vec_math.bc)
+    add_custom_command(
+        OUTPUT  ${VEC_MATH_BC}
+        COMMAND ${CLANG_CXX_BIN} -O1 -emit-llvm -c -std=c++20
+                --target=riscv64-linux-gnu
+                ${RV_ARCH_FLAGS}
+                -DSHADER_PACKET_WIDTH=${_PKT_W}
+                -I${PIPELINE_DIR}
+                ${VEC_MATH_SRC}
+                -o ${VEC_MATH_BC}
+        DEPENDS ${VEC_MATH_SRC} ${PIPELINE_DIR}/vec_math.h
+                ${CMAKE_SOURCE_DIR}/src/common/packet_width.h _output_dirs
+        COMMENT "[bc]  vec_math.bc (width ${_PKT_W})"
+        VERBATIM)
+    add_custom_target(vec_math.bc DEPENDS ${VEC_MATH_BC})
+
+    # Everything llvm-link'd into a shader module before opt -O3. One list so a
+    # future addition touches this line rather than all six link sites.
+    set(SHADER_BC ${TEX_INLINE_BC} ${VEC_MATH_BC})
 endif()
 
 # Compile a vertex shader (.src → .vert.spv) using the irgen_spirv emitter.
@@ -543,8 +570,8 @@ function(rv_compile_animation name)
         # Link in tex_inline.bc so calls to __tex2d_sample / __tex_lookup get
         # inlined by opt -O3 (both are marked always_inline). Harmless for
         # shaders that don't sample textures: bodies get DCE'd.
-        COMMAND ${LLVM_LINK_BIN} ${vsll} ${fsll} ${TEX_INLINE_BC} -S -o ${ll}
-        DEPENDS ${srcfile} ${SCENE_VS_SRC} irgen_riscv ${TEX_INLINE_BC}
+        COMMAND ${LLVM_LINK_BIN} ${vsll} ${fsll} ${SHADER_BC} -S -o ${ll}
+        DEPENDS ${srcfile} ${SCENE_VS_SRC} irgen_riscv ${SHADER_BC}
         COMMENT "[rv]  ${name}_rv.ll"
         VERBATIM)
     add_custom_target(${name}_rv.ll DEPENDS ${ll})
@@ -729,8 +756,8 @@ if(CROSS_CXX_BIN)
         COMMAND $<TARGET_FILE:irgen_riscv> ${_tl_vs} < ${SCENE_VS_SRC}
         COMMAND $<TARGET_FILE:irgen_riscv> ${_tl_fs} < ${ANIM_SHADER_DIR}/texlayer_fs.src
         # Link tex_inline.bc so __tex*/__image* resolve against g_tex/g_img.
-        COMMAND ${LLVM_LINK_BIN} ${_tl_vs} ${_tl_fs} ${TEX_INLINE_BC} -S -o ${_tl_ll}
-        DEPENDS ${SCENE_VS_SRC} ${ANIM_SHADER_DIR}/texlayer_fs.src irgen_riscv ${TEX_INLINE_BC}
+        COMMAND ${LLVM_LINK_BIN} ${_tl_vs} ${_tl_fs} ${SHADER_BC} -S -o ${_tl_ll}
+        DEPENDS ${SCENE_VS_SRC} ${ANIM_SHADER_DIR}/texlayer_fs.src irgen_riscv ${SHADER_BC}
         COMMENT "[rv]  texlayer_rv.ll"
         VERBATIM)
 
@@ -804,8 +831,8 @@ if(CROSS_CXX_BIN)
         BYPRODUCTS ${_vol_vs} ${_vol_fs}
         COMMAND $<TARGET_FILE:irgen_riscv> ${_vol_vs} < ${SCENE_VS_SRC}
         COMMAND $<TARGET_FILE:irgen_riscv> ${_vol_fs} < ${ANIM_SHADER_DIR}/volume_fs.src
-        COMMAND ${LLVM_LINK_BIN} ${_vol_vs} ${_vol_fs} ${TEX_INLINE_BC} -S -o ${_vol_ll}
-        DEPENDS ${SCENE_VS_SRC} ${ANIM_SHADER_DIR}/volume_fs.src irgen_riscv ${TEX_INLINE_BC}
+        COMMAND ${LLVM_LINK_BIN} ${_vol_vs} ${_vol_fs} ${SHADER_BC} -S -o ${_vol_ll}
+        DEPENDS ${SCENE_VS_SRC} ${ANIM_SHADER_DIR}/volume_fs.src irgen_riscv ${SHADER_BC}
         COMMENT "[rv]  volume_rv.ll"
         VERBATIM)
 
@@ -874,8 +901,8 @@ if(CROSS_CXX_BIN)
         OUTPUT  ${_vcs_ll}
         BYPRODUCTS ${_vcs_raw}
         COMMAND $<TARGET_FILE:irgen_riscv> ${_vcs_raw} < ${ANIM_SHADER_DIR}/volume_cs.src
-        COMMAND ${LLVM_LINK_BIN} ${_vcs_raw} ${TEX_INLINE_BC} -S -o ${_vcs_ll}
-        DEPENDS ${ANIM_SHADER_DIR}/volume_cs.src irgen_riscv ${TEX_INLINE_BC}
+        COMMAND ${LLVM_LINK_BIN} ${_vcs_raw} ${SHADER_BC} -S -o ${_vcs_ll}
+        DEPENDS ${ANIM_SHADER_DIR}/volume_cs.src irgen_riscv ${SHADER_BC}
         COMMENT "[rv]  volume_cs_rv.ll"
         VERBATIM)
 
@@ -983,9 +1010,9 @@ add_custom_command(
     COMMAND $<TARGET_FILE:irgen_riscv> ${_mesh_vsll} < ${ANIM_SHADER_DIR}/mesh_vs.src
     COMMAND $<TARGET_FILE:irgen_riscv> ${_mesh_fsll} < ${ANIM_SHADER_DIR}/mesh_fs.src
     # Link tex_inline.bc into the shader module so __tex2d_sample inlines.
-    COMMAND ${LLVM_LINK_BIN} ${_mesh_vsll} ${_mesh_fsll} ${TEX_INLINE_BC} -S -o ${_mesh_ll}
+    COMMAND ${LLVM_LINK_BIN} ${_mesh_vsll} ${_mesh_fsll} ${SHADER_BC} -S -o ${_mesh_ll}
     DEPENDS ${ANIM_SHADER_DIR}/mesh_vs.src ${ANIM_SHADER_DIR}/mesh_fs.src
-            irgen_riscv ${TEX_INLINE_BC}
+            irgen_riscv ${SHADER_BC}
     VERBATIM)
 add_custom_target(mesh_rv.ll DEPENDS ${_mesh_ll})
 
@@ -1060,10 +1087,10 @@ add_custom_command(
     BYPRODUCTS ${_terrain_vsll} ${_terrain_fsll}
     COMMAND $<TARGET_FILE:irgen_riscv> ${_terrain_vsll} < ${ANIM_SHADER_DIR}/terrain_vs.src
     COMMAND $<TARGET_FILE:irgen_riscv> ${_terrain_fsll} < ${ANIM_SHADER_DIR}/terrain_fs.src
-    COMMAND ${LLVM_LINK_BIN} ${_terrain_vsll} ${_terrain_fsll} ${TEX_INLINE_BC}
+    COMMAND ${LLVM_LINK_BIN} ${_terrain_vsll} ${_terrain_fsll} ${SHADER_BC}
             -S -o ${_terrain_ll}
     DEPENDS ${ANIM_SHADER_DIR}/terrain_vs.src ${ANIM_SHADER_DIR}/terrain_fs.src
-            irgen_riscv ${TEX_INLINE_BC}
+            irgen_riscv ${SHADER_BC}
     VERBATIM)
 add_custom_target(terrain_rv.ll DEPENDS ${_terrain_ll})
 

@@ -692,6 +692,17 @@ inline PacketValue PacketEmitter::emitBuiltin(CallExprAST* c) {
     // Every `unary` caller below passes the single argument c->Args[0], so this
     // is exactly the question "is the operand lane-invariant".
     const bool uniformArg = c->Args.size() == 1 && isUniformExpr(c->Args[0]);
+    // Calls a <W x float> -> <W x float> helper from vec_math.bc. The body is
+    // always_inline and the module is llvm-link'd in before opt -O3, so this
+    // becomes straight-line vector arithmetic rather than a call.
+    auto veclib = [&](const char* fn) -> PacketValue {
+        FunctionType* ft = FunctionType::get(vty(f32_), { vty(f32_) }, false);
+        FunctionCallee callee = TheModule->getOrInsertFunction(fn, ft);
+        PacketValue r;
+        r.ty = a[0].ty;
+        for (Value* cc : a[0].comps) r.comps.push_back(Builder->CreateCall(callee, cc, fn));
+        return r;
+    };
     auto unary = [&](Intrinsic::ID id) -> PacketValue {
         PacketValue r;
         r.ty = a[0].ty;
@@ -737,12 +748,16 @@ inline PacketValue PacketEmitter::emitBuiltin(CallExprAST* c) {
         return {};
     }
 
-    if (F == "sin" && a.size() == 1) return unary(Intrinsic::sin);
-    if (F == "cos" && a.size() == 1) return unary(Intrinsic::cos);
+    // Divergent sin/cos go to the vector implementations in vec_math.bc rather
+    // than llvm.sin.vNf32, which llc would scalarize into W libm calls because
+    // this target has no vector libm. A uniform argument still takes `unary`,
+    // which emits one scalar call and splats — cheaper than any vector form.
+    if (F == "sin" && a.size() == 1) return uniformArg ? unary(Intrinsic::sin) : veclib("__vsinf");
+    if (F == "cos" && a.size() == 1) return uniformArg ? unary(Intrinsic::cos) : veclib("__vcosf");
     if (F == "sqrt" && a.size() == 1) return unary(Intrinsic::sqrt);
     if (F == "floor" && a.size() == 1) return unary(Intrinsic::floor);
-    if (F == "exp" && a.size() == 1) return unary(Intrinsic::exp);
-    if (F == "log" && a.size() == 1) return unary(Intrinsic::log);
+    if (F == "exp" && a.size() == 1) return uniformArg ? unary(Intrinsic::exp) : veclib("__vexpf");
+    if (F == "log" && a.size() == 1) return uniformArg ? unary(Intrinsic::log) : veclib("__vlogf");
     if (F == "abs" && a.size() == 1) return unary(Intrinsic::fabs);
     // sign(x): -1 / 0 / +1, per GLSL. Two compares and two selects rather than
     // copysign, because copysign(1, -0.0) is -1 while GLSL requires 0.
@@ -784,10 +799,37 @@ inline PacketValue PacketEmitter::emitBuiltin(CallExprAST* c) {
         return binop([&](Value* x, Value* y) {
             return Builder->CreateBinaryIntrinsic(Intrinsic::maxnum, x, y);
         });
-    if (F == "pow" && a.size() == 2)
+    // pow(x, C) for a small whole C is a multiply chain, and RVV multiplies
+    // vectors natively. Left as llvm.pow.vNf32 it is scalarized into W powf
+    // calls — once sin was handled this was the single largest remaining libm
+    // cost in the suite (20 of ocean's 41 calls, from exponents 48/3/256/8/16).
+    // Repeated squaring rounds differently from powf, but these are specular
+    // terms on values in [0,1] where the result is already near zero.
+    if (F == "pow" && a.size() == 2) {
+        if (auto* e = llvm::dyn_cast<NumberExprAST>(c->Args[1])) {
+            const double v = e->Val;
+            const long long n = (long long)v;
+            // 1024 caps the expansion at ~20 multiplies; past that the libm
+            // call is the better trade.
+            if (v == (double)n && n >= 0 && n <= 1024) {
+                PacketValue r;
+                r.ty = a[0].ty;
+                for (Value* base : a[0].comps) {
+                    Value* acc = nullptr;
+                    Value* cur = base;
+                    for (long long k = n; k; k >>= 1) {
+                        if (k & 1) acc = acc ? Builder->CreateFMul(acc, cur, "pow.acc") : cur;
+                        if (k >> 1) cur = Builder->CreateFMul(cur, cur, "pow.sq");
+                    }
+                    r.comps.push_back(acc ? acc : ConstantFP::get(base->getType(), 1.0));
+                }
+                return r;
+            }
+        }
         return binop([&](Value* x, Value* y) {
             return Builder->CreateBinaryIntrinsic(Intrinsic::pow, x, y);
         });
+    }
     if (F == "mod" && a.size() == 2)
         return binop([&](Value* x, Value* y) {
             Value* fl = Builder->CreateUnaryIntrinsic(Intrinsic::floor, Builder->CreateFDiv(x, y));
