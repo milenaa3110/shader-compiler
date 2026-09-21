@@ -696,11 +696,28 @@ inline PacketValue PacketEmitter::emitBuiltin(CallExprAST* c) {
     // always_inline and the module is llvm-link'd in before opt -O3, so this
     // becomes straight-line vector arithmetic rather than a call.
     auto veclib = [&](const char* fn) -> PacketValue {
-        FunctionType* ft = FunctionType::get(vty(f32_), { vty(f32_) }, false);
+        // void (const <W x float>*, <W x float>*), matching vec_math.h. The
+        // vector cannot cross the boundary by value: riscv64 does not
+        // register-pass a 32-byte vector, so clang would emit
+        // `void(ptr sret, ptr)` while this emitted `<W x float>(<W x float>)`.
+        // llvm-link leaves those as two different functions, the definition
+        // never binds to the call, and always_inline finds nothing to inline —
+        // which is exactly what happened before, with 58 __vsinf calls surviving
+        // into the optimized IR. SROA erases the store/load once inlined.
+        Type* vt = vty(f32_);
+        Type* ptrTy = PointerType::getUnqual(*Context);
+        FunctionType* ft =
+            FunctionType::get(Type::getVoidTy(*Context), { ptrTy, ptrTy }, false);
         FunctionCallee callee = TheModule->getOrInsertFunction(fn, ft);
         PacketValue r;
         r.ty = a[0].ty;
-        for (Value* cc : a[0].comps) r.comps.push_back(Builder->CreateCall(callee, cc, fn));
+        for (Value* cc : a[0].comps) {
+            AllocaInst* in = allocaEntry(vt, "vm.in");
+            AllocaInst* out = allocaEntry(vt, "vm.out");
+            Builder->CreateStore(cc, in);
+            Builder->CreateCall(callee, { in, out });
+            r.comps.push_back(Builder->CreateLoad(vt, out, "vm.r"));
+        }
         return r;
     };
     auto unary = [&](Intrinsic::ID id) -> PacketValue {

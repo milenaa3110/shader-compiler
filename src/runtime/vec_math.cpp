@@ -143,7 +143,7 @@ constexpr float L0 = 3.3333331174e-1f;
 
 // exp(x) = 2^n * exp(r), r = x - n*ln2. The 2^n factor is built straight from
 // the exponent field rather than by another call.
-extern "C" __attribute__((always_inline)) vfloat __vexpf(vfloat x) {
+static inline vfloat expImpl(vfloat x) {
     // Clamp the ARGUMENT, not the resulting exponent. Clamping n after the fact
     // leaves r = x - n*ln2 far outside [-ln2/2, ln2/2], and the polynomial then
     // returns nonsense — exp(-100) came out as -7.67e-35 before this was moved.
@@ -169,7 +169,7 @@ extern "C" __attribute__((always_inline)) vfloat __vexpf(vfloat x) {
 
 // log(x) = e*ln2 + log(m), with x = m * 2^e and m in [0.5, 1) from the raw
 // exponent field — frexp without the call.
-extern "C" __attribute__((always_inline)) vfloat __vlogf(vfloat x) {
+static inline vfloat logImpl(vfloat x) {
     vuint ix = __builtin_bit_cast(vuint, x);
     vfloat e = __builtin_convertvector((vint)((ix >> 23) & 0xFFu) - 126, vfloat);
     vfloat m = __builtin_bit_cast(vfloat, (ix & 0x807FFFFFu) | 0x3F000000u);
@@ -192,7 +192,7 @@ extern "C" __attribute__((always_inline)) vfloat __vlogf(vfloat x) {
 }
 
 // q: 0 -> sin(r), 1 -> cos(r), 2 -> -sin(r), 3 -> -cos(r)
-extern "C" __attribute__((always_inline)) vfloat __vsinf(vfloat x) {
+static inline vfloat sinImpl(vfloat x) {
     const Reduced d = reduce(x);
     const vfloat r2 = d.r * d.r;
     const vfloat swap = __builtin_convertvector(d.q & 1, vfloat);         // 1 or 0
@@ -202,10 +202,28 @@ extern "C" __attribute__((always_inline)) vfloat __vsinf(vfloat x) {
 }
 
 // q: 0 -> cos(r), 1 -> -sin(r), 2 -> -cos(r), 3 -> sin(r)
-extern "C" __attribute__((always_inline)) vfloat __vcosf(vfloat x) {
+static inline vfloat cosImpl(vfloat x) {
     const Reduced d = reduce(x);
     const vfloat r2 = d.r * d.r;
     const vfloat swap = __builtin_convertvector(d.q & 1, vfloat);
     const vfloat neg = __builtin_convertvector(((d.q + 1) >> 1) & 1, vfloat);
     return sel(swap, sinPoly(d.r, r2), cosPoly(r2)) * (1.0f - 2.0f * neg);
+}
+
+// Pointer wrappers: see the ABI note in vec_math.h for why the vector does
+// not cross the call boundary by value.
+extern "C" __attribute__((always_inline)) void __vexpf(const vfloat* x, vfloat* out) {
+    *out = expImpl(*x);
+}
+
+extern "C" __attribute__((always_inline)) void __vlogf(const vfloat* x, vfloat* out) {
+    *out = logImpl(*x);
+}
+
+extern "C" __attribute__((always_inline)) void __vsinf(const vfloat* x, vfloat* out) {
+    *out = sinImpl(*x);
+}
+
+extern "C" __attribute__((always_inline)) void __vcosf(const vfloat* x, vfloat* out) {
+    *out = cosImpl(*x);
 }

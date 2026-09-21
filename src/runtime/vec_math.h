@@ -22,18 +22,26 @@
 // passes the same -DSHADER_PACKET_WIDTH to both.
 typedef float vfloat __attribute__((ext_vector_type(SHADER_PACKET_WIDTH)));
 
+// Argument and result travel through pointers, the same shape tex_inline.h uses.
+// Passing the vector by value looks nicer but does not survive the ABI: a 32-byte
+// <8 x float> is not register-passed on riscv64, so clang emits
+//   void __vsinf(ptr sret(<8 x float>), ptr)
+// while the emitter would be calling <8 x float>(<8 x float>). The signatures
+// then fail to unify at llvm-link time, the definition never binds to the call,
+// and always_inline has nothing to inline. Spelling the pointers out removes the
+// ambiguity; the store/load pair is erased by SROA once the body is inlined.
 extern "C" {
 
 // sin/cos over the reduced range, accurate to roughly 1 ulp near zero and
 // degrading as |x| grows (see the range note in vec_math.cpp).
-vfloat __vsinf(vfloat x);
-vfloat __vcosf(vfloat x);
+void __vsinf(const vfloat* x, vfloat* out);
+void __vcosf(const vfloat* x, vfloat* out);
 
 // exp/log. exp saturates rather than producing garbage outside roughly
 // [-87, 88]; log returns 0 for x <= 0 instead of -inf/NaN, which matches how
 // the shaders use it (always on a positive radius) and keeps the packet path
 // free of traps.
-vfloat __vexpf(vfloat x);
-vfloat __vlogf(vfloat x);
+void __vexpf(const vfloat* x, vfloat* out);
+void __vlogf(const vfloat* x, vfloat* out);
 
 }  // extern "C"
