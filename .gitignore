@@ -2,7 +2,14 @@
 /.idea
 /build/
 /build-debug/
+/build-fuzz/
 /result/
 __pycache__/
 /module.bc
 *.pdf
+crash-*
+leak-*
+timeout-*
+oom-*
+slow-unit-*
+fuzz-*.log

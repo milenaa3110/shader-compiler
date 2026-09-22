@@ -344,9 +344,12 @@ endif()
 # ─────────────────────────────────────────────────────────────────────────────
 # Parser fuzzer (libFuzzer). Opt-in: requires clang with -fsanitize=fuzzer.
 # Built only when CMAKE_CXX_COMPILER is clang and ENABLE_FUZZER is ON.
-#   cmake -B build -DENABLE_FUZZER=ON -DCMAKE_CXX_COMPILER=clang++-18
-#   cmake --build build --target parser_fuzz
-#   ./build/parser_fuzz -max_total_time=30
+# Use a SEPARATE build tree: CMake cannot switch the compiler in an existing
+# cache, and reconfiguring the normal build with clang + sanitizers would
+# rebuild every shader object and invalidate whatever is in benchmark-results.
+#   cmake -B build-fuzz -DENABLE_FUZZER=ON -DCMAKE_CXX_COMPILER=clang++-18
+#   cmake --build build-fuzz --target parser_fuzz
+#   ./build-fuzz/parser_fuzz -max_total_time=30
 # Build-isolated from compiler_common so we get a clean instrumented build
 # (libFuzzer doesn't mix with non-instrumented TUs in the same binary).
 # ─────────────────────────────────────────────────────────────────────────────

@@ -477,9 +477,23 @@ const Type* SemanticAnalyzer::typeExpr(ExprAST* node) {
     case K::Boolean:
       node->setType(Ctx.getBoolTy());
       return node->getType();
-    case K::Variable:
-      t = lookupVar(llvm::cast<VariableExprAST>(node)->Name);
+    case K::Variable: {
+      auto* v = llvm::cast<VariableExprAST>(node);
+      t = lookupVar(v->Name);
+      // Reporting here rather than inside lookupVar, which is also used as a
+      // plain existence probe by the Assignment case. Until now an unknown name
+      // just produced a null type that travelled through the rest of sema —
+      // every later dereference of a typeExpr result was a latent null deref,
+      // and parser_fuzz found one of them. Codegen did eventually diagnose it,
+      // but by then type checking had already run on a type that did not exist.
+      // Same wording codegen uses, so the message does not change with the pass
+      // that catches it.
+      if (!t) {
+        logErrorAt(v->loc, fmt::format("Unknown variable or uniform: {}", v->Name));
+        ++errorCount_;
+      }
       break;
+    }
     case K::Unary: {
       auto* u = llvm::cast<UnaryExprAST>(node);
       const Type* o = typeExpr(u->Operand);
@@ -523,7 +537,11 @@ const Type* SemanticAnalyzer::typeExpr(ExprAST* node) {
       // commonOperandType has no matrix case, so the generic promotion below
       // never fires for a matrix operand — an integer vector or scalar would
       // reach codegen unconverted and produce ill-typed IR.
-      if (t && (l->isMatrix() || r->isMatrix())) {
+      // l or r is null when an operand failed to type (an undeclared name, say).
+      // t alone is not enough of a guard: a comparison infers bool regardless of
+      // its operands, so `v < 3` with v undeclared left t non-null and
+      // dereferenced a null l — found by parser_fuzz on the input "v<3;".
+      if (t && l && r && (l->isMatrix() || r->isMatrix())) {
         coerceMatrixOperands(b);
         break;
       }
