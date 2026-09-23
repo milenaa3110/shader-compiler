@@ -1,47 +1,4 @@
 // vec_math.cpp — branchless vector sin/cos, no libm calls.
-//
-// Structure is the classic one: reduce x to r in [-pi/4, pi/4] plus a quadrant,
-// evaluate both the sine and the cosine minimax polynomial on r, then pick and
-// sign the result from the quadrant. Both polynomials are always evaluated
-// because lanes disagree on the quadrant — a branch would have to run both
-// anyway, so there is nothing to save by trying.
-//
-// ── Accuracy and range ──────────────────────────────────────────────────────
-// Coefficients are the cephes single-precision minimax sets, ~1 ulp on
-// [-pi/4, pi/4]. The limit is the reduction, not the polynomial: PIO2_HI has
-// its low mantissa bits clear so n * PIO2_HI is exact only while |n| < 256,
-// i.e. |x| < ~402. Past that the Cody-Waite correction terms stop covering the
-// rounding and the error grows with |x|.
-//
-// That matters for one specific idiom, which this shader suite uses a lot:
-//
-//     float seed = sin(ni * 127.1 + nj * 311.7) * 43758.5;   // cellular, galaxy
-//
-// This is a hash, not a wave. Its argument reaches the hundreds and the result
-// is then multiplied by ~4e4, so any disagreement with libm is amplified by the
-// same factor.
-//
-// Measured against libm, 2e6 samples per range.
-//
-//   sin/cos, max absolute error        exp/log, max relative error
-//     [-pi/4, pi/4]  4.5e-8  7.3e-8     exp  [-1, 1]        6.8e-8
-//     [-pi, pi]      8.4e-8  9.2e-8     exp  [-30, 0]       8.1e-8
-//     [-20, 20]      9.6e-7  7.3e-7     exp  [-87, 88]      8.0e-8
-//     [-100, 100]    3.8e-6  3.6e-6     log  (0, 1]         8.0e-8
-//     [-402, 402]    1.5e-5  1.5e-5     log  [1, 1000]      7.8e-8
-//     [-5000, 5000]  2.4e-4  2.4e-4     log  (0, 1e6]       6.1e-8
-//
-// exp and log hold ~1 ulp across their whole domain because their reduction is
-// exact; only sin/cos degrade with |x|, and only through the reduction.
-//
-// The hash intermediate itself stays inside the gate: sin(dx*127.3+dy*311.7)
-// times 43758.5 differs from libm by at most 0.67, against a tolerance of
-// 1e-4 + 1e-4*43758.5 = 4.4. What does not survive is what comes next —
-// galaxy applies step(0.998, fract(starSeed)) and cellular step(0.6, fract(seed)).
-// fract() of a value 0.67 apart is uncorrelated, and step() turns that into a
-// binary flip, so individual stars and cells appear or vanish. Those two shaders
-// need a raised tolerance and a documented note; the others feed sin into smooth
-// arithmetic and are unaffected.
 
 #include "vec_math.h"
 
